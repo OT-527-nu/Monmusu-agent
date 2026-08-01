@@ -1,0 +1,38 @@
+{
+  "schema_version": "agentic-mvp-actor-templates-1",
+  "skill_catalog_version": "coc7e-agentic-mvp-1",
+  "actors": [
+    {
+      "actor_id": "investigator_tracker",
+      "role": "investigator",
+      "choice_label": "寻迹者",
+      "suggested_display_name": "林雁",
+      "attributes": {
+        "strength": 40,
+        "constitution": 55,
+        "size": 50,
+        "dexterity": 60,
+        "appearance": 55,
+        "intelligence": 75,
+        "power": 65,
+        "education": 70
+      },
+      "skill_overrides": {
+        "spot_hidden": 70,
+        "library_use": 65,
+        "listen": 55,
+        "psychology": 50,
+        "persuade": 45,
+        "navigate": 40,
+        "stealth": 40,
+        "first_aid": 40,
+        "fighting__brawl": 35,
+        "dodge": 30
+      },
+      "hp": {"current": 10, "max": 10},
+      "san": {"current": 65, "max": 65},
+      "luck": {"current": 55},
+      "armor": 0
+    }
+  ]
+}

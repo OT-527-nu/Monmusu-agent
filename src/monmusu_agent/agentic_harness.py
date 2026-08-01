@@ -1,0 +1,915 @@
+"""驱动 Agentic MVP 的单 GM 回合并提交自然语言正典。"""
+
+from __future__ import annotations
+
+import copy
+import json
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from random import Random
+from types import MappingProxyType
+from typing import Any, Callable, Literal, Mapping, cast
+from uuid import uuid4
+
+from monmusu_agent.agentic_coc import (
+    MAKE_CHECK_TOOL,
+    MakeCheckError,
+    RandomSource,
+    normalize_make_check_arguments,
+    prepare_make_check,
+    resolve_prepared_check,
+)
+from monmusu_agent.agentic_model import (
+    GameMasterModel,
+    ModelCallError,
+    ModelProfileValidationError,
+    ModelRequest,
+    ModelResponse,
+    deepseek_model_profile,
+    validated_model_profile,
+)
+from monmusu_agent.agentic_session import AgenticSessionStore, LoadedSession
+from monmusu_agent.config import PROJECT_ROOT
+from monmusu_agent.storage import write_json_atomic
+
+
+def _load_capability_charter() -> str:
+    """从权威设计文档读取唯一的运行时 System Prompt 正文。"""
+
+    document = (
+        PROJECT_ROOT / "docs" / "agentic_mvp" / "gm_prompt.md"
+    ).read_text(encoding="utf-8")
+    try:
+        section = document.split("## 主持能力章程", 1)[1]
+        code_block = section.split("```text", 1)[1].split("```", 1)[0]
+    except IndexError as error:
+        raise RuntimeError("权威 GM 能力章程代码块缺失") from error
+    charter = code_block.strip()
+    if not charter:
+        raise RuntimeError("权威 GM 能力章程为空")
+    return charter
+
+
+_GM_CAPABILITY_CHARTER = _load_capability_charter()
+
+_ATTEMPT_LIMITS = {
+    "max_round_trips": 8,
+    "request_timeout_seconds": 60,
+    "attempt_timeout_seconds": 180,
+    "max_structure_repairs": 1,
+}
+_FINAL_FIELDS = frozenset({"narration", "establish", "retire", "session_status"})
+_ASSISTANT_FIELDS = frozenset(
+    {"role", "content", "reasoning_content", "tool_calls"}
+)
+_PROVIDER_FAILURE_CODES = frozenset(
+    {
+        "request_timeout",
+        "provider_authentication_failed",
+        "provider_rate_limited",
+        "provider_response_error",
+        "provider_server_error",
+        "provider_network_error",
+        "unsupported_model_profile",
+        "unsupported_streaming",
+        "unsupported_thinking_mode",
+    }
+)
+
+
+class AgenticTurnError(RuntimeError):
+    """表示回合无法在可信生命周期内开始或完成。"""
+
+
+class AgenticTurnInputError(AgenticTurnError):
+    """表示玩家输入不符合公开生命周期契约。"""
+
+
+class AgenticTurnBlockedError(AgenticTurnError):
+    """表示已有未完成回合阻塞了新的虚构行动。"""
+
+
+class AgenticSessionCompleteError(AgenticTurnError):
+    """表示已收束会话拒绝新玩家输入。"""
+
+
+class AgenticTurnPersistenceError(AgenticTurnError):
+    """表示回合状态无法可靠写入本地聚合。"""
+
+
+@dataclass(frozen=True)
+class PublicFactChange:
+    """只携带允许 CLI 展示的公开事实变化。"""
+
+    kind: Literal["established", "retired"]
+    fact_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class PublicMechanic:
+    """只携带允许 CLI 展示的已提交公开检定。"""
+
+    mechanic_id: str
+    actor_id: str
+    ability: str
+    ability_value: int
+    difficulty: str
+    target: int
+    dice_adjustment: Mapping[str, Any]
+    roll: int
+    success_level: str
+    action: str
+    stakes: str
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """公开生命周期只返回已提交投影或技术中断。"""
+
+    status: Literal["committed", "interrupted"]
+    turn_id: str
+    narration: str | None
+    public_mechanics: tuple[PublicMechanic, ...]
+    public_fact_changes: tuple[PublicFactChange, ...]
+    error_code: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class _ValidatedFinal:
+    narration: str
+    establish: tuple[Mapping[str, str], ...]
+    retire: tuple[Mapping[str, str], ...]
+    session_status: Literal["ongoing", "complete"]
+
+
+class _FinalValidationError(ValueError):
+    pass
+
+
+class AgenticHarness:
+    """隐藏上下文组装、模型分类和最终原子提交。"""
+
+    def __init__(
+        self,
+        store: AgenticSessionStore,
+        model: GameMasterModel,
+        *,
+        turn_id_factory: Callable[[], str] | None = None,
+        fact_id_factory: Callable[[], str] | None = None,
+        mechanic_id_factory: Callable[[], str] | None = None,
+        random_source: RandomSource | None = None,
+        clock: Callable[[], datetime] | None = None,
+        session_writer: Callable[[Path, Any], None] = write_json_atomic,
+        model_profile: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.store = store
+        self.model = model
+        self.turn_id_factory = turn_id_factory or (
+            lambda: f"turn_{uuid4().hex}"
+        )
+        self.fact_id_factory = fact_id_factory or (
+            lambda: f"fact_{uuid4().hex}"
+        )
+        self.mechanic_id_factory = mechanic_id_factory or (
+            lambda: f"mechanic_{uuid4().hex}"
+        )
+        self.random_source = random_source or Random()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.session_writer = session_writer
+        try:
+            self.model_profile = validated_model_profile(
+                (
+                    deepseek_model_profile()
+                    if model_profile is None
+                    else model_profile
+                ),
+                enabled_tools=("make_check",),
+            )
+        except ModelProfileValidationError as error:
+            raise AgenticTurnInputError(str(error)) from error
+
+    def start_turn(
+        self,
+        game_id: str,
+        player_input: str,
+        *,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
+    ) -> TurnResult:
+        """开始一个新玩家回合，返回已提交公开结果或技术中断。"""
+
+        action = self._required_string(player_input, "player_input")
+        loaded = self.store.load_session(game_id)
+        current = loaded.session
+        if current["session_status"] == "complete":
+            raise AgenticSessionCompleteError("本局已经结束，不能接受新的行动")
+        if current["incomplete_turn"] is not None:
+            raise AgenticTurnBlockedError("存在未完成回合，不能接受新的行动")
+
+        turn_id = self._new_identifier(self.turn_id_factory(), "turn_id")
+        if any(turn.get("turn_id") == turn_id for turn in current["turns"]):
+            raise AgenticTurnError("turn_id 与既有回合冲突")
+        started_at = self._timestamp(self.clock())
+        messages = self._assemble_messages(loaded, action)
+        working = copy.deepcopy(dict(current))
+        working["incomplete_turn"] = {
+            "turn_id": turn_id,
+            "player_input": action,
+            "started_at": started_at,
+            "attempt_number": 1,
+            "attempt_started_at": started_at,
+            "round_trips_used": 0,
+            "total_round_trips": 0,
+            "structure_repairs_used": 0,
+            "total_structure_repairs": 0,
+            "model_profile": copy.deepcopy(self.model_profile),
+            "attempt_limits": copy.deepcopy(_ATTEMPT_LIMITS),
+            "mechanics": [],
+            "tool_interactions": [],
+            "deepseek_messages": copy.deepcopy(messages),
+            "provider_protocol_errors": [],
+            "last_failure": None,
+        }
+        working["updated_at"] = started_at
+        self._write_initial_state(loaded, working)
+
+        public_mechanics: list[PublicMechanic] = []
+        while True:
+            incomplete = working["incomplete_turn"]
+            assert isinstance(incomplete, dict)
+            request = ModelRequest(
+                messages=tuple(copy.deepcopy(incomplete["deepseek_messages"])),
+                tools=(copy.deepcopy(MAKE_CHECK_TOOL),),
+                request_timeout_seconds=_ATTEMPT_LIMITS[
+                    "request_timeout_seconds"
+                ],
+                model_profile=copy.deepcopy(self.model_profile),
+            )
+            try:
+                response = self.model.complete(request)
+            except ModelCallError as error:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    self._safe_provider_failure_code(error.code),
+                    "GM 服务调用中断",
+                    public_mechanics=tuple(public_mechanics),
+                )
+            except Exception:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "provider_error",
+                    "GM 服务调用中断",
+                    public_mechanics=tuple(public_mechanics),
+                )
+
+            incomplete["round_trips_used"] += 1
+            incomplete["total_round_trips"] += 1
+            try:
+                assistant_message = self._validated_assistant_message(response)
+            except _FinalValidationError:
+                self._record_protocol_error(incomplete, response)
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "invalid_model_response",
+                    "GM 响应协议无效",
+                    public_mechanics=tuple(public_mechanics),
+                )
+
+            tool_calls = assistant_message["tool_calls"]
+            if tool_calls:
+                try:
+                    working, public_mechanic = self._commit_tool_response(
+                        loaded,
+                        working,
+                        assistant_message,
+                    )
+                except _FinalValidationError:
+                    self._record_protocol_error(incomplete, response)
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "provider_protocol_error",
+                        "GM 工具调用协议无效",
+                        public_mechanics=tuple(public_mechanics),
+                    )
+                except AgenticTurnPersistenceError:
+                    self._record_protocol_error(
+                        incomplete,
+                        response,
+                        message="tool interaction commit failed",
+                    )
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "tool_commit_failed",
+                        "工具交互提交失败",
+                        public_mechanics=tuple(public_mechanics),
+                    )
+                except AgenticTurnError:
+                    self._record_protocol_error(
+                        incomplete,
+                        response,
+                        message="mechanic authority id allocation failed",
+                    )
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "authority_id_error",
+                        "Harness 无法分配稳定标识符",
+                        public_mechanics=tuple(public_mechanics),
+                    )
+                if public_mechanic is not None:
+                    public_mechanics.append(public_mechanic)
+                    if public_mechanic_sink is not None:
+                        public_mechanic_sink(public_mechanic)
+                continue
+
+            try:
+                assistant_message = self._classify_direct_final(response)
+            except _FinalValidationError:
+                self._record_protocol_error(incomplete, response)
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "invalid_model_response",
+                    "GM 响应协议无效",
+                    public_mechanics=tuple(public_mechanics),
+                )
+            incomplete["deepseek_messages"].append(
+                copy.deepcopy(assistant_message)
+            )
+            try:
+                final = self._validate_final(assistant_message["content"], current)
+            except _FinalValidationError:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "invalid_final_response",
+                    "GM 最终答复结构或事实引用无效",
+                    public_mechanics=tuple(public_mechanics),
+                )
+
+            try:
+                committed, public_changes = self._build_final_commit(
+                    working,
+                    turn_id,
+                    action,
+                    final,
+                )
+            except AgenticTurnError:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "authority_id_error",
+                    "Harness 无法分配稳定标识符",
+                    public_mechanics=tuple(public_mechanics),
+                )
+
+            try:
+                self.session_writer(
+                    loaded.session_directory / "session.json",
+                    committed,
+                )
+            except Exception:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "final_commit_failed",
+                    "GM 最终答复提交失败",
+                    public_mechanics=tuple(public_mechanics),
+                )
+            return TurnResult(
+                status="committed",
+                turn_id=turn_id,
+                narration=final.narration,
+                public_mechanics=tuple(public_mechanics),
+                public_fact_changes=public_changes,
+                error_code=None,
+                error_message=None,
+            )
+
+    def _write_initial_state(
+        self,
+        loaded: LoadedSession,
+        session: Mapping[str, Any],
+    ) -> None:
+        try:
+            self.session_writer(loaded.session_directory / "session.json", session)
+        except Exception as error:
+            raise AgenticTurnPersistenceError(
+                "未完成回合无法持久化，模型未被调用"
+            ) from error
+
+    def _interrupt(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        turn_id: str,
+        code: str,
+        message: str,
+        *,
+        public_mechanics: tuple[PublicMechanic, ...] = (),
+    ) -> TurnResult:
+        incomplete = working["incomplete_turn"]
+        assert isinstance(incomplete, dict)
+        incomplete["last_failure"] = {"code": code, "message": message}
+        working["updated_at"] = self._timestamp(self.clock())
+        try:
+            self.session_writer(loaded.session_directory / "session.json", working)
+        except Exception:
+            # 最终提交失败后，未完成回合仍须保存稳定的中断状态。
+            try:
+                write_json_atomic(loaded.session_directory / "session.json", working)
+            except Exception:
+                return TurnResult(
+                    status="interrupted",
+                    turn_id=turn_id,
+                    narration=None,
+                    public_mechanics=public_mechanics,
+                    public_fact_changes=(),
+                    error_code="interruption_persistence_failed",
+                    error_message="技术中断状态无法持久化",
+                )
+        return TurnResult(
+            status="interrupted",
+            turn_id=turn_id,
+            narration=None,
+            public_mechanics=public_mechanics,
+            public_fact_changes=(),
+            error_code=code,
+            error_message=message,
+        )
+
+    def _commit_tool_response(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        assistant_message: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], PublicMechanic | None]:
+        tool_calls = assistant_message["tool_calls"]
+        if (
+            assistant_message.get("content") is not None
+            or not isinstance(tool_calls, list)
+            or len(tool_calls) != 1
+        ):
+            raise _FinalValidationError
+        call = tool_calls[0]
+        if not isinstance(call, dict) or set(call) != {"id", "type", "function"}:
+            raise _FinalValidationError
+        tool_call_id = call.get("id")
+        function = call.get("function")
+        if (
+            not isinstance(tool_call_id, str)
+            or not tool_call_id
+            or tool_call_id != tool_call_id.strip()
+            or call.get("type") != "function"
+            or not isinstance(function, dict)
+            or set(function) != {"name", "arguments"}
+        ):
+            raise _FinalValidationError
+
+        incomplete = working["incomplete_turn"]
+        assert isinstance(incomplete, dict)
+        if any(
+            interaction.get("tool_call_id") == tool_call_id
+            for interaction in incomplete["tool_interactions"]
+            if isinstance(interaction, dict)
+        ):
+            # Increment 2 才恢复同 ID 重放；当前切片先安全停止，绝不重复结算。
+            raise _FinalValidationError
+        tool_name = function.get("name")
+        arguments_raw = function.get("arguments")
+        if (
+            not isinstance(tool_name, str)
+            or not tool_name
+            or tool_name != tool_name.strip()
+            or not isinstance(arguments_raw, str)
+        ):
+            raise _FinalValidationError
+
+        arguments: dict[str, Any] | None = None
+        mechanic: dict[str, Any] | None = None
+        error: dict[str, str] | None = None
+        if tool_name != "make_check":
+            error = {
+                "code": "unknown_tool",
+                "message": f"工具 {tool_name} 当前不可用",
+            }
+        else:
+            try:
+                arguments = normalize_make_check_arguments(arguments_raw)
+                prepared = prepare_make_check(
+                    arguments,
+                    loaded.session["actors"],
+                )
+                mechanic_id = self._new_identifier(
+                    self.mechanic_id_factory(),
+                    "mechanic_id",
+                )
+                existing_ids = {
+                    item["mechanic_id"]
+                    for turn in loaded.session["turns"]
+                    for item in turn["mechanics"]
+                }
+                existing_ids.update(
+                    item["mechanic_id"] for item in incomplete["mechanics"]
+                )
+                if mechanic_id in existing_ids:
+                    raise AgenticTurnError("mechanic_id 与既有机械冲突")
+                mechanic = resolve_prepared_check(
+                    prepared,
+                    mechanic_id=mechanic_id,
+                    random_source=self.random_source,
+                    committed_at=self._timestamp(self.clock()),
+                )
+            except MakeCheckError as tool_error:
+                error = {"code": tool_error.code, "message": tool_error.message}
+
+        envelope = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "ok": mechanic is not None,
+            "result": copy.deepcopy(mechanic),
+            "error": copy.deepcopy(error),
+        }
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": json.dumps(envelope, ensure_ascii=False, sort_keys=True),
+        }
+        interaction = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "arguments_raw": arguments_raw,
+            "arguments": copy.deepcopy(arguments),
+            "ok": mechanic is not None,
+            "result": copy.deepcopy(mechanic),
+            "error": copy.deepcopy(error),
+        }
+        candidate = copy.deepcopy(working)
+        incomplete_candidate = candidate["incomplete_turn"]
+        assert isinstance(incomplete_candidate, dict)
+        incomplete_candidate["deepseek_messages"].extend(
+            [copy.deepcopy(dict(assistant_message)), tool_message]
+        )
+        incomplete_candidate["tool_interactions"].append(interaction)
+        if mechanic is not None:
+            incomplete_candidate["mechanics"].append(copy.deepcopy(mechanic))
+        candidate["updated_at"] = self._timestamp(self.clock())
+        try:
+            self.session_writer(
+                loaded.session_directory / "session.json",
+                candidate,
+            )
+        except Exception as commit_error:
+            raise AgenticTurnPersistenceError(
+                "工具交互无法原子提交"
+            ) from commit_error
+
+        public = None
+        if mechanic is not None and mechanic["visibility"] == "public":
+            public = self._public_mechanic(mechanic)
+        return candidate, public
+
+    @staticmethod
+    def _public_mechanic(mechanic: Mapping[str, Any]) -> PublicMechanic:
+        return PublicMechanic(
+            mechanic_id=mechanic["mechanic_id"],
+            actor_id=mechanic["actor_id"],
+            ability=mechanic["ability"],
+            ability_value=mechanic["ability_value"],
+            difficulty=mechanic["difficulty"],
+            target=mechanic["target"],
+            dice_adjustment=MappingProxyType(
+                copy.deepcopy(mechanic["dice_adjustment"])
+            ),
+            roll=mechanic["roll"],
+            success_level=mechanic["success_level"],
+            action=mechanic["action"],
+            stakes=mechanic["stakes"],
+        )
+
+    def _assemble_messages(
+        self,
+        loaded: LoadedSession,
+        player_input: str,
+    ) -> list[dict[str, str]]:
+        session = loaded.session
+        active_facts = [
+            copy.deepcopy(fact)
+            for fact in session["facts"]
+            if fact["status"] == "active"
+        ]
+        facts_by_id = {fact["fact_id"]: fact for fact in session["facts"]}
+        committed_record = []
+        for turn in session["turns"]:
+            record = copy.deepcopy(turn)
+            record["established_facts"] = [
+                copy.deepcopy(facts_by_id[fact_id])
+                for fact_id in turn["established_fact_ids"]
+            ]
+            committed_record.append(record)
+        package = {
+            "SESSION_SETUP": copy.deepcopy(session["setup"]),
+            "OPENING_FACT_HISTORY": [
+                copy.deepcopy(facts_by_id[fact_id])
+                for fact_id in session["setup"]["opening_fact_ids"]
+            ],
+            "INVESTIGATOR_PROFILE": copy.deepcopy(session["investigator_profile"]),
+            "ACTOR_DISPLAY_NAMES": copy.deepcopy(session["actor_display_names"]),
+            "ACTOR_SHEETS": copy.deepcopy(session["actors"]),
+            "ACTIVE_FACTS": active_facts,
+            "COMMITTED_TURNS": committed_record,
+            "MODULE_REFERENCE": loaded.module_reference,
+            "CHARACTER_REFERENCE": loaded.character_reference,
+            "AVAILABLE_TOOLS": [copy.deepcopy(MAKE_CHECK_TOOL)],
+        }
+        return [
+            {"role": "system", "content": _GM_CAPABILITY_CHARTER},
+            {
+                "role": "user",
+                "content": json.dumps(package, ensure_ascii=False, sort_keys=True),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "<PLAYER_INPUT>\n"
+                    f"{player_input}\n"
+                    "</PLAYER_INPUT>"
+                ),
+            },
+        ]
+
+    @classmethod
+    def _validated_assistant_message(
+        cls,
+        response: object,
+    ) -> dict[str, Any]:
+        if not isinstance(response, ModelResponse):
+            raise _FinalValidationError
+        message = response.assistant_message
+        if (
+            not isinstance(message, Mapping)
+            or set(message) != _ASSISTANT_FIELDS
+            or response.finish_reason is not None
+            and not isinstance(response.finish_reason, str)
+            or response.usage is not None
+            and not isinstance(response.usage, Mapping)
+            or response.latency_ms is not None
+            and (
+                not isinstance(response.latency_ms, int)
+                or isinstance(response.latency_ms, bool)
+                or response.latency_ms < 0
+            )
+        ):
+            raise _FinalValidationError
+        content = message.get("content")
+        reasoning = message.get("reasoning_content")
+        if (
+            message.get("role") != "assistant"
+            or not isinstance(message.get("tool_calls"), list)
+            or content is not None
+            and not isinstance(content, str)
+            or reasoning is not None
+            and not isinstance(reasoning, str)
+        ):
+            raise _FinalValidationError
+        return dict(message)
+
+    @classmethod
+    def _classify_direct_final(
+        cls,
+        response: object,
+    ) -> dict[str, Any]:
+        message = cls._validated_assistant_message(response)
+        content = message["content"]
+        if (
+            message["tool_calls"] != []
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            raise _FinalValidationError
+        return message
+
+    @classmethod
+    def _validate_final(
+        cls,
+        content: object,
+        session: Mapping[str, Any],
+    ) -> _ValidatedFinal:
+        if not isinstance(content, str):
+            raise _FinalValidationError
+        try:
+            candidate = json.loads(content)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise _FinalValidationError from error
+        if not isinstance(candidate, dict) or set(candidate) != _FINAL_FIELDS:
+            raise _FinalValidationError
+        narration = cls._final_string(candidate.get("narration"))
+        status = candidate.get("session_status")
+        if not isinstance(status, str) or status not in {"ongoing", "complete"}:
+            raise _FinalValidationError
+
+        establish_raw = candidate.get("establish")
+        if not isinstance(establish_raw, list):
+            raise _FinalValidationError
+        establish: list[Mapping[str, str]] = []
+        for item in establish_raw:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"visibility", "text"}
+                or not isinstance(item.get("visibility"), str)
+                or item.get("visibility") not in {"public", "hidden"}
+            ):
+                raise _FinalValidationError
+            establish.append(
+                {
+                    "visibility": item["visibility"],
+                    "text": cls._final_string(item.get("text")),
+                }
+            )
+
+        retire_raw = candidate.get("retire")
+        if not isinstance(retire_raw, list):
+            raise _FinalValidationError
+        active_ids = {
+            fact["fact_id"]
+            for fact in session["facts"]
+            if fact["status"] == "active"
+        }
+        seen_retirements: set[str] = set()
+        retire: list[Mapping[str, str]] = []
+        for item in retire_raw:
+            if not isinstance(item, dict) or set(item) != {"fact_id", "reason"}:
+                raise _FinalValidationError
+            fact_id = cls._final_string(item.get("fact_id"))
+            reason = cls._final_string(item.get("reason"))
+            if fact_id not in active_ids or fact_id in seen_retirements:
+                raise _FinalValidationError
+            seen_retirements.add(fact_id)
+            retire.append({"fact_id": fact_id, "reason": reason})
+        return _ValidatedFinal(
+            narration=narration,
+            establish=tuple(establish),
+            retire=tuple(retire),
+            session_status=cast(Literal["ongoing", "complete"], status),
+        )
+
+    def _build_final_commit(
+        self,
+        working: Mapping[str, Any],
+        turn_id: str,
+        player_input: str,
+        final: _ValidatedFinal,
+    ) -> tuple[dict[str, Any], tuple[PublicFactChange, ...]]:
+        committed = copy.deepcopy(dict(working))
+        facts = committed["facts"]
+        existing_fact_ids = {fact["fact_id"] for fact in facts}
+        established_ids: list[str] = []
+        public_changes: list[PublicFactChange] = []
+        for proposal in final.establish:
+            fact_id = self._new_identifier(self.fact_id_factory(), "fact_id")
+            if fact_id in existing_fact_ids:
+                raise AgenticTurnError("fact_id 与既有事实冲突")
+            existing_fact_ids.add(fact_id)
+            established_ids.append(fact_id)
+            facts.append(
+                {
+                    "fact_id": fact_id,
+                    "text": proposal["text"],
+                    "visibility": proposal["visibility"],
+                    "status": "active",
+                    "established_turn_id": turn_id,
+                    "origin": {"kind": "gm_turn", "source_ref": None},
+                    "retired_turn_id": None,
+                    "retire_reason": None,
+                }
+            )
+            if proposal["visibility"] == "public":
+                public_changes.append(
+                    PublicFactChange(
+                        kind="established",
+                        fact_id=fact_id,
+                        text=proposal["text"],
+                    )
+                )
+
+        facts_by_id = {fact["fact_id"]: fact for fact in facts}
+        retirements = [dict(retirement) for retirement in final.retire]
+        for retirement in retirements:
+            fact = facts_by_id[retirement["fact_id"]]
+            fact["status"] = "retired"
+            fact["retired_turn_id"] = turn_id
+            fact["retire_reason"] = retirement["reason"]
+            if fact["visibility"] == "public":
+                public_changes.append(
+                    PublicFactChange(
+                        kind="retired",
+                        fact_id=fact["fact_id"],
+                        text=retirement["reason"],
+                    )
+                )
+
+        committed_at = self._timestamp(self.clock())
+        incomplete = committed["incomplete_turn"]
+        assert isinstance(incomplete, dict)
+        committed["turns"].append(
+            {
+                "turn_id": turn_id,
+                "player_input": player_input,
+                "mechanics": copy.deepcopy(incomplete["mechanics"]),
+                "narration": final.narration,
+                "established_fact_ids": established_ids,
+                "retirements": retirements,
+                "session_status": final.session_status,
+                "committed_at": committed_at,
+            }
+        )
+        committed["session_status"] = final.session_status
+        committed["incomplete_turn"] = None
+        committed["updated_at"] = committed_at
+        return committed, tuple(public_changes)
+
+    def _record_protocol_error(
+        self,
+        incomplete: dict[str, Any],
+        response: object,
+        *,
+        message: str = "response envelope cannot form a valid model step",
+    ) -> None:
+        if isinstance(response, ModelResponse):
+            envelope: object = {
+                "assistant_message": response.assistant_message,
+                "finish_reason": response.finish_reason,
+                "usage": response.usage,
+                "latency_ms": response.latency_ms,
+            }
+        else:
+            envelope = {"unrecognized_response_type": type(response).__name__}
+        try:
+            serialized = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            serialized = json.dumps(
+                {"unserializable_response_type": type(response).__name__},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        incomplete["provider_protocol_errors"].append(
+            {
+                "code": "provider_protocol_error",
+                "message": message,
+                "model_response_json": serialized,
+                "recorded_at": self._timestamp(self.clock()),
+            }
+        )
+
+    @staticmethod
+    def _required_string(value: object, label: str) -> str:
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise AgenticTurnInputError(f"{label} 必须是去除首尾空白的非空字符串")
+        return value
+
+    @staticmethod
+    def _final_string(value: object) -> str:
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise _FinalValidationError
+        return value
+
+    @staticmethod
+    def _new_identifier(value: object, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]+", value) is None
+        ):
+            raise AgenticTurnError(f"{label} 格式无效")
+        return value
+
+    @staticmethod
+    def _safe_provider_failure_code(code: object) -> str:
+        if isinstance(code, str) and code in _PROVIDER_FAILURE_CODES:
+            return code
+        return "provider_error"
+
+    @staticmethod
+    def _timestamp(value: datetime) -> str:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise AgenticTurnError("clock 必须返回带时区的时间")
+        utc_value = value.astimezone(timezone.utc)
+        return utc_value.isoformat(timespec="seconds").replace("+00:00", "Z")

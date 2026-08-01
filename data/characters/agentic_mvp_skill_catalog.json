@@ -1,0 +1,28 @@
+{
+  "catalog_version": "coc7e-agentic-mvp-1",
+  "skills": {
+    "spot_hidden": {"display_name": "侦查", "base": {"kind": "fixed", "value": 25}},
+    "library_use": {"display_name": "图书馆使用", "base": {"kind": "fixed", "value": 20}},
+    "listen": {"display_name": "聆听", "base": {"kind": "fixed", "value": 20}},
+    "psychology": {"display_name": "心理学", "base": {"kind": "fixed", "value": 10}},
+    "persuade": {"display_name": "说服", "base": {"kind": "fixed", "value": 10}},
+    "navigate": {"display_name": "导航", "base": {"kind": "fixed", "value": 10}},
+    "stealth": {"display_name": "潜行", "base": {"kind": "fixed", "value": 20}},
+    "first_aid": {"display_name": "急救", "base": {"kind": "fixed", "value": 30}},
+    "fighting__brawl": {"display_name": "格斗（斗殴）", "base": {"kind": "fixed", "value": 25}, "specialty": "brawl"},
+    "dodge": {"display_name": "闪避", "base": {"kind": "derived", "formula": "floor(dexterity / 2)"}},
+    "charm": {"display_name": "魅惑", "base": {"kind": "fixed", "value": 15}},
+    "credit_rating": {"display_name": "信用评级", "base": {"kind": "fixed", "value": 0}},
+    "mechanical_repair": {"display_name": "机械维修", "base": {"kind": "fixed", "value": 10}},
+    "locksmith": {"display_name": "锁匠", "base": {"kind": "fixed", "value": 1}},
+    "electrical_repair": {"display_name": "电气维修", "base": {"kind": "fixed", "value": 10}},
+    "climb": {"display_name": "攀爬", "base": {"kind": "fixed", "value": 20}},
+    "swim": {"display_name": "游泳", "base": {"kind": "fixed", "value": 20}},
+    "occult": {"display_name": "神秘学", "base": {"kind": "fixed", "value": 5}},
+    "history": {"display_name": "历史", "base": {"kind": "fixed", "value": 5}},
+    "anthropology": {"display_name": "人类学", "base": {"kind": "fixed", "value": 1}},
+    "language_other__ancient_serpent": {"display_name": "其他语言（古代蛇人语）", "base": {"kind": "fixed", "value": 1}, "specialty": "ancient_serpent"},
+    "art_craft__rigging": {"display_name": "手艺（索具）", "base": {"kind": "fixed", "value": 5}, "specialty": "rigging"},
+    "flight": {"display_name": "飞行", "base": {"kind": "fixed", "value": 1}}
+  }
+}

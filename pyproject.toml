@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monmusu-agent"
+version = "0.1.0"
+description = "Single-agent investigative text game MVP with AI companion characters"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["openai>=1,<2"]
+
+[project.scripts]
+monmusu-agent = "monmusu_agent.cli:main"
+monmusu-agent-agentic = "monmusu_agent.agentic_cli:main"
+monmusu-agent-deepseek-contract = "monmusu_agent.agentic_contract:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+monmusu_agent = ["py.typed"]
