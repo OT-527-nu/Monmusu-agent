@@ -114,7 +114,7 @@ class ModelRequest:
 
     messages: tuple[Mapping[str, Any], ...]
     tools: tuple[Mapping[str, Any], ...]
-    request_timeout_seconds: int
+    request_timeout_seconds: float
     model_profile: Mapping[str, Any]
 
 

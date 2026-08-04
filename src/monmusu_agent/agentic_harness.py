@@ -6,7 +6,7 @@ import copy
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from random import Random
 from types import MappingProxyType
@@ -76,6 +76,12 @@ _PROVIDER_FAILURE_CODES = frozenset(
         "unsupported_streaming",
         "unsupported_thinking_mode",
     }
+)
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "content_filter"})
+_REPAIR_PROMPT = (
+    "你的上一份答复未通过本地最终答复结构校验。"
+    "请只返回完整、合法的 JSON Object，顶层只能包含 narration、establish、retire、session_status；"
+    "不要调用工具，不要加入 fact_id、mechanic_id、诊断或其他字段。"
 )
 
 
@@ -165,6 +171,7 @@ class AgenticHarness:
         clock: Callable[[], datetime] | None = None,
         session_writer: Callable[[Path, Any], None] = write_json_atomic,
         model_profile: Mapping[str, Any] | None = None,
+        attempt_limits: Mapping[str, int] | None = None,
     ) -> None:
         self.store = store
         self.model = model
@@ -180,6 +187,9 @@ class AgenticHarness:
         self.random_source = random_source or Random()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.session_writer = session_writer
+        self.attempt_limits = self._validated_attempt_limits(
+            _ATTEMPT_LIMITS if attempt_limits is None else attempt_limits
+        )
         try:
             self.model_profile = validated_model_profile(
                 (
@@ -199,7 +209,22 @@ class AgenticHarness:
         *,
         public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
     ) -> TurnResult:
-        """开始一个新玩家回合，返回已提交公开结果或技术中断。"""
+        """开始新回合，并委托一个有界的单次 GM 执行尝试。"""
+
+        return self._execute_attempt(
+            game_id,
+            player_input,
+            public_mechanic_sink=public_mechanic_sink,
+        )
+
+    def _execute_attempt(
+        self,
+        game_id: str,
+        player_input: str,
+        *,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
+    ) -> TurnResult:
+        """执行一次新回合尝试；未来 resume_turn 可复用此边界。"""
 
         action = self._required_string(player_input, "player_input")
         loaded = self.store.load_session(game_id)
@@ -212,7 +237,8 @@ class AgenticHarness:
         turn_id = self._new_identifier(self.turn_id_factory(), "turn_id")
         if any(turn.get("turn_id") == turn_id for turn in current["turns"]):
             raise AgenticTurnError("turn_id 与既有回合冲突")
-        started_at = self._timestamp(self.clock())
+        attempt_started = self.clock()
+        started_at = self._timestamp(attempt_started)
         messages = self._assemble_messages(loaded, action)
         working = copy.deepcopy(dict(current))
         working["incomplete_turn"] = {
@@ -226,7 +252,7 @@ class AgenticHarness:
             "structure_repairs_used": 0,
             "total_structure_repairs": 0,
             "model_profile": copy.deepcopy(self.model_profile),
-            "attempt_limits": copy.deepcopy(_ATTEMPT_LIMITS),
+            "attempt_limits": copy.deepcopy(self.attempt_limits),
             "mechanics": [],
             "tool_interactions": [],
             "deepseek_messages": copy.deepcopy(messages),
@@ -237,40 +263,94 @@ class AgenticHarness:
         self._write_initial_state(loaded, working)
 
         public_mechanics: list[PublicMechanic] = []
+        attempt_deadline = attempt_started + timedelta(
+            seconds=self.attempt_limits["attempt_timeout_seconds"]
+        )
+        repair_pending = False
         while True:
             incomplete = working["incomplete_turn"]
             assert isinstance(incomplete, dict)
+            limits = incomplete["attempt_limits"]
+            assert isinstance(limits, dict)
+            remaining = self._remaining_seconds(attempt_deadline)
+            if remaining <= 0:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "attempt_timeout",
+                    "GM 执行尝试超过时间限制",
+                    public_mechanics=tuple(public_mechanics),
+                )
+            if incomplete["round_trips_used"] >= limits["max_round_trips"]:
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "step_limit_exceeded",
+                    "GM 执行尝试达到往返上限",
+                    public_mechanics=tuple(public_mechanics),
+                )
             request = ModelRequest(
                 messages=tuple(copy.deepcopy(incomplete["deepseek_messages"])),
-                tools=(copy.deepcopy(MAKE_CHECK_TOOL),),
-                request_timeout_seconds=_ATTEMPT_LIMITS[
-                    "request_timeout_seconds"
-                ],
+                tools=()
+                if repair_pending
+                else (copy.deepcopy(MAKE_CHECK_TOOL),),
+                request_timeout_seconds=min(
+                    float(limits["request_timeout_seconds"]),
+                    remaining,
+                ),
                 model_profile=copy.deepcopy(self.model_profile),
             )
             try:
                 response = self.model.complete(request)
             except ModelCallError as error:
+                code = self._safe_provider_failure_code(error.code)
+                if self._remaining_seconds(attempt_deadline) <= 0:
+                    code = "attempt_timeout"
                 return self._interrupt(
                     loaded,
                     working,
                     turn_id,
-                    self._safe_provider_failure_code(error.code),
+                    code,
                     "GM 服务调用中断",
                     public_mechanics=tuple(public_mechanics),
                 )
             except Exception:
+                code = (
+                    "attempt_timeout"
+                    if self._remaining_seconds(attempt_deadline) <= 0
+                    else "provider_error"
+                )
                 return self._interrupt(
                     loaded,
                     working,
                     turn_id,
-                    "provider_error",
+                    code,
                     "GM 服务调用中断",
                     public_mechanics=tuple(public_mechanics),
                 )
 
             incomplete["round_trips_used"] += 1
             incomplete["total_round_trips"] += 1
+            if (
+                isinstance(response, ModelResponse)
+                and response.finish_reason in _TRUNCATED_FINISH_REASONS
+            ):
+                self._record_protocol_error(
+                    incomplete,
+                    response,
+                    code="provider_response_error",
+                    message="provider response was truncated",
+                )
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "provider_response_error",
+                    "GM 响应不完整",
+                    public_mechanics=tuple(public_mechanics),
+                )
             try:
                 assistant_message = self._validated_assistant_message(response)
             except _FinalValidationError:
@@ -286,13 +366,94 @@ class AgenticHarness:
 
             tool_calls = assistant_message["tool_calls"]
             if tool_calls:
-                try:
-                    working, public_mechanic = self._commit_tool_response(
+                if repair_pending:
+                    self._record_protocol_error(
+                        incomplete,
+                        response,
+                        message="structure repair response cannot call tools",
+                    )
+                    return self._interrupt(
                         loaded,
                         working,
-                        assistant_message,
+                        turn_id,
+                        "invalid_final_response",
+                        "GM 结构修正仍然无效",
+                        public_mechanics=tuple(public_mechanics),
                     )
-                except _FinalValidationError:
+                if len(tool_calls) == 1:
+                    try:
+                        working, public_mechanic = self._commit_tool_response(
+                            loaded,
+                            working,
+                            assistant_message,
+                        )
+                    except _FinalValidationError:
+                        self._record_protocol_error(incomplete, response)
+                        return self._interrupt(
+                            loaded,
+                            working,
+                            turn_id,
+                            "provider_protocol_error",
+                            "GM 工具调用协议无效",
+                            public_mechanics=tuple(public_mechanics),
+                        )
+                    except AgenticTurnPersistenceError:
+                        self._record_protocol_error(
+                            incomplete,
+                            response,
+                            message="tool interaction commit failed",
+                        )
+                        return self._interrupt(
+                            loaded,
+                            working,
+                            turn_id,
+                            "tool_commit_failed",
+                            "工具交互提交失败",
+                            public_mechanics=tuple(public_mechanics),
+                        )
+                    except AgenticTurnError:
+                        self._record_protocol_error(
+                            incomplete,
+                            response,
+                            message="mechanic authority id allocation failed",
+                        )
+                        return self._interrupt(
+                            loaded,
+                            working,
+                            turn_id,
+                            "authority_id_error",
+                            "Harness 无法分配稳定标识符",
+                            public_mechanics=tuple(public_mechanics),
+                        )
+                    if public_mechanic is not None:
+                        public_mechanics.append(public_mechanic)
+                        if public_mechanic_sink is not None:
+                            public_mechanic_sink(public_mechanic)
+                elif self._tool_calls_are_pairable(tool_calls) and self._tool_calls_have_new_ids(
+                    tool_calls,
+                    incomplete["tool_interactions"],
+                ):
+                    try:
+                        working = self._commit_multiple_tool_errors(
+                            loaded,
+                            working,
+                            assistant_message,
+                        )
+                    except AgenticTurnPersistenceError:
+                        self._record_protocol_error(
+                            incomplete,
+                            response,
+                            message="multiple tool error commit failed",
+                        )
+                        return self._interrupt(
+                            loaded,
+                            working,
+                            turn_id,
+                            "tool_commit_failed",
+                            "工具交互提交失败",
+                            public_mechanics=tuple(public_mechanics),
+                        )
+                else:
                     self._record_protocol_error(incomplete, response)
                     return self._interrupt(
                         loaded,
@@ -302,106 +463,101 @@ class AgenticHarness:
                         "GM 工具调用协议无效",
                         public_mechanics=tuple(public_mechanics),
                     )
-                except AgenticTurnPersistenceError:
-                    self._record_protocol_error(
-                        incomplete,
-                        response,
-                        message="tool interaction commit failed",
-                    )
+                if incomplete["round_trips_used"] >= limits["max_round_trips"]:
                     return self._interrupt(
                         loaded,
                         working,
                         turn_id,
-                        "tool_commit_failed",
-                        "工具交互提交失败",
+                        "step_limit_exceeded",
+                        "GM 执行尝试达到往返上限",
                         public_mechanics=tuple(public_mechanics),
                     )
-                except AgenticTurnError:
-                    self._record_protocol_error(
-                        incomplete,
-                        response,
-                        message="mechanic authority id allocation failed",
-                    )
-                    return self._interrupt(
-                        loaded,
-                        working,
-                        turn_id,
-                        "authority_id_error",
-                        "Harness 无法分配稳定标识符",
-                        public_mechanics=tuple(public_mechanics),
-                    )
-                if public_mechanic is not None:
-                    public_mechanics.append(public_mechanic)
-                    if public_mechanic_sink is not None:
-                        public_mechanic_sink(public_mechanic)
                 continue
 
             try:
-                assistant_message = self._classify_direct_final(response)
+                direct_message = self._classify_direct_final(response)
             except _FinalValidationError:
                 self._record_protocol_error(incomplete, response)
                 return self._interrupt(
                     loaded,
                     working,
                     turn_id,
-                    "invalid_model_response",
-                    "GM 响应协议无效",
+                    "invalid_final_response" if repair_pending else "invalid_model_response",
+                    "GM 结构修正仍然无效" if repair_pending else "GM 响应协议无效",
                     public_mechanics=tuple(public_mechanics),
                 )
-            incomplete["deepseek_messages"].append(
-                copy.deepcopy(assistant_message)
-            )
+
+            incomplete["deepseek_messages"].append(copy.deepcopy(direct_message))
             try:
-                final = self._validate_final(assistant_message["content"], current)
+                final = self._validate_final(direct_message["content"], working)
             except _FinalValidationError:
+                if repair_pending:
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "invalid_final_response",
+                        "GM 结构修正仍然无效",
+                        public_mechanics=tuple(public_mechanics),
+                    )
+                if (
+                    incomplete["structure_repairs_used"] < limits["max_structure_repairs"]
+                    and incomplete["round_trips_used"] < limits["max_round_trips"]
+                    and self._remaining_seconds(attempt_deadline) > 0
+                ):
+                    incomplete["structure_repairs_used"] += 1
+                    incomplete["total_structure_repairs"] += 1
+                    incomplete["deepseek_messages"].append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{_REPAIR_PROMPT}\n"
+                                f"本地校验提示：{self._final_validation_summary(direct_message['content'], working)}"
+                            ),
+                        }
+                    )
+                    try:
+                        self.session_writer(
+                            loaded.session_directory / "session.json",
+                            working,
+                        )
+                    except Exception:
+                        return self._interrupt(
+                            loaded,
+                            working,
+                            turn_id,
+                            "structure_repair_failed",
+                            "GM 结构修正状态无法保存",
+                            public_mechanics=tuple(public_mechanics),
+                        )
+                    repair_pending = True
+                    continue
+                code = (
+                    "step_limit_exceeded"
+                    if incomplete["round_trips_used"] >= limits["max_round_trips"]
+                    else "invalid_final_response"
+                )
                 return self._interrupt(
                     loaded,
                     working,
                     turn_id,
-                    "invalid_final_response",
-                    "GM 最终答复结构或事实引用无效",
+                    code,
+                    (
+                        "GM 执行尝试达到往返上限"
+                        if code == "step_limit_exceeded"
+                        else "GM 最终答复结构或事实引用无效"
+                    ),
                     public_mechanics=tuple(public_mechanics),
                 )
 
-            try:
-                committed, public_changes = self._build_final_commit(
-                    working,
-                    turn_id,
-                    action,
-                    final,
-                )
-            except AgenticTurnError:
-                return self._interrupt(
-                    loaded,
-                    working,
-                    turn_id,
-                    "authority_id_error",
-                    "Harness 无法分配稳定标识符",
-                    public_mechanics=tuple(public_mechanics),
-                )
-
-            try:
-                self.session_writer(
-                    loaded.session_directory / "session.json",
-                    committed,
-                )
-            except Exception:
-                return self._interrupt(
-                    loaded,
-                    working,
-                    turn_id,
-                    "final_commit_failed",
-                    "GM 最终答复提交失败",
-                    public_mechanics=tuple(public_mechanics),
-                )
-            return TurnResult(
-                status="committed",
-                turn_id=turn_id,
-                narration=final.narration,
-                public_mechanics=tuple(public_mechanics),
-                public_fact_changes=public_changes,
-                error_code=None,
-                error_message=None,
+            return self._commit_final_or_interrupt(
+                loaded,
+                working,
+                turn_id,
+                action,
+                final,
+                attempt_deadline,
+                tuple(public_mechanics),
             )
 
     def _write_initial_state(
@@ -415,6 +571,201 @@ class AgenticHarness:
             raise AgenticTurnPersistenceError(
                 "未完成回合无法持久化，模型未被调用"
             ) from error
+
+    @staticmethod
+    def _validated_attempt_limits(
+        limits: Mapping[str, int],
+    ) -> dict[str, int]:
+        if not isinstance(limits, Mapping) or set(limits) != set(_ATTEMPT_LIMITS):
+            raise AgenticTurnInputError("attempt_limits 必须只包含已知运行限制")
+        rebuilt: dict[str, int] = {}
+        for field in _ATTEMPT_LIMITS:
+            value = limits[field]
+            minimum = 0 if field == "max_structure_repairs" else 1
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < minimum
+                or value > 1_000_000
+            ):
+                raise AgenticTurnInputError("attempt_limits 数值无效")
+            rebuilt[field] = value
+        return rebuilt
+
+    def _remaining_seconds(self, deadline: datetime) -> float:
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise AgenticTurnError("clock 必须返回带时区的时间")
+        return (deadline - now.astimezone(timezone.utc)).total_seconds()
+
+    @staticmethod
+    def _tool_call_parts(call: object) -> tuple[str, str, str] | None:
+        if not isinstance(call, dict) or set(call) != {"id", "type", "function"}:
+            return None
+        tool_call_id = call.get("id")
+        function = call.get("function")
+        if (
+            not isinstance(tool_call_id, str)
+            or not tool_call_id
+            or tool_call_id != tool_call_id.strip()
+            or call.get("type") != "function"
+            or not isinstance(function, dict)
+            or set(function) != {"name", "arguments"}
+            or not isinstance(function.get("name"), str)
+            or not function["name"]
+            or function["name"] != function["name"].strip()
+            or not isinstance(function.get("arguments"), str)
+        ):
+            return None
+        return tool_call_id, function["name"], function["arguments"]
+
+    @classmethod
+    def _tool_calls_are_pairable(cls, tool_calls: object) -> bool:
+        if not isinstance(tool_calls, list) or len(tool_calls) < 2:
+            return False
+        parts = [cls._tool_call_parts(call) for call in tool_calls]
+        return all(part is not None for part in parts) and len(
+            {part[0] for part in parts if part is not None}
+        ) == len(parts)
+
+    @classmethod
+    def _tool_calls_have_new_ids(
+        cls,
+        tool_calls: object,
+        interactions: object,
+    ) -> bool:
+        if not isinstance(tool_calls, list) or not isinstance(interactions, list):
+            return False
+        existing_ids = {
+            interaction.get("tool_call_id")
+            for interaction in interactions
+            if isinstance(interaction, dict)
+        }
+        return all(
+            parts is not None and parts[0] not in existing_ids
+            for parts in (cls._tool_call_parts(call) for call in tool_calls)
+        )
+
+    def _commit_multiple_tool_errors(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        assistant_message: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        tool_calls = assistant_message["tool_calls"]
+        assert isinstance(tool_calls, list)
+        candidate = copy.deepcopy(working)
+        incomplete = candidate["incomplete_turn"]
+        assert isinstance(incomplete, dict)
+        incomplete["deepseek_messages"].append(copy.deepcopy(dict(assistant_message)))
+        error = {
+            "code": "multiple_tool_calls_not_allowed",
+            "message": "每次 GM 响应只能调用一个工具",
+        }
+        for call in tool_calls:
+            parts = self._tool_call_parts(call)
+            assert parts is not None
+            tool_call_id, tool_name, arguments_raw = parts
+            interaction = {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments_raw": arguments_raw,
+                "arguments": None,
+                "ok": False,
+                "result": None,
+                "error": copy.deepcopy(error),
+            }
+            incomplete["tool_interactions"].append(interaction)
+            envelope = {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "ok": False,
+                "result": None,
+                "error": copy.deepcopy(error),
+            }
+            incomplete["deepseek_messages"].append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": tool_name,
+                    "content": json.dumps(
+                        envelope,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                }
+            )
+        candidate["updated_at"] = self._timestamp(self.clock())
+        try:
+            self.session_writer(
+                loaded.session_directory / "session.json",
+                candidate,
+            )
+        except Exception as error:
+            raise AgenticTurnPersistenceError(
+                "多个工具错误无法原子提交"
+            ) from error
+        return candidate
+
+    def _commit_final_or_interrupt(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        turn_id: str,
+        player_input: str,
+        final: _ValidatedFinal,
+        attempt_deadline: datetime,
+        public_mechanics: tuple[PublicMechanic, ...],
+    ) -> TurnResult:
+        if self._remaining_seconds(attempt_deadline) <= 0:
+            return self._interrupt(
+                loaded,
+                working,
+                turn_id,
+                "attempt_timeout",
+                "GM 执行尝试超过时间限制",
+                public_mechanics=public_mechanics,
+            )
+        try:
+            committed, public_changes = self._build_final_commit(
+                working,
+                turn_id,
+                player_input,
+                final,
+            )
+        except AgenticTurnError:
+            return self._interrupt(
+                loaded,
+                working,
+                turn_id,
+                "authority_id_error",
+                "Harness 无法分配稳定标识符",
+                public_mechanics=public_mechanics,
+            )
+
+        try:
+            self.session_writer(
+                loaded.session_directory / "session.json",
+                committed,
+            )
+        except Exception:
+            return self._interrupt(
+                loaded,
+                working,
+                turn_id,
+                "final_commit_failed",
+                "GM 最终答复提交失败",
+                public_mechanics=public_mechanics,
+            )
+        return TurnResult(
+            status="committed",
+            turn_id=turn_id,
+            narration=final.narration,
+            public_mechanics=public_mechanics,
+            public_fact_changes=public_changes,
+            error_code=None,
+            error_message=None,
+        )
 
     def _interrupt(
         self,
@@ -691,6 +1042,17 @@ class AgenticHarness:
             and not isinstance(reasoning, str)
         ):
             raise _FinalValidationError
+        finish_reason = response.finish_reason
+        if finish_reason not in {None, "stop", "tool_calls"}:
+            raise _FinalValidationError
+        tool_calls = message["tool_calls"]
+        if (
+            tool_calls
+            and finish_reason not in {None, "tool_calls"}
+            or not tool_calls
+            and finish_reason == "tool_calls"
+        ):
+            raise _FinalValidationError
         return dict(message)
 
     @classmethod
@@ -772,6 +1134,52 @@ class AgenticHarness:
             session_status=cast(Literal["ongoing", "complete"], status),
         )
 
+    @classmethod
+    def _final_validation_summary(
+        cls,
+        content: object,
+        session: Mapping[str, Any],
+    ) -> str:
+        """生成不含 provider 细节的短校验提示，供同一 GM 修正。"""
+
+        if not isinstance(content, str):
+            return "content 必须是 JSON 文本"
+        try:
+            candidate = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return "content 必须是合法 JSON Object"
+        if not isinstance(candidate, dict):
+            return "顶层必须是 JSON Object"
+        expected = _FINAL_FIELDS
+        unknown = sorted(set(candidate) - expected)
+        missing = sorted(expected - set(candidate))
+        if unknown:
+            return f"不能包含未知字段：{', '.join(unknown)}"
+        if missing:
+            return f"缺少字段：{', '.join(missing)}"
+        status = candidate.get("session_status")
+        if not isinstance(status, str) or status not in {"ongoing", "complete"}:
+            return "session_status 必须是 ongoing 或 complete"
+        if not isinstance(candidate.get("narration"), str):
+            return "narration 必须是非空字符串"
+        retire = candidate.get("retire")
+        if isinstance(retire, list):
+            active_ids = {
+                fact["fact_id"]
+                for fact in session["facts"]
+                if fact["status"] == "active"
+            }
+            for item in retire:
+                if (
+                    isinstance(item, dict)
+                    and (
+                        not isinstance(item.get("fact_id"), str)
+                        or item["fact_id"] not in active_ids
+                    )
+                ):
+                    return "retire.fact_id 必须引用当前有效事实"
+        return "establish、retire 的元素必须符合最终答复契约"
+
     def _build_final_commit(
         self,
         working: Mapping[str, Any],
@@ -852,6 +1260,7 @@ class AgenticHarness:
         incomplete: dict[str, Any],
         response: object,
         *,
+        code: str = "provider_protocol_error",
         message: str = "response envelope cannot form a valid model step",
     ) -> None:
         if isinstance(response, ModelResponse):
@@ -873,7 +1282,7 @@ class AgenticHarness:
             )
         incomplete["provider_protocol_errors"].append(
             {
-                "code": "provider_protocol_error",
+                "code": code,
                 "message": message,
                 "model_response_json": serialized,
                 "recorded_at": self._timestamp(self.clock()),

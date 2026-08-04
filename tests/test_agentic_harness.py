@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from monmusu_agent.agentic_harness import (
@@ -99,6 +99,30 @@ class AgenticHarnessTest(unittest.TestCase):
                         "type": "function",
                         "function": {"name": name, "arguments": arguments_raw},
                     }
+                ],
+            },
+            finish_reason="tool_calls",
+            usage=None,
+            latency_ms=10,
+        )
+
+    @staticmethod
+    def _multi_tool_response(*tool_call_ids: str) -> ModelResponse:
+        return ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "make_check",
+                            "arguments": "{}",
+                        },
+                    }
+                    for tool_call_id in tool_call_ids
                 ],
             },
             finish_reason="tool_calls",
@@ -728,7 +752,9 @@ class AgenticHarnessTest(unittest.TestCase):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 store, game_id = self._create_session(Path(directory))
                 before = store.load_session(game_id).session
-                model = ScriptedGameMasterModel([self._response(final)])
+                model = ScriptedGameMasterModel(
+                    [self._response(final), self._response(final)]
+                )
                 harness = AgenticHarness(
                     store,
                     model,
@@ -760,6 +786,449 @@ class AgenticHarnessTest(unittest.TestCase):
                     loaded["incomplete_turn"]["last_failure"]["code"],
                     "invalid_final_response",
                 )
+
+    def test_invalid_final_receives_one_structure_repair_without_tools(self) -> None:
+        """首次业务 schema 失败只给同一 GM 一次无工具修正机会。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "首份结构不完整。",
+                            "establish": [],
+                            "retire": [],
+                        }
+                    ),
+                    self._response(
+                        {
+                            "narration": "修正后的叙事。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_repair",
+                clock=lambda: datetime(2026, 7, 28, 0, 9, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(result.narration, "修正后的叙事。")
+            self.assertEqual(len(model.requests), 2)
+            self.assertEqual(model.requests[0].tools[0]["function"]["name"], "make_check")
+            self.assertEqual(model.requests[1].tools, ())
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertIsNone(incomplete)
+            committed = store.load_session(game_id).session["turns"][0]
+            self.assertEqual(committed["narration"], "修正后的叙事。")
+
+    def test_eighth_tool_response_commits_tool_and_stops_without_ninth_request(self) -> None:
+        """第八次合法工具响应先持久化，再以 step limit 中断。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "ability": "spot_hidden",
+            "difficulty": "regular",
+            "dice_adjustment": {"kind": "none", "count": 0},
+            "action": "检查牢门",
+            "stakes": "失败会错过痕迹",
+            "visibility": "public",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        "{}",
+                        tool_call_id=f"call_{index}",
+                        name="unknown_tool",
+                    )
+                    for index in range(1, 8)
+                ]
+                + [self._tool_response(arguments, tool_call_id="call_8")]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_eighth_tool",
+                mechanic_id_factory=lambda: f"mechanic_{len(model.requests) + 1}",
+                random_source=ScriptedRandom((3, 4) * 8),
+                clock=lambda: datetime(2026, 7, 28, 0, 10, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "step_limit_exceeded")
+            self.assertEqual(len(model.requests), 8)
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertIsNotNone(incomplete)
+            assert incomplete is not None
+            self.assertEqual(incomplete["round_trips_used"], 8)
+            self.assertEqual(len(incomplete["mechanics"]), 1)
+
+    def test_eighth_response_variants_are_processed_without_a_ninth_request(self) -> None:
+        """第八次 final、工具错误和多工具分支都保存可恢复状态后停止。"""
+
+        valid_final = {
+            "narration": "第八次答复仍可正常提交。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        invalid_final = {
+            "narration": "第八次无效答复不应成为正典。",
+            "establish": [],
+            "retire": [],
+        }
+        variants = (
+            ("final", self._response(valid_final), "committed", None),
+            (
+                "invalid_final",
+                self._response(invalid_final),
+                "interrupted",
+                "step_limit_exceeded",
+            ),
+            (
+                "tool_error",
+                self._tool_response("{}", tool_call_id="call_8", name="unknown_tool"),
+                "interrupted",
+                "step_limit_exceeded",
+            ),
+            (
+                "multiple_tool_error",
+                self._multi_tool_response("call_8a", "call_8b"),
+                "interrupted",
+                "step_limit_exceeded",
+            ),
+            (
+                "unpairable_protocol",
+                self._multi_tool_response("call_8", "call_8"),
+                "interrupted",
+                "provider_protocol_error",
+            ),
+        )
+
+        for label, eighth_response, expected_status, expected_error in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                prefix = [
+                    self._tool_response(
+                        "{}",
+                        tool_call_id=f"call_{index}",
+                        name="unknown_tool",
+                    )
+                    for index in range(1, 8)
+                ]
+                model = ScriptedGameMasterModel(prefix + [eighth_response])
+                harness = AgenticHarness(
+                    store,
+                    model,
+                    turn_id_factory=lambda label=label: f"turn_eighth_{label}",
+                    clock=lambda: datetime(
+                        2026,
+                        7,
+                        28,
+                        0,
+                        10,
+                        tzinfo=timezone.utc,
+                    ),
+                )
+
+                result = harness.start_turn(game_id, "我检查牢门。")
+
+                self.assertEqual(result.status, expected_status)
+                self.assertEqual(result.error_code, expected_error)
+                self.assertEqual(len(model.requests), 8)
+                session = store.load_session(game_id).session
+                if expected_status == "committed":
+                    self.assertEqual(session["incomplete_turn"], None)
+                    self.assertEqual(len(session["turns"]), 1)
+                else:
+                    incomplete = session["incomplete_turn"]
+                    assert incomplete is not None
+                    self.assertEqual(incomplete["round_trips_used"], 8)
+                    if label == "multiple_tool_error":
+                        self.assertEqual(len(incomplete["tool_interactions"]), 9)
+                    elif label == "unpairable_protocol":
+                        self.assertEqual(len(incomplete["tool_interactions"]), 7)
+                        self.assertEqual(
+                            len(incomplete["provider_protocol_errors"]),
+                            1,
+                        )
+                    elif label == "invalid_final":
+                        self.assertEqual(len(incomplete["tool_interactions"]), 7)
+                    else:
+                        self.assertEqual(len(incomplete["tool_interactions"]), 8)
+
+    def test_multiple_usable_tool_calls_are_persisted_as_errors_and_continue(self) -> None:
+        """可关联多工具响应不执行机械，而是逐 ID 返回协议错误。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._multi_tool_response("call_a", "call_b"),
+                    self._response(
+                        {
+                            "narration": "我重新选择一个工具。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_multiple",
+                clock=lambda: datetime(2026, 7, 28, 0, 11, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(model.requests[1].tools[0]["function"]["name"], "make_check")
+            tool_result_messages = [
+                message
+                for message in model.requests[1].messages
+                if message.get("role") == "tool"
+            ]
+            self.assertEqual(len(tool_result_messages), 2)
+            self.assertTrue(
+                all(
+                    "multiple_tool_calls_not_allowed" in message["content"]
+                    for message in tool_result_messages
+                )
+            )
+
+    def test_request_timeout_is_clamped_to_remaining_attempt_budget(self) -> None:
+        """单次请求 timeout 不能超过当前执行尝试的剩余时间。"""
+
+        class ControlledClock:
+            def __init__(self) -> None:
+                self.current = datetime(2026, 7, 28, 0, 12, tzinfo=timezone.utc)
+                self.calls = 0
+
+            def __call__(self) -> datetime:
+                self.calls += 1
+                if self.calls == 2:
+                    self.current += timedelta(seconds=175)
+                return self.current
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            clock = ControlledClock()
+            model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "在剩余时间内完成。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_request_budget",
+                clock=clock,
+            )
+
+            result = harness.start_turn(game_id, "我观察周围。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(model.requests[0].request_timeout_seconds, 5.0)
+
+    def test_attempt_timeout_before_final_commit_keeps_turn_incomplete(self) -> None:
+        """响应返回后若整次尝试已过期，不提交最终叙事。"""
+
+        class AdvancingModel:
+            def __init__(self, clock: object) -> None:
+                self.clock = clock
+                self.requests: list[object] = []
+
+            def complete(self, request: object) -> ModelResponse:
+                self.requests.append(request)
+                assert isinstance(self.clock, ControlledClock)
+                self.clock.current += timedelta(seconds=181)
+                return AgenticHarnessTest._response(
+                    {
+                        "narration": "这段叙事不能提交。",
+                        "establish": [],
+                        "retire": [],
+                        "session_status": "ongoing",
+                    }
+                )
+
+        class ControlledClock:
+            def __init__(self) -> None:
+                self.current = datetime(2026, 7, 28, 0, 13, tzinfo=timezone.utc)
+
+            def __call__(self) -> datetime:
+                return self.current
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            clock = ControlledClock()
+            model = AdvancingModel(clock)
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_attempt_timeout",
+                clock=clock,
+            )
+
+            result = harness.start_turn(game_id, "我观察周围。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "attempt_timeout")
+            loaded = store.load_session(game_id).session
+            self.assertEqual(loaded["turns"], [])
+            self.assertEqual(
+                loaded["incomplete_turn"]["last_failure"]["code"],
+                "attempt_timeout",
+            )
+
+    def test_unpairable_multiple_tool_response_keeps_only_raw_protocol_error(self) -> None:
+        """多工具 ID 不可关联时不伪造任何 assistant/tool 配对。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [self._multi_tool_response("call_same", "call_same")]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_unpairable_multiple",
+                clock=lambda: datetime(2026, 7, 28, 0, 14, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.error_code, "provider_protocol_error")
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            assert incomplete is not None
+            self.assertEqual(len(incomplete["deepseek_messages"]), 3)
+            self.assertEqual(incomplete["tool_interactions"], [])
+            self.assertEqual(len(incomplete["provider_protocol_errors"]), 1)
+
+    def test_second_invalid_final_does_not_receive_a_second_repair(self) -> None:
+        """一次修正仍失败时保持中断，不进入第三次模型请求。"""
+
+        invalid = {
+            "narration": "结构错误。",
+            "establish": [],
+            "retire": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [self._response(invalid), self._response(invalid)]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_repair_failed",
+                clock=lambda: datetime(2026, 7, 28, 0, 15, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.error_code, "invalid_final_response")
+            self.assertEqual(len(model.requests), 2)
+            self.assertEqual(model.requests[1].tools, ())
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            assert incomplete is not None
+            self.assertEqual(incomplete["structure_repairs_used"], 1)
+            self.assertEqual(incomplete["total_structure_repairs"], 1)
+
+    def test_truncated_provider_response_is_an_interruption_without_fallback(self) -> None:
+        """provider 截断不会被 Harness 伪装成可提交叙事。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    ModelResponse(
+                        assistant_message={
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                        },
+                        finish_reason="length",
+                        usage=None,
+                        latency_ms=10,
+                    )
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_truncated",
+                clock=lambda: datetime(2026, 7, 28, 0, 16, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "provider_response_error")
+            self.assertIsNone(result.narration)
+            self.assertEqual(store.load_session(game_id).session["turns"], [])
+
+    def test_unknown_finish_reason_is_a_provider_protocol_interruption(self) -> None:
+        """未知模型步骤不能伪装成合法 final。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            final = {
+                "narration": "未知步骤不能提交。",
+                "establish": [],
+                "retire": [],
+                "session_status": "ongoing",
+            }
+            model = ScriptedGameMasterModel(
+                [
+                    ModelResponse(
+                        assistant_message={
+                            "role": "assistant",
+                            "content": json.dumps(final, ensure_ascii=False),
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                        },
+                        finish_reason="mystery",
+                        usage=None,
+                        latency_ms=10,
+                    )
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_unknown_step",
+                clock=lambda: datetime(2026, 7, 28, 0, 17, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "invalid_model_response")
+            self.assertEqual(store.load_session(game_id).session["turns"], [])
+
 
     def test_retired_fact_cannot_be_retired_again(self) -> None:
         """已结束事实不是后续 final 可再次结束的有效引用。"""
@@ -1254,8 +1723,11 @@ class AgenticHarnessTest(unittest.TestCase):
         for label, later_step, error_code, failed_write in later_failures:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 store, game_id = self._create_session(Path(directory))
+                later_steps = [later_step]
+                if error_code == "invalid_final_response":
+                    later_steps.append(later_step)
                 model = ScriptedGameMasterModel(
-                    [self._tool_response(valid_arguments), later_step]
+                    [self._tool_response(valid_arguments), *later_steps]
                 )
                 writes = 0
 

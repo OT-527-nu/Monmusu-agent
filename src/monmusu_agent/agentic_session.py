@@ -896,7 +896,11 @@ class AgenticSessionStore:
         if not isinstance(limits, dict) or set(limits) != _ATTEMPT_LIMIT_FIELDS:
             raise AgenticSessionLoadError("attempt_limits 格式无效")
         if any(
-            not cls._is_bounded_integer(limits.get(field), 1, 1_000_000)
+            not cls._is_bounded_integer(
+                limits.get(field),
+                0 if field == "max_structure_repairs" else 1,
+                1_000_000,
+            )
             for field in _ATTEMPT_LIMIT_FIELDS
         ):
             raise AgenticSessionLoadError("attempt_limits 格式无效")
@@ -1033,58 +1037,71 @@ class AgenticSessionStore:
                 if (
                     content is not None
                     or not isinstance(tool_calls, list)
-                    or len(tool_calls) != 1
+                    or not tool_calls
                     or interaction_index >= len(interactions)
-                    or message_index + 1 >= len(messages)
+                    or message_index + len(tool_calls) >= len(messages)
                 ):
                     raise AgenticSessionLoadError("deepseek_messages 格式无效")
-                call = tool_calls[0]
-                if (
-                    not isinstance(call, dict)
-                    or set(call) != _TOOL_CALL_FIELDS
-                    or call.get("type") != "function"
-                    or not isinstance(call.get("function"), dict)
-                    or set(call["function"]) != _FUNCTION_CALL_FIELDS
-                ):
-                    raise AgenticSessionLoadError("deepseek_messages 格式无效")
-                tool_message = messages[message_index + 1]
-                interaction = interactions[interaction_index]
-                if (
-                    not isinstance(tool_message, dict)
-                    or set(tool_message) != _TOOL_MESSAGE_FIELDS
-                    or tool_message.get("role") != "tool"
-                    or not isinstance(interaction, dict)
-                    or call.get("id") != interaction.get("tool_call_id")
-                    or call["function"].get("name") != interaction.get("tool_name")
-                    or call["function"].get("arguments")
-                    != interaction.get("arguments_raw")
-                    or tool_message.get("tool_call_id")
-                    != interaction.get("tool_call_id")
-                    or tool_message.get("name") != interaction.get("tool_name")
-                ):
-                    raise AgenticSessionLoadError("deepseek_messages 格式无效")
-                content_raw = tool_message.get("content")
-                if not isinstance(content_raw, str):
-                    raise AgenticSessionLoadError("deepseek_messages 格式无效")
-                try:
-                    envelope = json.loads(content_raw)
-                except json.JSONDecodeError as error:
-                    raise AgenticSessionLoadError(
-                        "deepseek_messages 格式无效"
-                    ) from error
-                if (
-                    not isinstance(envelope, dict)
-                    or set(envelope) != _TOOL_ENVELOPE_FIELDS
-                    or envelope.get("tool_call_id")
-                    != interaction.get("tool_call_id")
-                    or envelope.get("tool_name") != interaction.get("tool_name")
-                    or envelope.get("ok") is not interaction.get("ok")
-                    or envelope.get("result") != interaction.get("result")
-                    or envelope.get("error") != interaction.get("error")
-                ):
-                    raise AgenticSessionLoadError("deepseek_messages 格式无效")
-                interaction_index += 1
-                message_index += 2
+                response_ids: set[str] = set()
+                for offset, call in enumerate(tool_calls):
+                    if (
+                        not isinstance(call, dict)
+                        or set(call) != _TOOL_CALL_FIELDS
+                        or call.get("type") != "function"
+                        or not isinstance(call.get("id"), str)
+                        or not call["id"]
+                        or call["id"] != call["id"].strip()
+                        or call["id"] in response_ids
+                        or not isinstance(call.get("function"), dict)
+                        or set(call["function"]) != _FUNCTION_CALL_FIELDS
+                        or not isinstance(call["function"].get("name"), str)
+                        or not call["function"]["name"]
+                        or call["function"]["name"]
+                        != call["function"]["name"].strip()
+                        or not isinstance(call["function"].get("arguments"), str)
+                    ):
+                        raise AgenticSessionLoadError("deepseek_messages 格式无效")
+                    response_ids.add(call["id"])
+                    tool_message = messages[message_index + 1 + offset]
+                    interaction = interactions[interaction_index + offset]
+                    if (
+                        not isinstance(tool_message, dict)
+                        or set(tool_message) != _TOOL_MESSAGE_FIELDS
+                        or tool_message.get("role") != "tool"
+                        or not isinstance(interaction, dict)
+                        or call.get("id") != interaction.get("tool_call_id")
+                        or call["function"].get("name")
+                        != interaction.get("tool_name")
+                        or call["function"].get("arguments")
+                        != interaction.get("arguments_raw")
+                        or tool_message.get("tool_call_id")
+                        != interaction.get("tool_call_id")
+                        or tool_message.get("name") != interaction.get("tool_name")
+                    ):
+                        raise AgenticSessionLoadError("deepseek_messages 格式无效")
+                    content_raw = tool_message.get("content")
+                    if not isinstance(content_raw, str):
+                        raise AgenticSessionLoadError("deepseek_messages 格式无效")
+                    try:
+                        envelope = json.loads(content_raw)
+                    except json.JSONDecodeError as error:
+                        raise AgenticSessionLoadError(
+                            "deepseek_messages 格式无效"
+                        ) from error
+                    if (
+                        not isinstance(envelope, dict)
+                        or set(envelope) != _TOOL_ENVELOPE_FIELDS
+                        or envelope.get("tool_call_id")
+                        != interaction.get("tool_call_id")
+                        or envelope.get("tool_name")
+                        != interaction.get("tool_name")
+                        or envelope.get("ok") is not interaction.get("ok")
+                        or envelope.get("result") != interaction.get("result")
+                        or envelope.get("error") != interaction.get("error")
+                    ):
+                        raise AgenticSessionLoadError("deepseek_messages 格式无效")
+                interaction_index += len(tool_calls)
+                message_index += 1 + len(tool_calls)
             else:
                 raise AgenticSessionLoadError("deepseek_messages 格式无效")
         if interaction_index != len(interactions):
