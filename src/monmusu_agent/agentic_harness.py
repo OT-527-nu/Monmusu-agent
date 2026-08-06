@@ -97,6 +97,7 @@ _REPAIR_PROMPT = (
     "请只返回完整、合法的 JSON Object，顶层只能包含 narration、establish、retire、session_status；"
     "不要调用工具，不要加入 fact_id、mechanic_id、诊断或其他字段。"
 )
+_REPAIR_PROMPT_PREFIX = f"{_REPAIR_PROMPT}\n本地校验提示："
 
 
 class AgenticTurnError(RuntimeError):
@@ -377,7 +378,10 @@ class AgenticHarness:
         attempt_deadline = attempt_started + timedelta(
             seconds=limits["attempt_timeout_seconds"]
         )
-        repair_pending = False
+        repair_pending = self._repair_request_pending(
+            incomplete["deepseek_messages"]
+        )
+        repair_pending_from_previous_attempt = repair_pending
         while True:
             incomplete = working["incomplete_turn"]
             assert isinstance(incomplete, dict)
@@ -600,7 +604,7 @@ class AgenticHarness:
             try:
                 final = self._validate_final(direct_message["content"], working)
             except _FinalValidationError:
-                if repair_pending:
+                if repair_pending and not repair_pending_from_previous_attempt:
                     return self._interrupt(
                         loaded,
                         working,
@@ -620,8 +624,8 @@ class AgenticHarness:
                         {
                             "role": "user",
                             "content": (
-                                f"{_REPAIR_PROMPT}\n"
-                                f"本地校验提示：{self._final_validation_summary(direct_message['content'], working)}"
+                                f"{_REPAIR_PROMPT_PREFIX}"
+                                f"{self._final_validation_summary(direct_message['content'], working)}"
                             ),
                         }
                     )
@@ -640,6 +644,7 @@ class AgenticHarness:
                             public_mechanics=tuple(public_mechanics),
                         )
                     repair_pending = True
+                    repair_pending_from_previous_attempt = False
                     continue
                 code = (
                     "step_limit_exceeded"
@@ -654,7 +659,11 @@ class AgenticHarness:
                     (
                         "GM 执行尝试达到往返上限"
                         if code == "step_limit_exceeded"
-                        else "GM 最终答复结构或事实引用无效"
+                        else (
+                            "GM 结构修正仍然无效"
+                            if repair_pending
+                            else "GM 最终答复结构或事实引用无效"
+                        )
                     ),
                     public_mechanics=tuple(public_mechanics),
                 )
@@ -680,6 +689,20 @@ class AgenticHarness:
             raise AgenticTurnPersistenceError(
                 "未完成回合无法持久化，模型未被调用"
             ) from error
+
+    @staticmethod
+    def _repair_request_pending(messages: object) -> bool:
+        """从 Harness 自己持久化的末条消息恢复无工具修正相位。"""
+
+        if not isinstance(messages, list) or not messages:
+            return False
+        last_message = messages[-1]
+        return (
+            isinstance(last_message, dict)
+            and last_message.get("role") == "user"
+            and isinstance(last_message.get("content"), str)
+            and last_message["content"].startswith(_REPAIR_PROMPT_PREFIX)
+        )
 
     @staticmethod
     def _validated_attempt_limits(

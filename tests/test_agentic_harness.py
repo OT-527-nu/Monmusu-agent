@@ -1678,6 +1678,100 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(after_third["total_structure_repairs"], 1)
             self.assertEqual(store.load_session(game_id).session["turns"], [])
 
+    def test_resume_preserves_pending_structure_repair_phase(self) -> None:
+        """恢复先完成已保存的无工具修正，并仍拥有本次修正预算。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            invalid_final = self._response(
+                {
+                    "narration": "不会提交的叙事。",
+                    "establish": [],
+                    "retire": [],
+                    "session_status": [],
+                }
+            )
+            first_harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        invalid_final,
+                        ModelCallError("request_timeout", "private", retryable=True),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_0001",
+                clock=lambda: datetime(2026, 7, 27, 0, 5, tzinfo=timezone.utc),
+            )
+            interrupted = first_harness.start_turn(game_id, "我倾听门外。")
+            saved = store.load_session(game_id).session["incomplete_turn"]
+            replay_prefix = saved["deepseek_messages"]
+
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            self.assertEqual(replay_prefix[-1]["role"], "user")
+            self.assertIn("本地校验提示", replay_prefix[-1]["content"])
+
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    invalid_final,
+                    self._response(
+                        {
+                            "narration": "门外只有潮水拍击石墙。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            resumed = AgenticHarness(
+                store,
+                resumed_model,
+                clock=lambda: datetime(2026, 7, 27, 0, 6, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_0001")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(len(resumed_model.requests), 2)
+            self.assertEqual(resumed_model.requests[0].messages, tuple(replay_prefix))
+            self.assertEqual(resumed_model.requests[0].tools, ())
+            self.assertEqual(resumed_model.requests[1].tools, ())
+
+    def test_structure_repair_budget_is_hard_capped_at_one(self) -> None:
+        """即使配置误设更大，单次执行也不能连续修正两次。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            invalid_final = self._response(
+                {
+                    "narration": "不会提交的叙事。",
+                    "establish": [],
+                    "retire": [],
+                    "session_status": [],
+                }
+            )
+            model = ScriptedGameMasterModel(
+                [invalid_final, invalid_final, invalid_final]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                attempt_limits={
+                    "max_round_trips": 8,
+                    "request_timeout_seconds": 60,
+                    "attempt_timeout_seconds": 180,
+                    "max_structure_repairs": 2,
+                },
+                turn_id_factory=lambda: "turn_0001",
+                clock=lambda: datetime(2026, 7, 27, 0, 5, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我倾听门外。")
+
+            self.assertEqual(result.error_code, "invalid_final_response")
+            self.assertEqual(len(model.requests), 2)
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(incomplete["structure_repairs_used"], 1)
+            self.assertEqual(incomplete["total_structure_repairs"], 1)
+
     def test_invalid_recovery_requests_fail_before_model_call_or_write(self) -> None:
         """恢复 ID 或冻结 profile 不可用时，不得改变原恢复记录。"""
 
