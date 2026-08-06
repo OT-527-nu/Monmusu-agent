@@ -181,6 +181,25 @@ _TOOL_ENVELOPE_FIELDS = frozenset(
 )
 
 
+def tool_call_matches_interaction(
+    interaction: Mapping[str, Any],
+    tool_name: str,
+    arguments_raw: str,
+) -> bool:
+    """按持久化幂等规则比较一次 provider 工具重发。"""
+
+    if interaction.get("tool_name") != tool_name:
+        return False
+    persisted_arguments = interaction.get("arguments")
+    if isinstance(persisted_arguments, dict):
+        try:
+            incoming_arguments = normalize_make_check_arguments(arguments_raw)
+        except MakeCheckError:
+            return arguments_raw == interaction.get("arguments_raw")
+        return incoming_arguments == persisted_arguments
+    return arguments_raw == interaction.get("arguments_raw")
+
+
 class AgenticSessionError(RuntimeError):
     """表示 Agentic 会话无法被可靠创建或装载。"""
 
@@ -1006,7 +1025,17 @@ class AgenticSessionStore:
     ) -> None:
         if not isinstance(messages, list) or len(messages) < 3:
             raise AgenticSessionLoadError("deepseek_messages 格式无效")
-        interaction_index = 0
+        interactions_by_id = {
+            interaction["tool_call_id"]: interaction
+            for interaction in interactions
+            if isinstance(interaction, dict)
+            and isinstance(interaction.get("tool_call_id"), str)
+        }
+        if len(interactions_by_id) != len(interactions):
+            raise AgenticSessionLoadError("deepseek_messages 格式无效")
+        expected_interaction_order = list(interactions_by_id)
+        first_seen_interaction_ids: list[str] = []
+        seen_interaction_ids: set[str] = set()
         message_index = 0
         while message_index < len(messages):
             message = messages[message_index]
@@ -1039,7 +1068,6 @@ class AgenticSessionStore:
                     content is not None
                     or not isinstance(tool_calls, list)
                     or not tool_calls
-                    or interaction_index >= len(interactions)
                     or message_index + len(tool_calls) >= len(messages)
                 ):
                     raise AgenticSessionLoadError("deepseek_messages 格式无效")
@@ -1064,7 +1092,18 @@ class AgenticSessionStore:
                         raise AgenticSessionLoadError("deepseek_messages 格式无效")
                     response_ids.add(call["id"])
                     tool_message = messages[message_index + 1 + offset]
-                    interaction = interactions[interaction_index + offset]
+                    interaction = interactions_by_id.get(call["id"])
+                    first_occurrence = call["id"] not in seen_interaction_ids
+                    arguments_raw = call["function"]["arguments"]
+                    arguments_match = isinstance(interaction, dict) and (
+                        arguments_raw == interaction.get("arguments_raw")
+                        if first_occurrence
+                        else tool_call_matches_interaction(
+                            interaction,
+                            call["function"]["name"],
+                            arguments_raw,
+                        )
+                    )
                     if (
                         not isinstance(tool_message, dict)
                         or set(tool_message) != _TOOL_MESSAGE_FIELDS
@@ -1073,8 +1112,7 @@ class AgenticSessionStore:
                         or call.get("id") != interaction.get("tool_call_id")
                         or call["function"].get("name")
                         != interaction.get("tool_name")
-                        or call["function"].get("arguments")
-                        != interaction.get("arguments_raw")
+                        or not arguments_match
                         or tool_message.get("tool_call_id")
                         != interaction.get("tool_call_id")
                         or tool_message.get("name") != interaction.get("tool_name")
@@ -1101,11 +1139,13 @@ class AgenticSessionStore:
                         or envelope.get("error") != interaction.get("error")
                     ):
                         raise AgenticSessionLoadError("deepseek_messages 格式无效")
-                interaction_index += len(tool_calls)
+                    if first_occurrence:
+                        seen_interaction_ids.add(call["id"])
+                        first_seen_interaction_ids.append(call["id"])
                 message_index += 1 + len(tool_calls)
             else:
                 raise AgenticSessionLoadError("deepseek_messages 格式无效")
-        if interaction_index != len(interactions):
+        if first_seen_interaction_ids != expected_interaction_order:
             raise AgenticSessionLoadError("deepseek_messages 格式无效")
 
     @classmethod

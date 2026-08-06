@@ -30,7 +30,11 @@ from monmusu_agent.agentic_model import (
     deepseek_model_profile,
     validated_model_profile,
 )
-from monmusu_agent.agentic_session import AgenticSessionStore, LoadedSession
+from monmusu_agent.agentic_session import (
+    AgenticSessionStore,
+    LoadedSession,
+    tool_call_matches_interaction,
+)
 from monmusu_agent.config import PROJECT_ROOT
 from monmusu_agent.storage import write_json_atomic
 
@@ -542,15 +546,22 @@ class AgenticHarness:
                         public_mechanics.append(public_mechanic)
                         if public_mechanic_sink is not None:
                             public_mechanic_sink(public_mechanic)
-                elif self._tool_calls_are_pairable(tool_calls) and self._tool_calls_have_new_ids(
-                    tool_calls,
-                    incomplete["tool_interactions"],
-                ):
+                elif self._tool_calls_are_pairable(tool_calls):
                     try:
                         working = self._commit_multiple_tool_errors(
                             loaded,
                             working,
                             assistant_message,
+                        )
+                    except _FinalValidationError:
+                        self._record_protocol_error(incomplete, response)
+                        return self._interrupt(
+                            loaded,
+                            working,
+                            turn_id,
+                            "provider_protocol_error",
+                            "GM 工具调用协议无效",
+                            public_mechanics=tuple(public_mechanics),
                         )
                     except AgenticTurnPersistenceError:
                         self._record_protocol_error(
@@ -760,24 +771,6 @@ class AgenticHarness:
             {part[0] for part in parts if part is not None}
         ) == len(parts)
 
-    @classmethod
-    def _tool_calls_have_new_ids(
-        cls,
-        tool_calls: object,
-        interactions: object,
-    ) -> bool:
-        if not isinstance(tool_calls, list) or not isinstance(interactions, list):
-            return False
-        existing_ids = {
-            interaction.get("tool_call_id")
-            for interaction in interactions
-            if isinstance(interaction, dict)
-        }
-        return all(
-            parts is not None and parts[0] not in existing_ids
-            for parts in (cls._tool_call_parts(call) for call in tool_calls)
-        )
-
     def _commit_multiple_tool_errors(
         self,
         loaded: LoadedSession,
@@ -798,6 +791,30 @@ class AgenticHarness:
             parts = self._tool_call_parts(call)
             assert parts is not None
             tool_call_id, tool_name, arguments_raw = parts
+            existing_interaction = next(
+                (
+                    interaction
+                    for interaction in incomplete["tool_interactions"]
+                    if isinstance(interaction, dict)
+                    and interaction.get("tool_call_id") == tool_call_id
+                ),
+                None,
+            )
+            if existing_interaction is not None:
+                if (
+                    not tool_call_matches_interaction(
+                        existing_interaction,
+                        tool_name,
+                        arguments_raw,
+                    )
+                    or existing_interaction.get("ok") is not False
+                    or existing_interaction.get("error") != error
+                ):
+                    raise _FinalValidationError
+                incomplete["deepseek_messages"].append(
+                    self._tool_message(existing_interaction)
+                )
+                continue
             interaction = {
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
@@ -808,25 +825,7 @@ class AgenticHarness:
                 "error": copy.deepcopy(error),
             }
             incomplete["tool_interactions"].append(interaction)
-            envelope = {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "ok": False,
-                "result": None,
-                "error": copy.deepcopy(error),
-            }
-            incomplete["deepseek_messages"].append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": tool_name,
-                    "content": json.dumps(
-                        envelope,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                }
-            )
+            incomplete["deepseek_messages"].append(self._tool_message(interaction))
         candidate["updated_at"] = self._timestamp(self.clock())
         try:
             self.session_writer(
@@ -979,13 +978,6 @@ class AgenticHarness:
 
         incomplete = working["incomplete_turn"]
         assert isinstance(incomplete, dict)
-        if any(
-            interaction.get("tool_call_id") == tool_call_id
-            for interaction in incomplete["tool_interactions"]
-            if isinstance(interaction, dict)
-        ):
-            # Increment 2 才恢复同 ID 重放；当前切片先安全停止，绝不重复结算。
-            raise _FinalValidationError
         tool_name = function.get("name")
         arguments_raw = function.get("arguments")
         if (
@@ -995,6 +987,44 @@ class AgenticHarness:
             or not isinstance(arguments_raw, str)
         ):
             raise _FinalValidationError
+
+        existing_interaction = next(
+            (
+                interaction
+                for interaction in incomplete["tool_interactions"]
+                if isinstance(interaction, dict)
+                and interaction.get("tool_call_id") == tool_call_id
+            ),
+            None,
+        )
+        if existing_interaction is not None:
+            if not tool_call_matches_interaction(
+                existing_interaction,
+                tool_name,
+                arguments_raw,
+            ):
+                # 保留最后一个合法前缀；调用 ID 复用但参数改变不能覆盖原结果。
+                raise _FinalValidationError
+            candidate = copy.deepcopy(working)
+            incomplete_candidate = candidate["incomplete_turn"]
+            assert isinstance(incomplete_candidate, dict)
+            incomplete_candidate["deepseek_messages"].extend(
+                [
+                    copy.deepcopy(dict(assistant_message)),
+                    self._tool_message(existing_interaction),
+                ]
+            )
+            candidate["updated_at"] = self._timestamp(self.clock())
+            try:
+                self.session_writer(
+                    loaded.session_directory / "session.json",
+                    candidate,
+                )
+            except Exception as commit_error:
+                raise AgenticTurnPersistenceError(
+                    "工具重放无法原子提交"
+                ) from commit_error
+            return candidate, None
 
         arguments: dict[str, Any] | None = None
         mechanic: dict[str, Any] | None = None
@@ -1034,19 +1064,6 @@ class AgenticHarness:
             except MakeCheckError as tool_error:
                 error = {"code": tool_error.code, "message": tool_error.message}
 
-        envelope = {
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "ok": mechanic is not None,
-            "result": copy.deepcopy(mechanic),
-            "error": copy.deepcopy(error),
-        }
-        tool_message = {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": json.dumps(envelope, ensure_ascii=False, sort_keys=True),
-        }
         interaction = {
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
@@ -1056,6 +1073,7 @@ class AgenticHarness:
             "result": copy.deepcopy(mechanic),
             "error": copy.deepcopy(error),
         }
+        tool_message = self._tool_message(interaction)
         candidate = copy.deepcopy(working)
         incomplete_candidate = candidate["incomplete_turn"]
         assert isinstance(incomplete_candidate, dict)
@@ -1080,6 +1098,22 @@ class AgenticHarness:
         if mechanic is not None and mechanic["visibility"] == "public":
             public = self._public_mechanic(mechanic)
         return candidate, public
+
+    @staticmethod
+    def _tool_message(interaction: Mapping[str, Any]) -> dict[str, Any]:
+        envelope = {
+            "tool_call_id": interaction["tool_call_id"],
+            "tool_name": interaction["tool_name"],
+            "ok": interaction["ok"],
+            "result": copy.deepcopy(interaction["result"]),
+            "error": copy.deepcopy(interaction["error"]),
+        }
+        return {
+            "role": "tool",
+            "tool_call_id": interaction["tool_call_id"],
+            "name": interaction["tool_name"],
+            "content": json.dumps(envelope, ensure_ascii=False, sort_keys=True),
+        }
 
     @staticmethod
     def _public_mechanic(mechanic: Mapping[str, Any]) -> PublicMechanic:

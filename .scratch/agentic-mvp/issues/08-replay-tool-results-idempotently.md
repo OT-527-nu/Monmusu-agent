@@ -4,7 +4,7 @@
 
 Blocked by: 07 — 恢复同一个未完成回合
 
-Status: ready-for-agent
+Status: done
 
 ## References
 
@@ -14,13 +14,20 @@ Status: ready-for-agent
 - [Agent Loop](../../../docs/agentic_mvp/agent_loop.md): “模型响应协议”, “工具分支”, “八次模型往返”和“显式恢复时序”。
 - [ADR-025](../../../docs/adr/0025-mechanics-commit-before-atomic-gm-response.md), [ADR-036](../../../docs/adr/0036-agent-loop-has-eight-round-trip-safety-fuse.md), and [ADR-038](../../../docs/adr/0038-player-explicitly-resumes-incomplete-turn.md).
 
-- [ ] 在每个回合内强制一个 `(turn_id, tool_call_id)` 最多对应一条持久化 `ToolInteraction`；跨回合相同 provider ID 不混淆，不把 `tool_call_id` 提升为 Harness 权威 ID。
-- [ ] 同 ID、同工具名且同参数的重发返回已保存的成功结果或结构化错误，不调用 RNG、不重复角色数值变化、不追加第二条 mechanic/interaction，也不把旧公开机械再次报告为新提交事件。
-- [ ] 幂等比较优先使用已通过 schema 的规范化参数；无法规范化时精确比较 `arguments_raw`，包括空白和转义差异。相同 ID 搭配不同工具名、不同规范参数或不同 raw 字符串返回稳定 protocol error，不能覆盖原记录或执行工具。
-- [ ] 单工具调用缺失、非字符串、空或首尾有空白的 ID 不创建 synthetic assistant/tool 配对或 `ToolInteraction`；只原子保存受限 `provider_protocol_errors` 与稳定失败状态，从最后一个合法可回放前缀恢复。
-- [ ] 多工具响应一个也不执行。所有 ID 可用且唯一时，原子保存每个失败 `ToolInteraction` 与对应错误 tool message，并仅在预算允许时继续；任一 ID 不可用或重复时只保存受限原始协议记录并中断。
-- [ ] 第八响应上的成功工具、失败工具、可关联多工具和不可关联响应沿用 Ticket 06 分支：保存能保存的权威状态后中断，绝不为反馈请求第九个响应。
-- [ ] 机械、角色变化、成功/失败 `ToolInteraction` 及可回放 assistant/tool 消息继续通过一次 `session.json` 原子替换提交；故障注入证明写入失败不会留下部分幂等映射，也不会让后续恢复误判工具已经或尚未执行。
-- [ ] 从 `start_turn` / `resume_turn` 公开 seam，以真实临时 session、确定性 RNG、可编程假 model 和重复进程重建覆盖：成功/失败工具同参重发、raw fallback、异参重发、多工具各分支、不可用/重复 ID、工具提交故障、反复恢复；每案断言机械 ID、骰点和数值变化始终恰好一次。
+- [x] 在每个回合内强制一个 `(turn_id, tool_call_id)` 最多对应一条持久化 `ToolInteraction`；跨回合相同 provider ID 不混淆，不把 `tool_call_id` 提升为 Harness 权威 ID。
+- [x] 同 ID、同工具名且同参数的重发返回已保存的成功结果或结构化错误，不调用 RNG、不重复角色数值变化、不追加第二条 mechanic/interaction，也不把旧公开机械再次报告为新提交事件。
+- [x] 幂等比较优先使用已通过 schema 的规范化参数；无法规范化时精确比较 `arguments_raw`，包括空白和转义差异。相同 ID 搭配不同工具名、不同规范参数或不同 raw 字符串返回稳定 protocol error，不能覆盖原记录或执行工具。
+- [x] 单工具调用缺失、非字符串、空或首尾有空白的 ID 不创建 synthetic assistant/tool 配对或 `ToolInteraction`；只原子保存受限 `provider_protocol_errors` 与稳定失败状态，从最后一个合法可回放前缀恢复。
+- [x] 多工具响应一个也不执行。所有 ID 可用且唯一时，原子保存每个失败 `ToolInteraction` 与对应错误 tool message，并仅在预算允许时继续；任一 ID 不可用或重复时只保存受限原始协议记录并中断。
+- [x] 第八响应上的成功工具、失败工具、可关联多工具和不可关联响应沿用 Ticket 06 分支：保存能保存的权威状态后中断，绝不为反馈请求第九个响应。
+- [x] 机械、角色变化、成功/失败 `ToolInteraction` 及可回放 assistant/tool 消息继续通过一次 `session.json` 原子替换提交；故障注入证明写入失败不会留下部分幂等映射，也不会让后续恢复误判工具已经或尚未执行。
+- [x] 从 `start_turn` / `resume_turn` 公开 seam，以真实临时 session、确定性 RNG、可编程假 model 和重复进程重建覆盖：成功/失败工具同参重发、raw fallback、异参重发、多工具各分支、不可用/重复 ID、工具提交故障、反复恢复；每案断言机械 ID、骰点和数值变化始终恰好一次。
 
 **Not in this ticket:** 新 COC 工具、通用去重服务、CLI 菜单、thinking transport、真实 DeepSeek 证据或把 provider `tool_call_id` 作为跨会话身份。
+
+## Comments
+
+- 2026-08-06：Ticket 08 已完成。Harness 在分配 mechanic ID 或读取 RNG 前按 `(turn_id, tool_call_id)` 查找持久化交互；规范参数可等价重放，规范化失败退回精确 `arguments_raw` 比较。匹配时原子追加本次 assistant/tool 协议对并复用既有结果，不追加 interaction/mechanic 或公开事件；不匹配时保留原合法前缀并以稳定 `provider_protocol_error` 中断。
+- 2026-08-06：Session loader 仍强制每个 provider ID 只有一条 `ToolInteraction`，但允许后续合法 assistant/tool 重放对按首次交互顺序引用该记录；首次消息要求原始参数一致，后续消息按同一规范化/raw 幂等规则校验。跨回合仍只以当前 `turn_id` 作用域查重。
+- 2026-08-06：公开 lifecycle 测试覆盖成功/结构化失败同参重放、规范化等价 raw、raw fallback 与 raw 异常、异参中断、跨回合 ID 复用、连续恢复、工具原子写失败后的进程重建、多工具错误重放、不可用 ID/第八响应既有分支；断言 RNG、mechanic ID、角色值、interaction 数量、消息顺序、公开事件与最终回合数量。
+- 验证：`PYTHONPATH=src .venv/bin/python -m unittest tests.test_agentic_harness tests.test_agentic_session`（68 passed）；`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`（177 passed）；`.venv/bin/mypy src/monmusu_agent/agentic_harness.py src/monmusu_agent/agentic_session.py src/monmusu_agent/agentic_model.py`、targeted Ruff 基础规则和 `git diff --check` 均通过。验证解释器为项目 `.venv` 的 Python 3.12.3。

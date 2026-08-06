@@ -131,6 +131,28 @@ class AgenticHarnessTest(unittest.TestCase):
             latency_ms=10,
         )
 
+    @staticmethod
+    def _valid_check_arguments() -> dict[str, object]:
+        return {
+            "actor_id": "investigator_tracker",
+            "ability": "spot_hidden",
+            "difficulty": "regular",
+            "dice_adjustment": {"kind": "none", "count": 0},
+            "action": "检查牢门",
+            "stakes": "失败会错过痕迹",
+            "visibility": "public",
+        }
+
+    @staticmethod
+    def _tool_message_count(messages: object) -> int:
+        if not isinstance(messages, (list, tuple)):
+            return 0
+        return sum(
+            1
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "tool"
+        )
+
     def test_make_check_commits_before_same_gm_final(self) -> None:
         """公开检定先形成可信机械，再以匹配协议 ID 返回同一个 GM。"""
 
@@ -1601,6 +1623,439 @@ class AgenticHarnessTest(unittest.TestCase):
                 ["mechanic_public", "mechanic_hidden"],
             )
 
+    def test_resume_replays_same_successful_tool_call_idempotently(self) -> None:
+        """GM 重发同一成功调用时只复用已提交结果，不重复机械。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            actors_before = store.load_session(game_id).session["actors"]
+            arguments = self._valid_check_arguments()
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments, tool_call_id="call_replay"),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after tool",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_replay_success",
+                mechanic_id_factory=lambda: "mechanic_replay",
+                random_source=ScriptedRandom((3, 4)),
+                clock=lambda: datetime(2026, 7, 28, 0, 20, tzinfo=timezone.utc),
+            )
+
+            interrupted = first.start_turn(game_id, "我检查牢门。")
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            saved = store.load_session(game_id).session["incomplete_turn"]
+            assert saved is not None
+            replay_prefix = saved["deepseek_messages"]
+
+            replay_random = ScriptedRandom(())
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        json.dumps(arguments, ensure_ascii=False, indent=2),
+                        tool_call_id="call_replay",
+                    ),
+                    ModelCallError(
+                        "request_timeout",
+                        "stop after replay",
+                        retryable=True,
+                    ),
+                ]
+            )
+            published: list[PublicMechanic] = []
+            allocated_mechanic_ids: list[str] = []
+
+            def forbidden_mechanic_id() -> str:
+                allocated_mechanic_ids.append("mechanic_forbidden")
+                return "mechanic_forbidden"
+
+            resumed_harness = AgenticHarness(
+                store,
+                resumed_model,
+                mechanic_id_factory=forbidden_mechanic_id,
+                random_source=replay_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 21, tzinfo=timezone.utc),
+            )
+            replayed = resumed_harness.resume_turn(
+                game_id,
+                "turn_replay_success",
+                public_mechanic_sink=published.append,
+            )
+
+            self.assertEqual(replayed.error_code, "request_timeout")
+            self.assertEqual(replayed.public_mechanics, ())
+            self.assertEqual(published, [])
+            self.assertEqual(replay_random.calls, [])
+            self.assertEqual(allocated_mechanic_ids, [])
+            self.assertEqual(len(resumed_model.requests), 2)
+            self.assertEqual(resumed_model.requests[0].messages, tuple(replay_prefix))
+            after_replay = store.load_session(game_id).session["incomplete_turn"]
+            assert after_replay is not None
+            self.assertEqual(len(after_replay["tool_interactions"]), 1)
+            self.assertEqual(len(after_replay["mechanics"]), 1)
+            self.assertEqual(len(after_replay["deepseek_messages"]), 7)
+            self.assertEqual(
+                self._tool_message_count(after_replay["deepseek_messages"]),
+                2,
+            )
+
+            final_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        json.dumps(arguments, ensure_ascii=False, indent=2),
+                        tool_call_id="call_replay",
+                    ),
+                    self._response(
+                        {
+                            "narration": "门锁附近没有新的动静。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            final_harness = AgenticHarness(
+                store,
+                final_model,
+                mechanic_id_factory=forbidden_mechanic_id,
+                random_source=replay_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 22, tzinfo=timezone.utc),
+            )
+            resumed = final_harness.resume_turn(
+                game_id,
+                "turn_replay_success",
+                public_mechanic_sink=published.append,
+            )
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(resumed.public_mechanics, ())
+            self.assertEqual(published, [])
+            self.assertEqual(replay_random.calls, [])
+            self.assertEqual(allocated_mechanic_ids, [])
+            self.assertEqual(
+                final_model.requests[0].messages,
+                tuple(after_replay["deepseek_messages"]),
+            )
+            committed = store.load_session(game_id).session
+            self.assertEqual(committed["actors"], actors_before)
+            self.assertEqual(len(committed["turns"]), 1)
+            self.assertEqual(
+                committed["turns"][0]["mechanics"][0]["mechanic_id"],
+                "mechanic_replay",
+            )
+            self.assertEqual(committed["turns"][0]["mechanics"][0]["roll"], 43)
+
+            self.assertEqual(
+                self._tool_message_count(final_model.requests[1].messages),
+                3,
+            )
+
+    def test_resume_replays_same_failed_tool_call_idempotently(self) -> None:
+        """GM 重发同一结构化失败时复用原错误，不生成第二条交互。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            arguments_raw = "{"
+            first_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        arguments_raw,
+                        tool_call_id="call_failed",
+                    ),
+                    ModelCallError(
+                        "request_timeout",
+                        "stop after tool",
+                        retryable=True,
+                    ),
+                ]
+            )
+            first = AgenticHarness(
+                store,
+                first_model,
+                turn_id_factory=lambda: "turn_replay_failure",
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 22, tzinfo=timezone.utc),
+            )
+            first.start_turn(game_id, "我检查牢门。")
+
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        arguments_raw,
+                        tool_call_id="call_failed",
+                    ),
+                    self._response(
+                        {
+                            "narration": "你暂时没有可靠的检定工具。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            resumed = AgenticHarness(
+                store,
+                resumed_model,
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 23, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_replay_failure")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(
+                self._tool_message_count(resumed_model.requests[1].messages),
+                2,
+            )
+            committed = store.load_session(game_id).session
+            self.assertEqual(len(committed["turns"]), 1)
+            self.assertEqual(committed["turns"][0]["mechanics"], [])
+
+    def test_resume_replays_multiple_tool_errors_without_new_interactions(self) -> None:
+        """多工具协议错误重发时逐 ID 复用失败结果，不追加交互。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._multi_tool_response("call_a", "call_b"),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after multiple-tool error",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_multiple_replay",
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 36, tzinfo=timezone.utc),
+            )
+            first.start_turn(game_id, "我检查牢门。")
+
+            replay_model = ScriptedGameMasterModel(
+                [
+                    self._multi_tool_response("call_a", "call_b"),
+                    ModelCallError(
+                        "request_timeout",
+                        "stop after replayed multiple-tool error",
+                        retryable=True,
+                    ),
+                ]
+            )
+            replayed = AgenticHarness(
+                store,
+                replay_model,
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 37, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_multiple_replay")
+
+            self.assertEqual(replayed.error_code, "request_timeout")
+            after_replay = store.load_session(game_id).session["incomplete_turn"]
+            assert after_replay is not None
+            self.assertEqual(len(after_replay["tool_interactions"]), 2)
+            self.assertEqual(len(after_replay["mechanics"]), 0)
+            self.assertEqual(len(after_replay["deepseek_messages"]), 9)
+            self.assertEqual(len(after_replay["provider_protocol_errors"]), 0)
+
+            final_model = ScriptedGameMasterModel(
+                [
+                    self._multi_tool_response("call_a", "call_b"),
+                    self._response(
+                        {
+                            "narration": "我改为一次只选择一个工具。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                final_model,
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 38, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_multiple_replay")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(result.public_mechanics, ())
+            committed = store.load_session(game_id).session
+            self.assertEqual(len(committed["turns"]), 1)
+            self.assertEqual(committed["turns"][0]["mechanics"], [])
+            self.assertEqual(
+                self._tool_message_count(final_model.requests[1].messages),
+                6,
+            )
+
+    def test_replay_mismatch_keeps_original_interaction_and_interrupts(self) -> None:
+        """同 ID 异规范参数不能覆盖原结果或再次执行工具。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            arguments = self._valid_check_arguments()
+            changed = {**arguments, "action": "改看走廊暗影"}
+            first_random = ScriptedRandom((3, 4))
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            tool_call_id="call_mismatch",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after tool",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_replay_mismatch",
+                mechanic_id_factory=lambda: "mechanic_mismatch",
+                random_source=first_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 26, tzinfo=timezone.utc),
+            )
+            first.start_turn(game_id, "我检查牢门。")
+            saved = store.load_session(game_id).session["incomplete_turn"]
+            assert saved is not None
+            original_messages = saved["deepseek_messages"]
+            original_interaction = saved["tool_interactions"][0]
+
+            replay_random = ScriptedRandom(())
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            changed,
+                            tool_call_id="call_mismatch",
+                        )
+                    ]
+                ),
+                random_source=replay_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 27, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_replay_mismatch")
+
+            self.assertEqual(result.error_code, "provider_protocol_error")
+            self.assertEqual(replay_random.calls, [])
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            assert incomplete is not None
+            self.assertEqual(incomplete["deepseek_messages"], original_messages)
+            self.assertEqual(
+                incomplete["tool_interactions"],
+                [original_interaction],
+            )
+            self.assertEqual(len(incomplete["mechanics"]), 1)
+            self.assertEqual(len(incomplete["provider_protocol_errors"]), 1)
+
+    def test_changed_raw_after_failed_normalization_interrupts(self) -> None:
+        """规范化失败时只要 raw 改变就必须中断。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            "{",
+                            tool_call_id="call_raw_changed",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after tool",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_raw_changed",
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 30, tzinfo=timezone.utc),
+            )
+            first.start_turn(game_id, "我检查牢门。")
+
+            replay_random = ScriptedRandom(())
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            "{ ",
+                            tool_call_id="call_raw_changed",
+                        )
+                    ]
+                ),
+                random_source=replay_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 31, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_raw_changed")
+
+            self.assertEqual(result.error_code, "provider_protocol_error")
+            self.assertEqual(replay_random.calls, [])
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            assert incomplete is not None
+            self.assertEqual(len(incomplete["tool_interactions"]), 1)
+            self.assertEqual(len(incomplete["mechanics"]), 0)
+            self.assertEqual(len(incomplete["provider_protocol_errors"]), 1)
+
+    def test_same_provider_tool_id_is_independent_across_turns(self) -> None:
+        """provider ID 只在当前 turn_id 内构成幂等键。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            arguments = self._valid_check_arguments()
+            final = self._response(
+                {
+                    "narration": "检查已经完成。",
+                    "establish": [],
+                    "retire": [],
+                    "session_status": "ongoing",
+                }
+            )
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(arguments, tool_call_id="call_reused"),
+                    final,
+                    self._tool_response(arguments, tool_call_id="call_reused"),
+                    final,
+                ]
+            )
+            turn_ids = iter(("turn_first", "turn_second"))
+            mechanic_ids = iter(("mechanic_first", "mechanic_second"))
+            random_source = ScriptedRandom((3, 4, 5, 6))
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: next(turn_ids),
+                mechanic_id_factory=lambda: next(mechanic_ids),
+                random_source=random_source,
+                clock=lambda: datetime(2026, 7, 28, 0, 35, tzinfo=timezone.utc),
+            )
+
+            first = harness.start_turn(game_id, "我第一次检查牢门。")
+            second = harness.start_turn(game_id, "我第二次检查牢门。")
+
+            self.assertEqual(first.status, "committed")
+            self.assertEqual(second.status, "committed")
+            self.assertEqual(random_source.calls, [(0, 9)] * 4)
+            turns = store.load_session(game_id).session["turns"]
+            self.assertEqual(len(turns), 2)
+            self.assertEqual(
+                [turn["mechanics"][0]["mechanic_id"] for turn in turns],
+                ["mechanic_first", "mechanic_second"],
+            )
+            self.assertEqual(
+                [turn["mechanics"][0]["roll"] for turn in turns],
+                [43, 65],
+            )
+
     def test_repeated_resume_resets_attempt_budget_and_preserves_totals(self) -> None:
         """每次恢复获得冻结预算，同时保留同一回合的累计诊断。"""
 
@@ -2280,6 +2735,107 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(len(incomplete["provider_protocol_errors"]), 1)
             self.assertEqual(random_source.calls, [(0, 9), (0, 9)])
             self.assertEqual(len(model.requests), 1)
+
+    def test_restart_after_tool_write_failure_executes_then_replays_exactly_once(
+        self,
+    ) -> None:
+        """写失败不留幂等映射，重启后提交一次且后续重放不再执行。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            arguments = self._valid_check_arguments()
+            writes = 0
+
+            def fail_first_tool_write(path: Path, value: object) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected tool write failure")
+                write_json_atomic(path, value)
+
+            first_random = ScriptedRandom((3, 4))
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [self._tool_response(arguments, tool_call_id="call_atomic")]
+                ),
+                turn_id_factory=lambda: "turn_atomic_replay",
+                mechanic_id_factory=lambda: "mechanic_uncommitted",
+                random_source=first_random,
+                session_writer=fail_first_tool_write,
+                clock=lambda: datetime(2026, 7, 28, 0, 32, tzinfo=timezone.utc),
+            )
+
+            failed = first.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(failed.error_code, "tool_commit_failed")
+            after_failure = store.load_session(game_id).session["incomplete_turn"]
+            assert after_failure is not None
+            self.assertEqual(after_failure["mechanics"], [])
+            self.assertEqual(after_failure["tool_interactions"], [])
+            self.assertEqual(len(after_failure["deepseek_messages"]), 3)
+            self.assertEqual(first_random.calls, [(0, 9), (0, 9)])
+
+            committed_random = ScriptedRandom((5, 6))
+            second = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments, tool_call_id="call_atomic"),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after committed retry",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                mechanic_id_factory=lambda: "mechanic_committed",
+                random_source=committed_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 33, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_atomic_replay")
+
+            self.assertEqual(second.error_code, "request_timeout")
+            self.assertEqual(committed_random.calls, [(0, 9), (0, 9)])
+            after_commit = store.load_session(game_id).session["incomplete_turn"]
+            assert after_commit is not None
+            self.assertEqual(len(after_commit["mechanics"]), 1)
+            self.assertEqual(len(after_commit["tool_interactions"]), 1)
+            self.assertEqual(
+                after_commit["mechanics"][0]["mechanic_id"],
+                "mechanic_committed",
+            )
+            self.assertEqual(after_commit["mechanics"][0]["roll"], 65)
+
+            replay_random = ScriptedRandom(())
+            third = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments, tool_call_id="call_atomic"),
+                        self._response(
+                            {
+                                "narration": "牢门仍然紧闭。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                    ]
+                ),
+                random_source=replay_random,
+                clock=lambda: datetime(2026, 7, 28, 0, 34, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_atomic_replay")
+
+            self.assertEqual(third.status, "committed")
+            self.assertEqual(replay_random.calls, [])
+            session = store.load_session(game_id).session
+            self.assertEqual(len(session["turns"]), 1)
+            self.assertEqual(len(session["turns"][0]["mechanics"]), 1)
+            self.assertEqual(
+                session["turns"][0]["mechanics"][0]["mechanic_id"],
+                "mechanic_committed",
+            )
+            self.assertEqual(session["turns"][0]["mechanics"][0]["roll"], 65)
 
     def test_committed_check_survives_provider_and_final_failures_exactly_once(self) -> None:
         """工具提交后的 provider/final 故障不回滚、不重掷也不重复机械。"""
