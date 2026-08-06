@@ -815,12 +815,13 @@ class AgenticSessionStore:
             for value in counters
         ):
             raise AgenticSessionLoadError("IncompleteTurn 格式无效")
+        assert isinstance(attempt_number, int)
         assert isinstance(round_trips_used, int)
         assert isinstance(total_round_trips, int)
         assert isinstance(structure_repairs_used, int)
         assert isinstance(total_structure_repairs, int)
         if (
-            attempt_number != 1
+            attempt_number < 1
             or round_trips_used > total_round_trips
             or structure_repairs_used > total_structure_repairs
         ):

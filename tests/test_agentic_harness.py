@@ -15,6 +15,7 @@ from monmusu_agent.agentic_model import (
     ModelCallError,
     ModelResponse,
     ScriptedGameMasterModel,
+    deepseek_model_profile,
 )
 from monmusu_agent.agentic_session import (
     AgenticSessionLoadError,
@@ -347,7 +348,9 @@ class AgenticHarnessTest(unittest.TestCase):
             persisted_text = (loaded.session_directory / "session.json").read_text(
                 encoding="utf-8"
             )
+            lifecycle = harness.get_session_state(game_id)
             self.assertNotIn("不得进入玩家记录的隐藏推理", persisted_text)
+            self.assertNotIn("蓄水池里潜伏着一名拾骨者。", repr(lifecycle))
 
     def test_model_profile_rejects_unknown_secret_before_turn_allocation(self) -> None:
         """provider 配置只冻结已知非秘密字段，凭据不能触及存档。"""
@@ -1438,6 +1441,343 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(allocated_turn_ids, ["turn_0001"])
             self.assertEqual(len(model.requests), 1)
 
+    def test_interrupted_turn_is_discoverable_and_resumes_after_restart(self) -> None:
+        """调用者只读发现中断后，可由新 Harness 显式恢复同一回合。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            interrupted_model = ScriptedGameMasterModel(
+                [
+                    ModelCallError(
+                        "request_timeout",
+                        "private provider detail",
+                        retryable=True,
+                    )
+                ]
+            )
+            first_harness = AgenticHarness(
+                store,
+                interrupted_model,
+                turn_id_factory=lambda: "turn_0001",
+                clock=lambda: datetime(2026, 7, 27, 0, 5, tzinfo=timezone.utc),
+            )
+            interrupted = first_harness.start_turn(
+                game_id,
+                "我贴近门缝倾听。",
+            )
+            session_file = store.load_session(game_id).session_directory / "session.json"
+            before_projection = session_file.read_bytes()
+
+            lifecycle = first_harness.get_session_state(game_id)
+
+            self.assertEqual(lifecycle.session_status, "ongoing")
+            self.assertEqual(lifecycle.technical_status, "interrupted")
+            self.assertTrue(lifecycle.has_incomplete_turn)
+            self.assertEqual(lifecycle.turn_id, "turn_0001")
+            self.assertEqual(lifecycle.error_code, "request_timeout")
+            self.assertNotIn("private provider detail", lifecycle.error_message or "")
+            self.assertEqual(lifecycle.public_mechanics, ())
+            self.assertEqual(len(interrupted_model.requests), 1)
+            self.assertEqual(session_file.read_bytes(), before_projection)
+
+            allocated_turn_ids: list[str] = []
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "门外只有潮水拍击石墙的回声。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            restarted_harness = AgenticHarness(
+                store,
+                resumed_model,
+                turn_id_factory=lambda: allocated_turn_ids.append("unexpected")
+                or "turn_unexpected",
+                clock=lambda: datetime(2026, 7, 27, 0, 6, tzinfo=timezone.utc),
+            )
+
+            resumed = restarted_harness.resume_turn(game_id, interrupted.turn_id)
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(resumed.turn_id, "turn_0001")
+            self.assertEqual(allocated_turn_ids, [])
+            self.assertEqual(len(resumed_model.requests), 1)
+            committed = store.load_session(game_id).session
+            self.assertIsNone(committed["incomplete_turn"])
+            self.assertEqual(len(committed["turns"]), 1)
+            self.assertEqual(committed["turns"][0]["turn_id"], "turn_0001")
+            self.assertEqual(
+                committed["turns"][0]["player_input"],
+                "我贴近门缝倾听。",
+            )
+
+    def test_resume_replays_committed_tools_without_reroll_or_hidden_leak(self) -> None:
+        """恢复沿用合法工具前缀，公开投影不泄露隐藏机械。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            public_arguments = {
+                "actor_id": "investigator_tracker",
+                "ability": "spot_hidden",
+                "difficulty": "regular",
+                "dice_adjustment": {"kind": "none", "count": 0},
+                "action": "检查门锁上的新鲜刮痕",
+                "stakes": "失败会错过守卫留下的痕迹",
+                "visibility": "public",
+            }
+            hidden_arguments = {
+                **public_arguments,
+                "actor_id": "investigator_tracker",
+                "action": "判断走廊远处的暗影是否正在靠近",
+                "stakes": "失败会误判暗影的位置",
+                "visibility": "hidden",
+            }
+            interrupted_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(public_arguments, tool_call_id="call_public"),
+                    self._tool_response(hidden_arguments, tool_call_id="call_hidden"),
+                    ModelCallError("request_timeout", "private", retryable=True),
+                ]
+            )
+            mechanic_ids = iter(("mechanic_public", "mechanic_hidden"))
+            first_random = ScriptedRandom((3, 4, 5, 6))
+            first_harness = AgenticHarness(
+                store,
+                interrupted_model,
+                turn_id_factory=lambda: "turn_0001",
+                mechanic_id_factory=lambda: next(mechanic_ids),
+                random_source=first_random,
+                clock=lambda: datetime(2026, 7, 27, 0, 5, tzinfo=timezone.utc),
+            )
+
+            interrupted = first_harness.start_turn(game_id, "我仔细观察牢门。")
+            lifecycle = first_harness.get_session_state(game_id)
+            saved_incomplete = store.load_session(game_id).session["incomplete_turn"]
+            replay_prefix = saved_incomplete["deepseek_messages"]
+
+            self.assertEqual(interrupted.status, "interrupted")
+            self.assertEqual(
+                [item.mechanic_id for item in lifecycle.public_mechanics],
+                ["mechanic_public"],
+            )
+            self.assertNotIn("mechanic_hidden", repr(lifecycle))
+            self.assertNotIn("private", repr(lifecycle))
+            self.assertEqual(len(saved_incomplete["mechanics"]), 2)
+
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "刮痕很新，远处的暗影却没有继续靠近。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            resumed_random = ScriptedRandom(())
+            restarted_harness = AgenticHarness(
+                store,
+                resumed_model,
+                random_source=resumed_random,
+                clock=lambda: datetime(2026, 7, 27, 0, 6, tzinfo=timezone.utc),
+            )
+
+            resumed = restarted_harness.resume_turn(game_id, "turn_0001")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(resumed_model.requests[0].messages, tuple(replay_prefix))
+            self.assertEqual(resumed_random.calls, [])
+            committed = store.load_session(game_id).session
+            self.assertEqual(len(committed["turns"]), 1)
+            self.assertEqual(
+                [item["mechanic_id"] for item in committed["turns"][0]["mechanics"]],
+                ["mechanic_public", "mechanic_hidden"],
+            )
+
+    def test_repeated_resume_resets_attempt_budget_and_preserves_totals(self) -> None:
+        """每次恢复获得冻结预算，同时保留同一回合的累计诊断。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first_harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [ModelCallError("request_timeout", "private", retryable=True)]
+                ),
+                turn_id_factory=lambda: "turn_0001",
+                clock=lambda: datetime(2026, 7, 27, 0, 5, tzinfo=timezone.utc),
+            )
+            first_harness.start_turn(game_id, "我继续倾听门外。")
+            invalid_final = self._response(
+                {
+                    "narration": "不会提交的叙事。",
+                    "establish": [],
+                    "retire": [],
+                    "session_status": [],
+                }
+            )
+            second_model = ScriptedGameMasterModel([invalid_final, invalid_final])
+            local_one_response_limits = {
+                "max_round_trips": 1,
+                "request_timeout_seconds": 1,
+                "attempt_timeout_seconds": 1,
+                "max_structure_repairs": 0,
+            }
+            second_harness = AgenticHarness(
+                store,
+                second_model,
+                attempt_limits=local_one_response_limits,
+                clock=lambda: datetime(2026, 7, 27, 0, 6, tzinfo=timezone.utc),
+            )
+
+            second = second_harness.resume_turn(game_id, "turn_0001")
+
+            self.assertEqual(second.error_code, "invalid_final_response")
+            self.assertEqual(len(second_model.requests), 2)
+            after_second = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(after_second["turn_id"], "turn_0001")
+            self.assertEqual(after_second["attempt_number"], 2)
+            self.assertEqual(after_second["round_trips_used"], 2)
+            self.assertEqual(after_second["total_round_trips"], 2)
+            self.assertEqual(after_second["structure_repairs_used"], 1)
+            self.assertEqual(after_second["total_structure_repairs"], 1)
+            self.assertEqual(
+                after_second["attempt_limits"],
+                {
+                    "max_round_trips": 8,
+                    "request_timeout_seconds": 60,
+                    "attempt_timeout_seconds": 180,
+                    "max_structure_repairs": 1,
+                },
+            )
+
+            third_model = ScriptedGameMasterModel(
+                [ModelCallError("request_timeout", "private", retryable=True)]
+            )
+            third_harness = AgenticHarness(
+                store,
+                third_model,
+                clock=lambda: datetime(2026, 7, 27, 0, 7, tzinfo=timezone.utc),
+            )
+            third = third_harness.resume_turn(game_id, "turn_0001")
+
+            self.assertEqual(third.error_code, "request_timeout")
+            after_third = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(after_third["turn_id"], "turn_0001")
+            self.assertEqual(after_third["attempt_number"], 3)
+            self.assertEqual(after_third["round_trips_used"], 0)
+            self.assertEqual(after_third["total_round_trips"], 2)
+            self.assertEqual(after_third["structure_repairs_used"], 0)
+            self.assertEqual(after_third["total_structure_repairs"], 1)
+            self.assertEqual(store.load_session(game_id).session["turns"], [])
+
+    def test_invalid_recovery_requests_fail_before_model_call_or_write(self) -> None:
+        """恢复 ID 或冻结 profile 不可用时，不得改变原恢复记录。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, game_id = self._create_session(root)
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [ModelCallError("request_timeout", "private", retryable=True)]
+                ),
+                turn_id_factory=lambda: "turn_0001",
+                clock=lambda: datetime(2026, 7, 27, 0, 5, tzinfo=timezone.utc),
+            ).start_turn(game_id, "我贴近门缝倾听。")
+            session_file = store.load_session(game_id).session_directory / "session.json"
+            interrupted_bytes = session_file.read_bytes()
+
+            wrong_id_model = ScriptedGameMasterModel(
+                [self._response({"unreachable": True})]
+            )
+            wrong_id_harness = AgenticHarness(store, wrong_id_model)
+            with self.assertRaisesRegex(
+                AgenticTurnBlockedError,
+                "指定回合当前不可恢复",
+            ):
+                wrong_id_harness.resume_turn(game_id, "turn_wrong")
+            self.assertEqual(wrong_id_model.requests, [])
+            self.assertEqual(session_file.read_bytes(), interrupted_bytes)
+
+            wrong_profile_model = ScriptedGameMasterModel(
+                [self._response({"unreachable": True})]
+            )
+            wrong_profile_harness = AgenticHarness(
+                store,
+                wrong_profile_model,
+                model_profile=deepseek_model_profile(model_id="deepseek-v4-pro"),
+            )
+            with self.assertRaisesRegex(
+                AgenticTurnBlockedError,
+                "冻结的模型运行配置当前不可用",
+            ):
+                wrong_profile_harness.resume_turn(game_id, "turn_0001")
+            self.assertEqual(wrong_profile_model.requests, [])
+            self.assertEqual(session_file.read_bytes(), interrupted_bytes)
+
+            fresh_store = AgenticSessionStore(
+                session_root=root / "fresh-sessions",
+                game_id_factory=lambda: "game_fresh_0001",
+                clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+            fresh = fresh_store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            unavailable_model = ScriptedGameMasterModel(
+                [self._response({"unreachable": True})]
+            )
+            fresh_harness = AgenticHarness(fresh_store, unavailable_model)
+            ready = fresh_harness.get_session_state(fresh.game_id)
+            self.assertEqual(ready.technical_status, "ready")
+            self.assertFalse(ready.has_incomplete_turn)
+            with self.assertRaisesRegex(
+                AgenticTurnBlockedError,
+                "指定回合当前不可恢复",
+            ):
+                fresh_harness.resume_turn(fresh.game_id, "turn_unknown")
+            self.assertEqual(unavailable_model.requests, [])
+
+            completed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "你登上引潮舟，驶离沉城。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "complete",
+                        }
+                    )
+                ]
+            )
+            completed_harness = AgenticHarness(
+                fresh_store,
+                completed_model,
+                turn_id_factory=lambda: "turn_complete",
+            )
+            completed_harness.start_turn(fresh.game_id, "我驶离港口。")
+            completed = completed_harness.get_session_state(fresh.game_id)
+            self.assertEqual(completed.session_status, "complete")
+            self.assertEqual(completed.technical_status, "complete")
+            self.assertFalse(completed.has_incomplete_turn)
+            model_calls_before_resume = len(completed_model.requests)
+            with self.assertRaisesRegex(
+                AgenticTurnBlockedError,
+                "指定回合当前不可恢复",
+            ):
+                completed_harness.resume_turn(fresh.game_id, "turn_complete")
+            self.assertEqual(len(completed_model.requests), model_calls_before_resume)
+
     def test_provider_failure_code_is_allowlisted_before_persistence_or_output(self) -> None:
         """provider 失败码不是玩家输出协议，未知值必须收敛为稳定码。"""
 
@@ -1724,6 +2064,70 @@ class AgenticHarnessTest(unittest.TestCase):
                 )
                 self.assertEqual(random_source.calls, [])
                 self.assertEqual(len(model.requests), 1)
+
+    def test_resume_omits_unpairable_provider_response_from_replay_prefix(self) -> None:
+        """不可配对响应只留在受限诊断，恢复请求仅发送最后合法前缀。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first_harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "ability": "spot_hidden",
+                                "difficulty": "regular",
+                                "dice_adjustment": {"kind": "none", "count": 0},
+                                "action": "检查牢门",
+                                "stakes": "失败会错过痕迹",
+                                "visibility": "public",
+                            },
+                            tool_call_id=None,
+                            reasoning="受限协议材料",
+                        )
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_0001",
+                random_source=ScriptedRandom(()),
+                clock=lambda: datetime(2026, 7, 28, 0, 4, tzinfo=timezone.utc),
+            )
+            first_harness.start_turn(game_id, "我检查牢门。")
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            replay_prefix = incomplete["deepseek_messages"]
+            self.assertIn(
+                "受限协议材料",
+                incomplete["provider_protocol_errors"][0]["model_response_json"],
+            )
+
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "牢门没有显出更多痕迹。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            resumed = AgenticHarness(
+                store,
+                resumed_model,
+                clock=lambda: datetime(2026, 7, 28, 0, 5, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_0001")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(resumed_model.requests[0].messages, tuple(replay_prefix))
+            self.assertNotIn(
+                "受限协议材料",
+                json.dumps(
+                    resumed_model.requests[0].messages,
+                    ensure_ascii=False,
+                ),
+            )
 
     def test_tool_write_failure_reports_no_mechanic_and_stops_same_gm(self) -> None:
         """工具事务写失败时不向 GM 或玩家报告未提交的随机结果。"""
@@ -2126,10 +2530,13 @@ class AgenticHarnessTest(unittest.TestCase):
                 "我悄悄拨动排水沟盖。",
                 public_mechanic_sink=published.append,
             )
+            lifecycle = harness.get_session_state(game_id)
 
             self.assertEqual(result.error_code, "request_timeout")
             self.assertEqual(result.public_mechanics, ())
             self.assertEqual(published, [])
+            self.assertEqual(lifecycle.public_mechanics, ())
+            self.assertNotIn(secret_action, repr(lifecycle))
             incomplete = store.load_session(game_id).session["incomplete_turn"]
             mechanic = incomplete["mechanics"][0]
             self.assertEqual(mechanic["visibility"], "hidden")
@@ -2195,8 +2602,8 @@ class AgenticHarnessTest(unittest.TestCase):
             ):
                 store.load_session(game_id)
 
-    def test_final_write_failure_keeps_only_interrupted_turn(self) -> None:
-        """最终原子替换失败后看不到部分回合或事实，只保留中断材料。"""
+    def test_final_write_failure_recovers_to_one_committed_turn(self) -> None:
+        """最终写失败不留部分事实，恢复后只提交一份回合和事实。"""
 
         with tempfile.TemporaryDirectory() as directory:
             store, game_id = self._create_session(Path(directory))
@@ -2249,6 +2656,41 @@ class AgenticHarnessTest(unittest.TestCase):
                 session["incomplete_turn"]["last_failure"]["code"],
                 "final_commit_failed",
             )
+
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "敲击声表明墙后存在空腔。",
+                            "establish": [
+                                {
+                                    "visibility": "public",
+                                    "text": "牢房墙后存在空腔。",
+                                }
+                            ],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            resumed = AgenticHarness(
+                store,
+                resumed_model,
+                fact_id_factory=lambda: "fact_1001",
+                clock=lambda: datetime(2026, 7, 27, 0, 7, tzinfo=timezone.utc),
+            ).resume_turn(game_id, "turn_0001")
+
+            self.assertEqual(resumed.status, "committed")
+            committed = store.load_session(game_id).session
+            self.assertIsNone(committed["incomplete_turn"])
+            self.assertEqual(len(committed["turns"]), 1)
+            self.assertEqual(committed["turns"][0]["turn_id"], "turn_0001")
+            recovered_facts = [
+                fact for fact in committed["facts"] if fact["fact_id"] == "fact_1001"
+            ]
+            self.assertEqual(len(recovered_facts), 1)
+            self.assertEqual(recovered_facts[0]["text"], "牢房墙后存在空腔。")
 
     def test_repeated_injected_final_write_failure_still_returns_interruption(self) -> None:
         """写入器持续失败时，Harness 仍用原子恢复写回稳定中断而非抛异常。"""

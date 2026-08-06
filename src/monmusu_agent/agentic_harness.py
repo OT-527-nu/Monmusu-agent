@@ -77,6 +77,20 @@ _PROVIDER_FAILURE_CODES = frozenset(
         "unsupported_thinking_mode",
     }
 )
+_PUBLIC_INTERRUPTION_CODES = _PROVIDER_FAILURE_CODES | frozenset(
+    {
+        "provider_error",
+        "attempt_timeout",
+        "step_limit_exceeded",
+        "invalid_model_response",
+        "invalid_final_response",
+        "provider_protocol_error",
+        "tool_commit_failed",
+        "authority_id_error",
+        "structure_repair_failed",
+        "final_commit_failed",
+    }
+)
 _TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "content_filter"})
 _REPAIR_PROMPT = (
     "你的上一份答复未通过本地最终答复结构校验。"
@@ -140,6 +154,19 @@ class TurnResult:
     narration: str | None
     public_mechanics: tuple[PublicMechanic, ...]
     public_fact_changes: tuple[PublicFactChange, ...]
+    error_code: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class SessionLifecycleView:
+    """向玩家调用层公开会话状态，不泄露受限恢复材料。"""
+
+    session_status: Literal["ongoing", "complete"]
+    technical_status: Literal["ready", "interrupted", "complete"]
+    has_incomplete_turn: bool
+    turn_id: str | None
+    public_mechanics: tuple[PublicMechanic, ...]
     error_code: str | None
     error_message: str | None
 
@@ -211,21 +238,6 @@ class AgenticHarness:
     ) -> TurnResult:
         """开始新回合，并委托一个有界的单次 GM 执行尝试。"""
 
-        return self._execute_attempt(
-            game_id,
-            player_input,
-            public_mechanic_sink=public_mechanic_sink,
-        )
-
-    def _execute_attempt(
-        self,
-        game_id: str,
-        player_input: str,
-        *,
-        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
-    ) -> TurnResult:
-        """执行一次新回合尝试；未来 resume_turn 可复用此边界。"""
-
         action = self._required_string(player_input, "player_input")
         loaded = self.store.load_session(game_id)
         current = loaded.session
@@ -261,17 +273,114 @@ class AgenticHarness:
         }
         working["updated_at"] = started_at
         self._write_initial_state(loaded, working)
+        return self._execute_attempt(
+            loaded,
+            working,
+            attempt_started,
+            public_mechanic_sink=public_mechanic_sink,
+        )
 
+    def get_session_state(self, game_id: str) -> SessionLifecycleView:
+        """只读返回玩家安全的会话生命周期投影。"""
+
+        current = self.store.load_session(game_id).session
+        incomplete = current["incomplete_turn"]
+        if incomplete is None:
+            status = cast(Literal["ongoing", "complete"], current["session_status"])
+            return SessionLifecycleView(
+                session_status=status,
+                technical_status="complete" if status == "complete" else "ready",
+                has_incomplete_turn=False,
+                turn_id=None,
+                public_mechanics=(),
+                error_code=None,
+                error_message=None,
+            )
+
+        assert isinstance(incomplete, dict)
+        public_mechanics = tuple(
+            self._public_mechanic(mechanic)
+            for mechanic in incomplete["mechanics"]
+            if mechanic["visibility"] == "public"
+        )
+        last_failure = incomplete["last_failure"]
+        raw_code = last_failure.get("code") if isinstance(last_failure, dict) else None
+        error_code = (
+            raw_code
+            if isinstance(raw_code, str) and raw_code in _PUBLIC_INTERRUPTION_CODES
+            else "technical_interruption"
+        )
+        return SessionLifecycleView(
+            session_status="ongoing",
+            technical_status="interrupted",
+            has_incomplete_turn=True,
+            turn_id=cast(str, incomplete["turn_id"]),
+            public_mechanics=public_mechanics,
+            error_code=error_code,
+            error_message="回合因技术问题中断，需要显式恢复",
+        )
+
+    def resume_turn(
+        self,
+        game_id: str,
+        turn_id: str,
+        *,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
+    ) -> TurnResult:
+        """以明确 ID 恢复同一未完成回合，并开启新的有界尝试。"""
+
+        recovery_turn_id = self._required_string(turn_id, "turn_id")
+        loaded = self.store.load_session(game_id)
+        current = loaded.session
+        incomplete = current["incomplete_turn"]
+        if incomplete is None or incomplete.get("turn_id") != recovery_turn_id:
+            raise AgenticTurnBlockedError("指定回合当前不可恢复")
+        if incomplete["model_profile"] != self.model_profile:
+            raise AgenticTurnBlockedError("冻结的模型运行配置当前不可用")
+
+        attempt_started = self.clock()
+        attempt_started_at = self._timestamp(attempt_started)
+        working = copy.deepcopy(dict(current))
+        resumed = working["incomplete_turn"]
+        assert isinstance(resumed, dict)
+        resumed["attempt_number"] += 1
+        resumed["attempt_started_at"] = attempt_started_at
+        resumed["round_trips_used"] = 0
+        resumed["structure_repairs_used"] = 0
+        resumed["last_failure"] = None
+        working["updated_at"] = attempt_started_at
+        self._write_initial_state(loaded, working)
+        return self._execute_attempt(
+            loaded,
+            working,
+            attempt_started,
+            public_mechanic_sink=public_mechanic_sink,
+        )
+
+    def _execute_attempt(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        attempt_started: datetime,
+        *,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
+    ) -> TurnResult:
+        """执行已准备的新回合或恢复尝试。"""
+
+        incomplete = working["incomplete_turn"]
+        assert isinstance(incomplete, dict)
+        turn_id = cast(str, incomplete["turn_id"])
+        action = cast(str, incomplete["player_input"])
+        profile = cast(dict[str, Any], incomplete["model_profile"])
+        limits = cast(dict[str, int], incomplete["attempt_limits"])
         public_mechanics: list[PublicMechanic] = []
         attempt_deadline = attempt_started + timedelta(
-            seconds=self.attempt_limits["attempt_timeout_seconds"]
+            seconds=limits["attempt_timeout_seconds"]
         )
         repair_pending = False
         while True:
             incomplete = working["incomplete_turn"]
             assert isinstance(incomplete, dict)
-            limits = incomplete["attempt_limits"]
-            assert isinstance(limits, dict)
             remaining = self._remaining_seconds(attempt_deadline)
             if remaining <= 0:
                 return self._interrupt(
@@ -300,7 +409,7 @@ class AgenticHarness:
                     float(limits["request_timeout_seconds"]),
                     remaining,
                 ),
-                model_profile=copy.deepcopy(self.model_profile),
+                model_profile=copy.deepcopy(profile),
             )
             try:
                 response = self.model.complete(request)
