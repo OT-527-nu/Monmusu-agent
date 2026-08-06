@@ -34,6 +34,12 @@ These rules apply to agents editing this repository. Prefer evidence, narrow sco
 - Remove only dead paths made obsolete by the active migration slice or by your own changes.
 - Do not commit unless the user asks or the active workflow explicitly requires a commit.
 
+## Git commits
+
+- Use Conventional Commits format: `<type>: <imperative summary>`.
+- Use one primary type, such as `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, or `chore:`; do not concatenate prefixes such as `fix: docs:`.
+- Keep the summary specific to the user-visible change and avoid vague messages such as `update` or `misc changes`.
+
 ## Reliability boundaries
 
 - Treat provider responses, tool arguments, JSON/schema data, timeouts, and recovery state as untrusted boundaries.
