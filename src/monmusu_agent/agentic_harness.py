@@ -743,6 +743,16 @@ class AgenticHarness:
                 public_mechanics=public_mechanics,
             )
 
+        if self._remaining_seconds(attempt_deadline) <= 0:
+            return self._interrupt(
+                loaded,
+                working,
+                turn_id,
+                "attempt_timeout",
+                "GM 执行尝试超过时间限制",
+                public_mechanics=public_mechanics,
+            )
+
         try:
             self.session_writer(
                 loaded.session_directory / "session.json",

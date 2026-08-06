@@ -844,6 +844,7 @@ class AgenticHarnessTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom((3, 4) * 8)
             model = ScriptedGameMasterModel(
                 [
                     self._tool_response(
@@ -860,15 +861,23 @@ class AgenticHarnessTest(unittest.TestCase):
                 model,
                 turn_id_factory=lambda: "turn_eighth_tool",
                 mechanic_id_factory=lambda: f"mechanic_{len(model.requests) + 1}",
-                random_source=ScriptedRandom((3, 4) * 8),
+                random_source=random_source,
                 clock=lambda: datetime(2026, 7, 28, 0, 10, tzinfo=timezone.utc),
             )
 
-            result = harness.start_turn(game_id, "我检查牢门。")
+            published: list[PublicMechanic] = []
+            result = harness.start_turn(
+                game_id,
+                "我检查牢门。",
+                public_mechanic_sink=published.append,
+            )
 
             self.assertEqual(result.status, "interrupted")
             self.assertEqual(result.error_code, "step_limit_exceeded")
             self.assertEqual(len(model.requests), 8)
+            self.assertEqual(len(result.public_mechanics), 1)
+            self.assertEqual(published, list(result.public_mechanics))
+            self.assertEqual(random_source.calls, [(0, 9), (0, 9)])
             incomplete = store.load_session(game_id).session["incomplete_turn"]
             self.assertIsNotNone(incomplete)
             assert incomplete is not None
@@ -890,34 +899,91 @@ class AgenticHarnessTest(unittest.TestCase):
             "retire": [],
         }
         variants = (
-            ("final", self._response(valid_final), "committed", None),
+            ("final", self._response(valid_final), "committed", None, 0, 0),
             (
                 "invalid_final",
                 self._response(invalid_final),
                 "interrupted",
                 "step_limit_exceeded",
+                7,
+                0,
             ),
             (
                 "tool_error",
                 self._tool_response("{}", tool_call_id="call_8", name="unknown_tool"),
                 "interrupted",
                 "step_limit_exceeded",
+                8,
+                0,
             ),
             (
                 "multiple_tool_error",
                 self._multi_tool_response("call_8a", "call_8b"),
                 "interrupted",
                 "step_limit_exceeded",
+                9,
+                0,
             ),
             (
                 "unpairable_protocol",
                 self._multi_tool_response("call_8", "call_8"),
                 "interrupted",
                 "provider_protocol_error",
+                7,
+                1,
+            ),
+            (
+                "unpairable_single",
+                self._tool_response("{}", tool_call_id=None),
+                "interrupted",
+                "provider_protocol_error",
+                7,
+                1,
+            ),
+            (
+                "empty_content",
+                self._response(""),
+                "interrupted",
+                "invalid_model_response",
+                7,
+                1,
+            ),
+            (
+                "malformed_json",
+                self._response("{"),
+                "interrupted",
+                "step_limit_exceeded",
+                7,
+                0,
+            ),
+            (
+                "truncated",
+                ModelResponse(
+                    assistant_message={
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": None,
+                        "tool_calls": [],
+                    },
+                    finish_reason="length",
+                    usage=None,
+                    latency_ms=10,
+                ),
+                "interrupted",
+                "provider_response_error",
+                7,
+                1,
             ),
         )
 
-        for label, eighth_response, expected_status, expected_error in variants:
+        for (
+            label,
+            eighth_response,
+            expected_status,
+            expected_error,
+            expected_interactions,
+            expected_protocol_errors,
+        ) in variants:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 store, game_id = self._create_session(Path(directory))
                 prefix = [
@@ -956,18 +1022,14 @@ class AgenticHarnessTest(unittest.TestCase):
                     incomplete = session["incomplete_turn"]
                     assert incomplete is not None
                     self.assertEqual(incomplete["round_trips_used"], 8)
-                    if label == "multiple_tool_error":
-                        self.assertEqual(len(incomplete["tool_interactions"]), 9)
-                    elif label == "unpairable_protocol":
-                        self.assertEqual(len(incomplete["tool_interactions"]), 7)
-                        self.assertEqual(
-                            len(incomplete["provider_protocol_errors"]),
-                            1,
-                        )
-                    elif label == "invalid_final":
-                        self.assertEqual(len(incomplete["tool_interactions"]), 7)
-                    else:
-                        self.assertEqual(len(incomplete["tool_interactions"]), 8)
+                    self.assertEqual(
+                        len(incomplete["tool_interactions"]),
+                        expected_interactions,
+                    )
+                    self.assertEqual(
+                        len(incomplete["provider_protocol_errors"]),
+                        expected_protocol_errors,
+                    )
 
     def test_multiple_usable_tool_calls_are_persisted_as_errors_and_continue(self) -> None:
         """可关联多工具响应不执行机械，而是逐 ID 返回协议错误。"""
@@ -1099,6 +1161,53 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(loaded["turns"], [])
             self.assertEqual(
                 loaded["incomplete_turn"]["last_failure"]["code"],
+                "attempt_timeout",
+            )
+
+    def test_attempt_timeout_during_final_build_precedes_atomic_write(self) -> None:
+        """最终聚合构造期间过期时，写入前的截止检查仍阻止提交。"""
+
+        class ControlledClock:
+            def __init__(self) -> None:
+                self.current = datetime(2026, 7, 28, 0, 13, tzinfo=timezone.utc)
+                self.calls = 0
+
+            def __call__(self) -> datetime:
+                self.calls += 1
+                if self.calls == 4:
+                    self.current += timedelta(seconds=181)
+                return self.current
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            clock = ControlledClock()
+            model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "构造期间过期的叙事不能提交。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_build_timeout",
+                clock=clock,
+            )
+
+            result = harness.start_turn(game_id, "我观察周围。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "attempt_timeout")
+            session = store.load_session(game_id).session
+            self.assertEqual(session["turns"], [])
+            self.assertEqual(
+                session["incomplete_turn"]["last_failure"]["code"],
                 "attempt_timeout",
             )
 
