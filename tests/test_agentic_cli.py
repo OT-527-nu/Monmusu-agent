@@ -11,8 +11,8 @@ from unittest.mock import patch
 from monmusu_agent.agent import GameMasterAgent
 from monmusu_agent.agentic_cli import (
     CliInputEncodingError,
-    NewSessionCliResult,
     main,
+    run_agentic_cli,
     run_game_cli,
     run_new_session_cli,
     run_turn_cli,
@@ -27,7 +27,6 @@ from monmusu_agent.agentic_model import (
 )
 from monmusu_agent.agentic_session import (
     AgenticSessionStore,
-    CreatedSession,
     NewSessionRequest,
 )
 
@@ -45,7 +44,7 @@ class ForbiddenModelLoop:
 
 class FixedRandom:
     def __init__(self) -> None:
-        self.values = iter((3, 4))
+        self.values = iter((3, 4, 5, 6))
 
     def randint(self, minimum: int, maximum: int) -> int:
         if (minimum, maximum) != (0, 9):
@@ -138,6 +137,571 @@ class PersistedMechanicThenFinalModel(GameMasterModel):
 
 
 class AgenticCliTest(unittest.TestCase):
+    def test_startup_discovers_incomplete_session_and_exit_preserves_it(
+        self,
+    ) -> None:
+        """启动只展示安全恢复入口，退出不调用模型或改变存档。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            game_ids = iter(
+                ("game_ready", "game_interrupted_a", "game_interrupted_b")
+            )
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=game_ids.__next__,
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            ready = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            interrupted_a = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            interrupted_b = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            for created, turn_id in (
+                (interrupted_a, "turn_interrupted_a"),
+                (interrupted_b, "turn_interrupted_b"),
+            ):
+                AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            ModelCallError(
+                                "request_timeout",
+                                "private",
+                                retryable=True,
+                            )
+                        ]
+                    ),
+                    turn_id_factory=lambda: turn_id,
+                    clock=lambda: datetime(
+                        2026,
+                        8,
+                        7,
+                        0,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                ).start_turn(created.game_id, "我检查门锁。")
+            ready_bytes = ready.session_file.read_bytes()
+            interrupted_a_bytes = interrupted_a.session_file.read_bytes()
+            interrupted_b_bytes = interrupted_b.session_file.read_bytes()
+            recovery_model = ScriptedGameMasterModel([])
+            harness = AgenticHarness(store, recovery_model)
+            answers = iter(("2", "退出"))
+            prompts: list[str] = []
+            output: list[str] = []
+
+            def read_line(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(answers)
+
+            result = run_agentic_cli(
+                harness,
+                store,
+                read_line=read_line,
+                write_line=output.append,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(recovery_model.requests, [])
+            self.assertEqual(ready.session_file.read_bytes(), ready_bytes)
+            self.assertEqual(
+                interrupted_a.session_file.read_bytes(),
+                interrupted_a_bytes,
+            )
+            self.assertEqual(
+                interrupted_b.session_file.read_bytes(),
+                interrupted_b_bytes,
+            )
+            self.assertEqual(
+                prompts,
+                [
+                    "请选择要处理的未完成会话编号：",
+                    "输入“恢复”继续原回合，或输入“退出”结束：",
+                ],
+            )
+            self.assertEqual(
+                output,
+                [
+                    "检测到未完成回合：",
+                    "1. 会话 game_interrupted_a",
+                    "2. 会话 game_interrupted_b",
+                    "未完成回合：turn_interrupted_b",
+                    "技术中断（request_timeout）：回合因技术问题中断，需要显式恢复",
+                    "已退出；未完成回合已保留。",
+                ],
+            )
+            self.assertNotIn("game_ready", "\n".join(output))
+
+    def test_recovery_repeats_gate_then_accepts_next_action_after_commit(
+        self,
+    ) -> None:
+        """再次中断仍门控，原回合提交后才接受下一条行动。"""
+
+        tool_response = ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_recovery_check",
+                        "type": "function",
+                        "function": {
+                            "name": "make_check",
+                            "arguments": json.dumps(
+                                {
+                                    "actor_id": "investigator_tracker",
+                                    "ability": "spot_hidden",
+                                    "difficulty": "regular",
+                                    "dice_adjustment": {
+                                        "kind": "none",
+                                        "count": 0,
+                                    },
+                                    "action": "检查门锁上的刮痕",
+                                    "stakes": "失败会错过开锁痕迹",
+                                    "visibility": "public",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            finish_reason="tool_calls",
+            usage=None,
+            latency_ms=10,
+        )
+        recovered_final = ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": "你确认门锁刚被人从外侧打开过。",
+                        "establish": [],
+                        "retire": [],
+                        "session_status": "ongoing",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": None,
+                "tool_calls": [],
+            },
+            finish_reason="stop",
+            usage=None,
+            latency_ms=10,
+        )
+        next_turn_final = ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": "你推门离开石牢。",
+                        "establish": [],
+                        "retire": [],
+                        "session_status": "complete",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": None,
+                "tool_calls": [],
+            },
+            finish_reason="stop",
+            usage=None,
+            latency_ms=10,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_recovery_loop",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [ModelCallError("request_timeout", "private", retryable=True)]
+                ),
+                turn_id_factory=lambda: "turn_interrupted",
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            ).start_turn(created.game_id, "我检查门锁。")
+            recovery_model = ScriptedGameMasterModel(
+                [
+                    tool_response,
+                    ModelCallError("request_timeout", "private", retryable=True),
+                    recovered_final,
+                    next_turn_final,
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                recovery_model,
+                turn_id_factory=lambda: "turn_next",
+                mechanic_id_factory=lambda: "mechanic_recovery",
+                random_source=FixedRandom(),
+                clock=lambda: datetime(2026, 8, 7, 0, 2, tzinfo=timezone.utc),
+            )
+            answers = iter(
+                ("1", "我先踢门。", "恢复", "恢复", "我推门离开。")
+            )
+            prompts: list[str] = []
+            output: list[str] = []
+
+            def read_line(prompt: str) -> str:
+                value = next(answers)
+                if value == "我先踢门。":
+                    self.assertEqual(recovery_model.requests, [])
+                prompts.append(prompt)
+                return value
+
+            result = run_agentic_cli(
+                harness,
+                store,
+                read_line=read_line,
+                write_line=output.append,
+            )
+            saved = store.load_session(created.game_id).session
+
+        assert result is not None
+        self.assertEqual(result.status, "committed")
+        self.assertEqual(result.turn_id, "turn_next")
+        self.assertEqual(len(recovery_model.requests), 4)
+        self.assertEqual(
+            [turn["turn_id"] for turn in saved["turns"]],
+            ["turn_interrupted", "turn_next"],
+        )
+        self.assertEqual(
+            [turn["player_input"] for turn in saved["turns"]],
+            ["我检查门锁。", "我推门离开。"],
+        )
+        self.assertIsNone(saved["incomplete_turn"])
+        self.assertEqual(saved["session_status"], "complete")
+        self.assertEqual(
+            prompts,
+            [
+                "请选择要处理的未完成会话编号：",
+                "输入“恢复”继续原回合，或输入“退出”结束：",
+                "输入“恢复”继续原回合，或输入“退出”结束：",
+                "输入“恢复”继续原回合，或输入“退出”结束：",
+                "你的行动：",
+            ],
+        )
+        rendered = "\n".join(output)
+        self.assertIn("只能输入“恢复”或“退出”。", output)
+        self.assertEqual(rendered.count("公开检定 | 行动：检查门锁上的刮痕"), 1)
+        self.assertEqual(rendered.count("你确认门锁刚被人从外侧打开过。"), 1)
+        self.assertEqual(rendered.count("你推门离开石牢。"), 1)
+
+    def test_recovery_gate_rejects_new_action_and_preserves_state_on_exit_input(
+        self,
+    ) -> None:
+        """无效选择、EOF 与键盘中断都不能越过未完成回合门。"""
+
+        cases: tuple[tuple[str, tuple[object, ...]], ...] = (
+            ("action-like", ("1", "我踢开牢门。", "退出")),
+            ("malformed-selection", ("not-a-number", "1", "退出")),
+            ("eof", ("1", EOFError())),
+            ("keyboard-interrupt", ("1", KeyboardInterrupt())),
+        )
+        for label, scripted_inputs in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store = AgenticSessionStore(
+                    session_root=Path(directory) / "sessions",
+                    game_id_factory=lambda: "game_preserved",
+                    clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+                )
+                created = store.create_session(
+                    NewSessionRequest(
+                        investigator_id="investigator_tracker",
+                        display_name="林雁",
+                    )
+                )
+                AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            ModelCallError(
+                                "request_timeout",
+                                "private",
+                                retryable=True,
+                            )
+                        ]
+                    ),
+                    turn_id_factory=lambda: "turn_preserved",
+                    clock=lambda: datetime(
+                        2026,
+                        8,
+                        7,
+                        0,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                ).start_turn(created.game_id, "我检查门锁。")
+                before = created.session_file.read_bytes()
+                recovery_model = ScriptedGameMasterModel([])
+                inputs = iter(scripted_inputs)
+                output: list[str] = []
+
+                def read_line(prompt: str) -> str:
+                    value = next(inputs)
+                    if isinstance(value, BaseException):
+                        raise value
+                    assert isinstance(value, str)
+                    return value
+
+                result = run_agentic_cli(
+                    AgenticHarness(store, recovery_model),
+                    store,
+                    read_line=read_line,
+                    write_line=output.append,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(recovery_model.requests, [])
+                self.assertEqual(created.session_file.read_bytes(), before)
+                self.assertEqual(
+                    store.find_incomplete_session_ids(),
+                    ("game_preserved",),
+                )
+                self.assertNotIn("你的行动：", "\n".join(output))
+                if label == "action-like":
+                    self.assertIn("只能输入“恢复”或“退出”。", output)
+                if label == "malformed-selection":
+                    self.assertIn("请输入有效的未完成会话编号。", output)
+
+    def test_recovery_startup_filters_all_restricted_incomplete_turn_content(
+        self,
+    ) -> None:
+        """恢复页只投影公开机械与稳定技术状态。"""
+
+        hidden_fact = "门后的守卫已经认出调查员"
+        hidden_mechanic = "守卫暗中判断是否听见墙缝声"
+        invalid_final = "这段未通过校验的叙事不能显示"
+        reasoning = "private reasoning content"
+        provider_detail = "sk-private-fragment Authorization: Bearer secret"
+
+        def final_response(payload: object) -> ModelResponse:
+            return ModelResponse(
+                assistant_message={
+                    "role": "assistant",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                },
+                finish_reason="stop",
+                usage=None,
+                latency_ms=10,
+            )
+
+        def check_response(
+            call_id: str,
+            action: str,
+            visibility: str,
+        ) -> ModelResponse:
+            return ModelResponse(
+                assistant_message={
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": reasoning,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "make_check",
+                                "arguments": json.dumps(
+                                    {
+                                        "actor_id": "investigator_tracker",
+                                        "ability": "spot_hidden",
+                                        "difficulty": "regular",
+                                        "dice_adjustment": {
+                                            "kind": "none",
+                                            "count": 0,
+                                        },
+                                        "action": action,
+                                        "stakes": "失败会错过痕迹",
+                                        "visibility": visibility,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+                usage=None,
+                latency_ms=10,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_private_projection",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            model = ScriptedGameMasterModel(
+                [
+                    final_response(
+                        {
+                            "narration": "你听见门外的脚步停了一瞬。",
+                            "establish": [
+                                {"visibility": "hidden", "text": hidden_fact}
+                            ],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                    check_response(
+                        "call_public",
+                        "检查墙缝上的新鲜刮痕",
+                        "public",
+                    ),
+                    check_response("call_hidden", hidden_mechanic, "hidden"),
+                    ModelResponse(
+                        assistant_message={
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {"narration": invalid_final},
+                                ensure_ascii=False,
+                            ),
+                            "reasoning_content": reasoning,
+                            "tool_calls": [],
+                        },
+                        finish_reason="stop",
+                        usage=None,
+                        latency_ms=10,
+                    ),
+                    ModelCallError(
+                        "request_timeout",
+                        provider_detail,
+                        retryable=True,
+                    ),
+                ]
+            )
+            turn_ids = iter(("turn_hidden_fact", "turn_interrupted"))
+            mechanic_ids = iter(("mechanic_public", "mechanic_hidden"))
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=turn_ids.__next__,
+                fact_id_factory=lambda: "fact_hidden",
+                mechanic_id_factory=mechanic_ids.__next__,
+                random_source=FixedRandom(),
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            )
+            harness.start_turn(created.game_id, "我侧耳听门外。")
+            interrupted = harness.start_turn(created.game_id, "我检查墙缝。")
+            self.assertEqual(interrupted.status, "interrupted")
+            recovery_model = ScriptedGameMasterModel([])
+            output: list[str] = []
+            answers = iter(("1", "退出"))
+
+            run_agentic_cli(
+                AgenticHarness(store, recovery_model),
+                store,
+                read_line=lambda prompt: next(answers),
+                write_line=output.append,
+            )
+
+        rendered = "\n".join(output)
+        self.assertEqual(recovery_model.requests, [])
+        self.assertEqual(
+            rendered.count("公开检定 | 行动：检查墙缝上的新鲜刮痕"),
+            1,
+        )
+        for restricted in (
+            hidden_fact,
+            hidden_mechanic,
+            invalid_final,
+            reasoning,
+            provider_detail,
+            "sk-private-fragment",
+            "Authorization",
+        ):
+            self.assertNotIn(restricted, rendered)
+
+    def test_agentic_cli_starts_new_game_when_no_incomplete_session_exists(
+        self,
+    ) -> None:
+        """没有恢复 blocker 时保留现有 opt-in 新游戏流程。"""
+
+        response = ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": "你推开潮湿的牢门，短篇在此收束。",
+                        "establish": [],
+                        "retire": [],
+                        "session_status": "complete",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": None,
+                "tool_calls": [],
+            },
+            finish_reason="stop",
+            usage=None,
+            latency_ms=10,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_new_flow",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            model = ScriptedGameMasterModel([response])
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_new_flow",
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            )
+            answers = iter(("1", "", "", "", "", "", "", "", "我推门。"))
+            output: list[str] = []
+
+            result = run_agentic_cli(
+                harness,
+                store,
+                read_line=lambda prompt: next(answers),
+                write_line=output.append,
+            )
+            saved = store.load_session("game_new_flow").session
+
+        assert result is not None
+        self.assertEqual(result.status, "committed")
+        self.assertEqual(len(model.requests), 1)
+        self.assertEqual(saved["turns"][0]["player_input"], "我推门。")
+        self.assertEqual(saved["session_status"], "complete")
+        self.assertLess(
+            output.index(saved["setup"]["opening_narration"]),
+            output.index("你推开潮湿的牢门，短篇在此收束。"),
+        )
+
     def test_cli_repairs_utf8_bytes_preserved_by_surrogateescape(self) -> None:
         """终端以兼容编码解码时，可无损还原原始 UTF-8 输入。"""
 
@@ -272,16 +836,6 @@ class AgenticCliTest(unittest.TestCase):
         """新版入口只在组合边界读取 key，并把首条行动交给同一 Harness。"""
 
         session_file = Path("/private/session/session.json")
-        result = NewSessionCliResult(
-            created=CreatedSession(
-                game_id="game_test_0001",
-                session_directory=session_file.parent,
-                session_file=session_file,
-                opening_narration="开场文本",
-                session={},
-            ),
-            first_action="我倾听走廊。",
-        )
         output = io.StringIO()
 
         store = object()
@@ -301,14 +855,10 @@ class AgenticCliTest(unittest.TestCase):
                 return_value=store,
             ),
             patch(
-                "monmusu_agent.agentic_cli.run_new_session_cli",
-                return_value=result,
-            ),
-            patch(
                 "monmusu_agent.agentic_cli.compose_deepseek_harness",
                 return_value=harness,
             ) as compose,
-            patch("monmusu_agent.agentic_cli.run_game_cli") as run_game,
+            patch("monmusu_agent.agentic_cli.run_agentic_cli") as run_cli,
             redirect_stdout(output),
         ):
             self.assertEqual(main(), 0)
@@ -319,12 +869,7 @@ class AgenticCliTest(unittest.TestCase):
             model_id="deepseek-v4-flash",
             thinking=False,
         )
-        run_game.assert_called_once_with(
-            harness,
-            store,
-            "game_test_0001",
-            "我倾听走廊。",
-        )
+        run_cli.assert_called_once_with(harness, store)
         self.assertNotIn(str(session_file), output.getvalue())
         self.assertNotIn("sk-cli-secret-fragment", output.getvalue())
 
@@ -355,7 +900,7 @@ class AgenticCliTest(unittest.TestCase):
             patch("monmusu_agent.agentic_cli.AgenticSessionStore"),
             patch("monmusu_agent.agentic_cli.compose_deepseek_harness"),
             patch(
-                "monmusu_agent.agentic_cli.run_new_session_cli",
+                "monmusu_agent.agentic_cli.run_agentic_cli",
                 side_effect=CliInputEncodingError("终端输入不是有效的 UTF-8"),
             ),
             redirect_stdout(output),
@@ -443,7 +988,6 @@ class AgenticCliTest(unittest.TestCase):
 
             result = run_game_cli(
                 harness,
-                store,
                 created.game_id,
                 "我探查潮水涌入的墙缝。",
                 read_line=read_line,
@@ -661,7 +1205,8 @@ class AgenticCliTest(unittest.TestCase):
             )
 
             self.assertEqual(result.status, "interrupted")
-            self.assertEqual(len(output), 1)
+            self.assertEqual(len(output), 2)
+            self.assertEqual(output[0], "未完成回合：turn_0001")
             rendered = "\n".join(output)
             self.assertIn("技术中断（request_timeout）", rendered)
             self.assertNotIn(secret_text, rendered)

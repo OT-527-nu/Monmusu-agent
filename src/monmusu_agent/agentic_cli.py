@@ -11,6 +11,7 @@ from typing import Any
 from monmusu_agent.agentic_harness import (
     AgenticHarness,
     PublicMechanic,
+    SessionLifecycleView,
     TurnResult,
 )
 from monmusu_agent.agentic_model import (
@@ -117,6 +118,65 @@ def compose_deepseek_harness(
     return AgenticHarness(store, model, model_profile=profile)
 
 
+def run_agentic_cli(
+    harness: AgenticHarness,
+    store: AgenticSessionStore,
+    *,
+    read_line: Callable[[str], str] = input,
+    write_line: Callable[[str], None] = print,
+) -> TurnResult | None:
+    """优先门控未完成回合，否则进入现有新游戏流程。"""
+
+    incomplete_game_ids = store.find_incomplete_session_ids()
+    if not incomplete_game_ids:
+        new_session = run_new_session_cli(
+            store,
+            read_line=read_line,
+            write_line=write_line,
+        )
+        return run_game_cli(
+            harness,
+            new_session.created.game_id,
+            new_session.first_action,
+            read_line=read_line,
+            write_line=write_line,
+        )
+
+    wrapped_read_line = _wrap_read_line(read_line)
+    game_id = _select_incomplete_session(
+        incomplete_game_ids,
+        wrapped_read_line,
+        write_line,
+    )
+    if game_id is None:
+        return None
+    return run_recovery_cli(
+        harness,
+        game_id,
+        read_line=wrapped_read_line,
+        write_line=write_line,
+    )
+
+
+def run_recovery_cli(
+    harness: AgenticHarness,
+    game_id: str,
+    *,
+    read_line: Callable[[str], str] = input,
+    write_line: Callable[[str], None] = print,
+) -> TurnResult | None:
+    """从已发现的未完成会话进入显式恢复/退出门。"""
+
+    return _run_session_cli(
+        harness,
+        game_id,
+        first_action=None,
+        show_initial_recovery=True,
+        read_line=read_line,
+        write_line=write_line,
+    )
+
+
 def run_new_session_cli(
     store: AgenticSessionStore,
     *,
@@ -171,11 +231,22 @@ def run_turn_cli(
             _format_public_mechanic(mechanic)
         ),
     )
+    _write_turn_result(result, write_line)
+    return result
+
+
+def _write_turn_result(
+    result: TurnResult,
+    write_line: Callable[[str], None],
+) -> None:
+    """展示一次生命周期调用新提交的公开投影。"""
+
     if result.status == "interrupted":
+        write_line(f"未完成回合：{result.turn_id}")
         write_line(
             f"技术中断（{result.error_code}）：{result.error_message}"
         )
-        return result
+        return
 
     assert result.narration is not None
     write_line(result.narration)
@@ -184,12 +255,10 @@ def run_turn_cli(
             write_line(f"公开事实已确立：{change.text}")
         else:
             write_line(f"公开事实已结束：{change.text}")
-    return result
 
 
 def run_game_cli(
     harness: AgenticHarness,
-    store: AgenticSessionStore,
     game_id: str,
     first_action: str,
     *,
@@ -198,22 +267,69 @@ def run_game_cli(
 ) -> TurnResult:
     """在同一会话中持续接收行动，直到收束或技术中断。"""
 
+    result = _run_session_cli(
+        harness,
+        game_id,
+        first_action=first_action,
+        show_initial_recovery=False,
+        read_line=read_line,
+        write_line=write_line,
+    )
+    assert result is not None
+    return result
+
+
+def _run_session_cli(
+    harness: AgenticHarness,
+    game_id: str,
+    *,
+    first_action: str | None,
+    show_initial_recovery: bool,
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+) -> TurnResult | None:
+    """只依据 Harness 投影在新行动与显式恢复之间切换。"""
+
     read_line = _wrap_read_line(read_line)
-    first_action = _normalise_cli_input(first_action)
-    player_input = first_action
+    player_input = (
+        None if first_action is None else _normalise_cli_input(first_action)
+    )
+    last_result: TurnResult | None = None
+    show_recovery_state = show_initial_recovery
     while True:
+        lifecycle = harness.get_session_state(game_id)
+        if lifecycle.has_incomplete_turn:
+            if show_recovery_state:
+                _write_recovery_state(lifecycle, write_line)
+            choice = _read_recovery_choice(read_line, write_line)
+            if choice == "exit":
+                return last_result
+            assert lifecycle.turn_id is not None
+            result = harness.resume_turn(
+                game_id,
+                lifecycle.turn_id,
+                public_mechanic_sink=lambda mechanic: write_line(
+                    _format_public_mechanic(mechanic)
+                ),
+            )
+            _write_turn_result(result, write_line)
+            last_result = result
+            show_recovery_state = False
+            continue
+
+        if lifecycle.technical_status == "complete":
+            return last_result
+        if player_input is None:
+            player_input = _read_first_action(read_line, write_line)
         result = run_turn_cli(
             harness,
             game_id,
             player_input,
             write_line=write_line,
         )
-        if result.status == "interrupted":
-            return result
-        loaded = store.load_session(game_id)
-        if loaded.session["session_status"] == "complete":
-            return result
-        player_input = _read_first_action(read_line, write_line)
+        last_result = result
+        player_input = None
+        show_recovery_state = False
 
 
 def _format_public_mechanic(mechanic: PublicMechanic) -> str:
@@ -226,6 +342,64 @@ def _format_public_mechanic(mechanic: PublicMechanic) -> str:
         f"事前风险：{mechanic.stakes} | 骰点：{mechanic.roll} | "
         f"结果：{mechanic.success_level}"
     )
+
+
+def _select_incomplete_session(
+    game_ids: tuple[str, ...],
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+) -> str | None:
+    write_line("检测到未完成回合：")
+    for index, game_id in enumerate(game_ids, start=1):
+        write_line(f"{index}. 会话 {game_id}")
+    while True:
+        try:
+            raw = read_line("请选择要处理的未完成会话编号：").strip()
+        except (EOFError, KeyboardInterrupt):
+            write_line("已退出；未完成回合已保留。")
+            return None
+        try:
+            index = int(raw)
+        except ValueError:
+            write_line("请输入有效的未完成会话编号。")
+            continue
+        if 1 <= index <= len(game_ids):
+            return game_ids[index - 1]
+        write_line("请输入有效的未完成会话编号。")
+
+
+def _write_recovery_state(
+    lifecycle: SessionLifecycleView,
+    write_line: Callable[[str], None],
+) -> None:
+    if not lifecycle.has_incomplete_turn or lifecycle.turn_id is None:
+        raise RuntimeError("发现的会话当前没有未完成回合")
+    write_line(f"未完成回合：{lifecycle.turn_id}")
+    for mechanic in lifecycle.public_mechanics:
+        write_line(_format_public_mechanic(mechanic))
+    write_line(
+        f"技术中断（{lifecycle.error_code}）：{lifecycle.error_message}"
+    )
+
+
+def _read_recovery_choice(
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+) -> str:
+    while True:
+        try:
+            choice = read_line(
+                "输入“恢复”继续原回合，或输入“退出”结束："
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            write_line("已退出；未完成回合已保留。")
+            return "exit"
+        if choice == "恢复":
+            return "resume"
+        if choice == "退出":
+            write_line("已退出；未完成回合已保留。")
+            return "exit"
+        write_line("只能输入“恢复”或“退出”。")
 
 
 def main() -> int:
@@ -261,13 +435,7 @@ def main() -> int:
         print(f"运行配置错误（{error.code}）：{error.message}")
         return 2
     try:
-        new_session = run_new_session_cli(store)
-        run_game_cli(
-            harness,
-            store,
-            new_session.created.game_id,
-            new_session.first_action,
-        )
+        run_agentic_cli(harness, store)
     except CliInputEncodingError as error:
         print(f"输入错误：{error}")
         return 2

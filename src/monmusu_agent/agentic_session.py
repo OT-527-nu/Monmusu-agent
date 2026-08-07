@@ -334,6 +334,33 @@ class AgenticSessionStore:
             raise AgenticSessionSourceError("至少需要一张预生成调查员卡")
         return tuple(choices)
 
+    def find_incomplete_session_ids(self) -> tuple[str, ...]:
+        """返回经过完整装载校验的已发布未完成会话。"""
+
+        if not self.session_root.exists():
+            return ()
+        try:
+            candidates = sorted(
+                (
+                    path
+                    for path in self.session_root.iterdir()
+                    if not path.name.startswith(".")
+                    and not path.is_symlink()
+                    and path.is_dir()
+                ),
+                key=lambda path: path.name,
+            )
+        except OSError as error:
+            raise AgenticSessionLoadError("会话目录无法读取") from error
+
+        incomplete_ids: list[str] = []
+        for session_directory in candidates:
+            game_id = self._validated_game_id(session_directory.name)
+            loaded = self._load_session_directory(session_directory, game_id)
+            if loaded.session["incomplete_turn"] is not None:
+                incomplete_ids.append(game_id)
+        return tuple(incomplete_ids)
+
     def create_session(self, request: NewSessionRequest) -> CreatedSession:
         """构造完整开场聚合，并发布到一个新的游戏目录。"""
 

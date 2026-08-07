@@ -11,6 +11,8 @@ from monmusu_agent.agentic_session import (
     AgenticSessionStore,
     NewSessionRequest,
 )
+from monmusu_agent.agentic_harness import AgenticHarness
+from monmusu_agent.agentic_model import ModelCallError, ScriptedGameMasterModel
 from monmusu_agent.storage import read_json, write_json_atomic
 
 
@@ -172,6 +174,36 @@ class AgenticSessionStoreTest(unittest.TestCase):
                 first.session["setup"]["setup_id"],
                 second.session["setup"]["setup_id"],
             )
+
+    def test_find_incomplete_session_ids_returns_only_valid_blockers(self) -> None:
+        """发现只返回经过完整装载校验的未完成 Agentic 会话。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            game_ids = iter(("game_ready", "game_interrupted"))
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=game_ids.__next__,
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            ready = store.create_session(self._request())
+            interrupted = store.create_session(self._request())
+            model = ScriptedGameMasterModel(
+                [ModelCallError("request_timeout", "private", retryable=True)]
+            )
+            AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_interrupted",
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            ).start_turn(interrupted.game_id, "我检查门锁。")
+            ready_bytes = ready.session_file.read_bytes()
+            interrupted_bytes = interrupted.session_file.read_bytes()
+
+            found = store.find_incomplete_session_ids()
+
+            self.assertEqual(found, ("game_interrupted",))
+            self.assertEqual(ready.session_file.read_bytes(), ready_bytes)
+            self.assertEqual(interrupted.session_file.read_bytes(), interrupted_bytes)
 
     def test_load_session_uses_read_only_snapshots_after_sources_change(self) -> None:
         """工作树材料变化后，会话仍只装载建局时冻结的全文。"""
