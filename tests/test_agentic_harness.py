@@ -83,6 +83,7 @@ class AgenticHarnessTest(unittest.TestCase):
         tool_call_id: object = "call_001",
         name: object = "make_check",
         reasoning: str | None = None,
+        content: str | None = None,
     ) -> ModelResponse:
         arguments_raw = arguments if isinstance(arguments, str) else json.dumps(
             arguments,
@@ -92,7 +93,7 @@ class AgenticHarnessTest(unittest.TestCase):
         return ModelResponse(
             assistant_message={
                 "role": "assistant",
-                "content": None,
+                "content": content,
                 "reasoning_content": reasoning,
                 "tool_calls": [
                     {
@@ -1537,6 +1538,212 @@ class AgenticHarnessTest(unittest.TestCase):
                 committed["turns"][0]["player_input"],
                 "我贴近门缝倾听。",
             )
+
+    def test_thinking_reasoning_round_trips_only_in_incomplete_recovery_state(
+        self,
+    ) -> None:
+        canary_marker = "THINKING_RECOVERY_CANARY_10_EXACT"
+        reasoning_canary = f"  {canary_marker}\nsecond line  "
+        content_canary = "THINKING_TOOL_CONTENT_CANARY_10"
+        profile = deepseek_model_profile(thinking=True)
+        arguments = self._valid_check_arguments()
+        tool_response = self._tool_response(
+            arguments,
+            tool_call_id="call_thinking_recovery",
+            reasoning=reasoning_canary,
+            content=content_canary,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first_model = ScriptedGameMasterModel(
+                [
+                    tool_response,
+                    ModelCallError(
+                        "request_timeout",
+                        "private provider detail",
+                        retryable=True,
+                    ),
+                ]
+            )
+            first_harness = AgenticHarness(
+                store,
+                first_model,
+                turn_id_factory=lambda: "turn_thinking_recovery",
+                mechanic_id_factory=lambda: "mechanic_thinking_recovery",
+                random_source=ScriptedRandom((3, 4)),
+                model_profile=profile,
+                clock=lambda: datetime(2026, 8, 7, 0, 10, tzinfo=timezone.utc),
+            )
+
+            interrupted = first_harness.start_turn(game_id, "我检查牢门。")
+            lifecycle = first_harness.get_session_state(game_id)
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            assert incomplete is not None
+            replay_prefix = incomplete["deepseek_messages"]
+
+            self.assertEqual(interrupted.status, "interrupted")
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            self.assertEqual(incomplete["model_profile"], profile)
+            self.assertEqual(replay_prefix[-2], tool_response.assistant_message)
+            self.assertEqual(
+                replay_prefix[-2]["reasoning_content"],
+                reasoning_canary,
+            )
+            self.assertEqual(replay_prefix[-2]["content"], content_canary)
+            self.assertEqual(replay_prefix[-1]["role"], "tool")
+            self.assertNotIn(canary_marker, repr(tool_response))
+            self.assertNotIn(content_canary, repr(tool_response))
+            self.assertNotIn(canary_marker, repr(first_harness))
+            self.assertNotIn(content_canary, repr(first_harness))
+            self.assertNotIn(canary_marker, repr(interrupted))
+            self.assertNotIn(content_canary, repr(interrupted))
+            self.assertNotIn(canary_marker, repr(lifecycle))
+            self.assertNotIn(content_canary, repr(lifecycle))
+
+            final_response = self._response(
+                {
+                    "narration": "牢门铰链附近留着一道新鲜刮痕。",
+                    "establish": [],
+                    "retire": [],
+                    "session_status": "ongoing",
+                },
+                reasoning="THINKING_FINAL_CANARY_10",
+            )
+            resumed_model = ScriptedGameMasterModel([final_response])
+            resumed_random = ScriptedRandom(())
+            resumed_harness = AgenticHarness(
+                store,
+                resumed_model,
+                random_source=resumed_random,
+                model_profile=profile,
+                clock=lambda: datetime(2026, 8, 7, 0, 11, tzinfo=timezone.utc),
+            )
+
+            resumed = resumed_harness.resume_turn(
+                game_id,
+                "turn_thinking_recovery",
+            )
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(resumed_model.requests[0].messages, tuple(replay_prefix))
+            self.assertEqual(resumed_model.requests[0].model_profile, profile)
+            self.assertNotIn(canary_marker, repr(resumed_model.requests[0]))
+            self.assertEqual(resumed_random.calls, [])
+            committed = store.load_session(game_id).session
+            self.assertIsNone(committed["incomplete_turn"])
+            committed_json = json.dumps(committed, ensure_ascii=False, sort_keys=True)
+            self.assertNotIn(canary_marker, committed_json)
+            self.assertNotIn(content_canary, committed_json)
+            self.assertNotIn("THINKING_FINAL_CANARY_10", committed_json)
+            self.assertNotIn(canary_marker, repr(resumed))
+
+    def test_thinking_direct_final_allows_nullable_reasoning_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "我先把手收回，观察锁扣的受力方向。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                model_profile=deepseek_model_profile(thinking=True),
+                turn_id_factory=lambda: "turn_thinking_nullable_final",
+                clock=lambda: datetime(2026, 8, 7, 0, 14, tzinfo=timezone.utc),
+            ).start_turn(game_id, "我观察锁扣。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertIsNone(store.load_session(game_id).session["incomplete_turn"])
+
+    def test_thinking_response_without_reasoning_preserves_last_legal_prefix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom(())
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        self._valid_check_arguments(),
+                        tool_call_id="call_missing_reasoning",
+                        reasoning=None,
+                    )
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_missing_reasoning",
+                mechanic_id_factory=lambda: "mechanic_must_not_exist",
+                random_source=random_source,
+                model_profile=deepseek_model_profile(thinking=True),
+                clock=lambda: datetime(2026, 8, 7, 0, 12, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我检查牢门。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "provider_protocol_error")
+            self.assertEqual(random_source.calls, [])
+            self.assertEqual(len(model.requests), 1)
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            assert incomplete is not None
+            self.assertEqual(len(incomplete["deepseek_messages"]), 3)
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(incomplete["tool_interactions"], [])
+            self.assertEqual(len(incomplete["provider_protocol_errors"]), 1)
+            self.assertEqual(
+                incomplete["last_failure"]["code"],
+                "provider_protocol_error",
+            )
+
+    def test_loader_rejects_thinking_replay_with_missing_reasoning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            self._valid_check_arguments(),
+                            reasoning="THINKING_PERSISTENCE_CANARY_10",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after legal tool pair",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_thinking_tamper",
+                mechanic_id_factory=lambda: "mechanic_thinking_tamper",
+                random_source=ScriptedRandom((3, 4)),
+                model_profile=deepseek_model_profile(thinking=True),
+                clock=lambda: datetime(2026, 8, 7, 0, 13, tzinfo=timezone.utc),
+            )
+            harness.start_turn(game_id, "我检查牢门。")
+            loaded = store.load_session(game_id)
+            session_file = loaded.session_directory / "session.json"
+            tampered = json.loads(session_file.read_text(encoding="utf-8"))
+            tampered["incomplete_turn"]["deepseek_messages"][-2].pop(
+                "reasoning_content"
+            )
+            write_json_atomic(session_file, tampered)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "deepseek_messages",
+            ):
+                store.load_session(game_id)
 
     def test_resume_replays_committed_tools_without_reroll_or_hidden_leak(self) -> None:
         """恢复沿用合法工具前缀，公开投影不泄露隐藏机械。"""

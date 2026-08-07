@@ -4,7 +4,7 @@
 
 Blocked by: 08 — 幂等重放已提交工具结果
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## References
 
@@ -14,13 +14,19 @@ Status: ready-for-agent
 - [Agent Loop](../../../docs/agentic_mvp/agent_loop.md): “模型响应协议”, “非流式输出边界”和“显式恢复时序”。
 - [ADR-031](../../../docs/adr/0031-deepseek-through-openai-sdk.md), [ADR-035](../../../docs/adr/0035-first-cli-does-not-stream-model-output.md), and [ADR-038](../../../docs/adr/0038-player-explicitly-resumes-incomplete-turn.md).
 
-- [ ] 组合入口允许显式 `thinking=true` profile，仍固定 non-streaming、单一 DeepSeek/OpenAI SDK adapter 和外部 key 注入；不增加自动模型选择、fallback、provider registry 或运行时路由。
-- [ ] `GameMasterModel` envelope 保留 DeepSeek assistant 消息中恢复协议要求的 `reasoning_content`；adapter 不解释、总结、校验或记录其语义，Harness 仍负责响应分类、工具和持久化。
-- [ ] thinking tool-call 响应的 `reasoning_content` 与其 assistant/tool 配对在同一次原子写入中保存为受限 `IncompleteTurn` 恢复材料；恢复时按 provider 要求原样、原顺序回传，不重写、截断、合并或注入 committed game context。
-- [ ] non-thinking 消息不要求或合成 reasoning 字段；thinking profile 缺少 provider 必需恢复字段时产生稳定技术中断并保留最后合法前缀，不静默降级为 non-thinking 或重新开始对话。
-- [ ] 最终成功提交后，`CommittedTurn`、事实账本、mechanic、玩家投影和后续普通 GM 正典上下文都不包含 reasoning content；未完成状态之外不复制该字段，清除恢复阻塞时也清除其受限副本。
-- [ ] CLI、技术错误、普通日志、公共评估记录、序列化异常和 adapter/Harness `repr` 不泄露 reasoning 正文、隐藏事实或 provider 私有诊断；测试使用唯一 canary 文本在所有禁止投影中作否定断言。
-- [ ] mocked SDK 测试验证 thinking 请求参数以及带 tool call 的 assistant `reasoning_content` 在下一请求中精确回传；公开 Harness 生命周期测试用真实临时 session 和可编程假 model 覆盖工具后中断、进程重建、恢复 final、恢复再次中断与最终清理。
-- [ ] non-thinking 现有 contract 与恢复测试保持通过，证明 thinking 支持没有改变 Increment 1 默认显式配置或玩家可见协议。
+- [x] 组合入口允许显式 `thinking=true` profile，仍固定 non-streaming、单一 DeepSeek/OpenAI SDK adapter 和外部 key 注入；不增加自动模型选择、fallback、provider registry 或运行时路由。
+- [x] `GameMasterModel` envelope 保留 DeepSeek assistant 消息中恢复协议要求的 `reasoning_content`；adapter 不解释、总结、校验或记录其语义，Harness 仍负责响应分类、工具和持久化。
+- [x] thinking tool-call 响应的 `reasoning_content` 与其 assistant/tool 配对在同一次原子写入中保存为受限 `IncompleteTurn` 恢复材料；恢复时按 provider 要求原样、原顺序回传，不重写、截断、合并或注入 committed game context。
+- [x] non-thinking 消息不要求或合成 reasoning 字段；thinking profile 缺少 provider 必需恢复字段时产生稳定技术中断并保留最后合法前缀，不静默降级为 non-thinking 或重新开始对话。
+- [x] 最终成功提交后，`CommittedTurn`、事实账本、mechanic、玩家投影和后续普通 GM 正典上下文都不包含 reasoning content；未完成状态之外不复制该字段，清除恢复阻塞时也清除其受限副本。
+- [x] CLI、技术错误、普通日志、公共评估记录、序列化异常和 adapter/Harness `repr` 不泄露 reasoning 正文、隐藏事实或 provider 私有诊断；测试使用唯一 canary 文本在所有禁止投影中作否定断言。
+- [x] mocked SDK 测试验证 thinking 请求参数以及带 tool call 的 assistant `reasoning_content` 在下一请求中精确回传；公开 Harness 生命周期测试用真实临时 session 和可编程假 model 覆盖工具后中断、进程重建、恢复 final、恢复再次中断与最终清理。
+- [x] non-thinking 现有 contract 与恢复测试保持通过，证明 thinking 支持没有改变 Increment 1 默认显式配置或玩家可见协议。
 
 **Not in this ticket:** 真实 key 调用、模型质量比较、thinking 内容审查或持久化为游戏记录、streaming、自动配置选择及通用 provider 支持。
+
+## Comments
+
+- 2026-08-07：Ticket 10 已实现。DeepSeek adapter 接受显式 `thinking=true`，继续使用单一 OpenAI SDK Chat Completions、`stream=False`、JSON Object 和外部 API key 注入，并将 thinking 映射为 `extra_body={"thinking":{"type":"enabled"}}`；默认 non-thinking 继续显式发送 disabled。
+- 2026-08-07：Harness 与 session loader 只把 provider `reasoning_content` 保存在 `IncompleteTurn.deepseek_messages` 或受限协议错误 envelope；thinking tool-call 的 assistant/tool 配对以原消息顺序原子写入和恢复，允许 provider 同时返回 assistant `content`。带工具的 thinking 响应缺少可回放 reasoning 时稳定以 `provider_protocol_error` 中断，不执行 RNG/机械、不合成消息、不降级；最终提交清除全部受限副本，CLI/记录/普通 repr 不泄露 canary。
+- 验证：解释器 `.venv/bin/python`（Python 3.12.3）；`PYTHONPATH=src .venv/bin/python -m unittest tests.test_agentic_harness tests.test_agentic_deepseek tests.test_agentic_cli`（86 passed）；`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`（189 passed）；`.venv/bin/mypy src/monmusu_agent/agentic_model.py src/monmusu_agent/agentic_harness.py src/monmusu_agent/agentic_session.py src/monmusu_agent/agentic_cli.py`、`PYTHONPATH=src .venv/bin/python -m compileall -q src tests`、`.venv/bin/ruff check --select E9,F63,F7,F82 src/monmusu_agent/agentic_model.py src/monmusu_agent/agentic_harness.py src/monmusu_agent/agentic_session.py src/monmusu_agent/agentic_cli.py tests/test_agentic_deepseek.py tests/test_agentic_harness.py tests/test_agentic_cli.py` 和 `git diff --check` 均通过。按本票范围未运行真实 DeepSeek；Ticket 11 负责 live recovery contract。

@@ -188,6 +188,10 @@ class _FinalValidationError(ValueError):
     pass
 
 
+class _ThinkingRecoveryMaterialError(_FinalValidationError):
+    pass
+
+
 class AgenticHarness:
     """隐藏上下文组装、模型分类和最终原子提交。"""
 
@@ -469,7 +473,24 @@ class AgenticHarness:
                     public_mechanics=tuple(public_mechanics),
                 )
             try:
-                assistant_message = self._validated_assistant_message(response)
+                assistant_message = self._validated_assistant_message(
+                    response,
+                    thinking=profile["thinking"],
+                )
+            except _ThinkingRecoveryMaterialError:
+                self._record_protocol_error(
+                    incomplete,
+                    response,
+                    message="thinking response lacks replayable reasoning_content",
+                )
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    "provider_protocol_error",
+                    "GM thinking 恢复协议无效",
+                    public_mechanics=tuple(public_mechanics),
+                )
             except _FinalValidationError:
                 self._record_protocol_error(incomplete, response)
                 return self._interrupt(
@@ -503,6 +524,7 @@ class AgenticHarness:
                             loaded,
                             working,
                             assistant_message,
+                            thinking=profile["thinking"],
                         )
                     except _FinalValidationError:
                         self._record_protocol_error(incomplete, response)
@@ -552,6 +574,7 @@ class AgenticHarness:
                             loaded,
                             working,
                             assistant_message,
+                            thinking=profile["thinking"],
                         )
                     except _FinalValidationError:
                         self._record_protocol_error(incomplete, response)
@@ -776,9 +799,13 @@ class AgenticHarness:
         loaded: LoadedSession,
         working: dict[str, Any],
         assistant_message: Mapping[str, Any],
+        *,
+        thinking: bool,
     ) -> dict[str, Any]:
         tool_calls = assistant_message["tool_calls"]
         assert isinstance(tool_calls, list)
+        if not thinking and assistant_message.get("content") is not None:
+            raise _FinalValidationError
         candidate = copy.deepcopy(working)
         incomplete = candidate["incomplete_turn"]
         assert isinstance(incomplete, dict)
@@ -953,10 +980,13 @@ class AgenticHarness:
         loaded: LoadedSession,
         working: dict[str, Any],
         assistant_message: Mapping[str, Any],
+        *,
+        thinking: bool,
     ) -> tuple[dict[str, Any], PublicMechanic | None]:
         tool_calls = assistant_message["tool_calls"]
         if (
             assistant_message.get("content") is not None
+            and not thinking
             or not isinstance(tool_calls, list)
             or len(tool_calls) != 1
         ):
@@ -1188,13 +1218,24 @@ class AgenticHarness:
     def _validated_assistant_message(
         cls,
         response: object,
+        *,
+        thinking: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(response, ModelResponse):
             raise _FinalValidationError
         message = response.assistant_message
+        if not isinstance(message, Mapping):
+            raise _FinalValidationError
         if (
-            not isinstance(message, Mapping)
-            or set(message) != _ASSISTANT_FIELDS
+            thinking
+            and isinstance(message.get("tool_calls"), list)
+            and message["tool_calls"]
+            and "reasoning_content" not in message
+        ):
+            raise _ThinkingRecoveryMaterialError
+        reasoning = message.get("reasoning_content")
+        if (
+            set(message) != _ASSISTANT_FIELDS
             or response.finish_reason is not None
             and not isinstance(response.finish_reason, str)
             or response.usage is not None
@@ -1208,20 +1249,23 @@ class AgenticHarness:
         ):
             raise _FinalValidationError
         content = message.get("content")
-        reasoning = message.get("reasoning_content")
+        tool_calls = message.get("tool_calls")
         if (
             message.get("role") != "assistant"
-            or not isinstance(message.get("tool_calls"), list)
+            or not isinstance(tool_calls, list)
             or content is not None
             and not isinstance(content, str)
-            or reasoning is not None
-            and not isinstance(reasoning, str)
         ):
             raise _FinalValidationError
+        if reasoning is not None and not isinstance(reasoning, str):
+            if thinking and tool_calls:
+                raise _ThinkingRecoveryMaterialError
+            raise _FinalValidationError
+        if thinking and tool_calls and not isinstance(reasoning, str):
+            raise _ThinkingRecoveryMaterialError
         finish_reason = response.finish_reason
         if finish_reason not in {None, "stop", "tool_calls"}:
             raise _FinalValidationError
-        tool_calls = message["tool_calls"]
         if (
             tool_calls
             and finish_reason not in {None, "tool_calls"}

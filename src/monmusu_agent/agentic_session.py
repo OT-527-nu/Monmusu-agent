@@ -907,11 +907,14 @@ class AgenticSessionStore:
                 successful_mechanic_ids.append(mechanic_id)
         if successful_mechanic_ids != list(mechanics_by_id):
             raise AgenticSessionLoadError("IncompleteTurn 格式无效")
-        cls._validate_model_profile(incomplete.get("model_profile"))
+        model_profile = incomplete.get("model_profile")
+        cls._validate_model_profile(model_profile)
         cls._validate_attempt_limits(incomplete.get("attempt_limits"))
+        assert isinstance(model_profile, Mapping)
         cls._validate_incomplete_messages(
             incomplete.get("deepseek_messages"),
             interactions,
+            thinking=model_profile.get("thinking") is True,
         )
         cls._validate_protocol_errors(
             incomplete.get("provider_protocol_errors")
@@ -1049,6 +1052,8 @@ class AgenticSessionStore:
         cls,
         messages: object,
         interactions: list[Any],
+        *,
+        thinking: bool,
     ) -> None:
         if not isinstance(messages, list) or len(messages) < 3:
             raise AgenticSessionLoadError("deepseek_messages 格式无效")
@@ -1079,6 +1084,8 @@ class AgenticSessionStore:
                 reasoning_content = message.get("reasoning_content")
                 if (
                     set(message) != _ASSISTANT_MESSAGE_FIELDS
+                    or content is not None
+                    and not isinstance(content, str)
                     or reasoning_content is not None
                     and not isinstance(reasoning_content, str)
                 ):
@@ -1093,10 +1100,13 @@ class AgenticSessionStore:
                     continue
                 if (
                     content is not None
+                    and not thinking
                     or not isinstance(tool_calls, list)
                     or not tool_calls
                     or message_index + len(tool_calls) >= len(messages)
                 ):
+                    raise AgenticSessionLoadError("deepseek_messages 格式无效")
+                if thinking and not isinstance(reasoning_content, str):
                     raise AgenticSessionLoadError("deepseek_messages 格式无效")
                 response_ids: set[str] = set()
                 for offset, call in enumerate(tool_calls):

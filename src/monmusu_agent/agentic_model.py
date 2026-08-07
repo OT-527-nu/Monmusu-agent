@@ -108,7 +108,7 @@ def deepseek_model_profile(
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ModelRequest:
     """保存一次非流式 GM 请求所需的完整 provider 无关材料。"""
 
@@ -117,8 +117,13 @@ class ModelRequest:
     request_timeout_seconds: float
     model_profile: Mapping[str, Any]
 
+    def __repr__(self) -> str:
+        """避免 GM 上下文和恢复协议材料通过调试表示外泄。"""
 
-@dataclass(frozen=True)
+        return "ModelRequest(<restricted model context>)"
+
+
+@dataclass(frozen=True, repr=False)
 class ModelResponse:
     """保留 adapter 收到的完整 assistant 协议消息。"""
 
@@ -126,6 +131,11 @@ class ModelResponse:
     finish_reason: str | None
     usage: Mapping[str, Any] | None
     latency_ms: int | None
+
+    def __repr__(self) -> str:
+        """避免未分类 provider envelope 通过调试表示泄露受限内容。"""
+
+        return "ModelResponse(<restricted provider envelope>)"
 
 
 class ModelCallError(RuntimeError):
@@ -169,12 +179,6 @@ class DeepSeekGameMasterModel:
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         profile = request.model_profile
-        if profile.get("thinking") is not False:
-            raise ModelCallError(
-                "unsupported_thinking_mode",
-                "Increment 1 does not support DeepSeek thinking mode",
-                retryable=False,
-            )
         if profile.get("stream") is not False:
             raise ModelCallError(
                 "unsupported_streaming",
@@ -209,7 +213,13 @@ class DeepSeekGameMasterModel:
             "stream": False,
             "max_tokens": validated_profile["max_tokens"],
             "timeout": request.request_timeout_seconds,
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "extra_body": {
+                "thinking": {
+                    "type": (
+                        "enabled" if validated_profile["thinking"] else "disabled"
+                    )
+                }
+            },
         }
         started_at = self._monotonic()
         try:

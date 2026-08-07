@@ -101,12 +101,6 @@ def compose_deepseek_harness(
 ) -> AgenticHarness:
     """在组合边界注入 key，并构造同一 Agentic Harness seam。"""
 
-    if thinking:
-        raise ModelCallError(
-            "unsupported_thinking_mode",
-            "Increment 1 does not support DeepSeek thinking mode",
-            retryable=False,
-        )
     try:
         profile = deepseek_model_profile(model_id=model_id, thinking=thinking)
     except ModelProfileValidationError as error:

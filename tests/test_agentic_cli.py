@@ -251,11 +251,13 @@ class AgenticCliTest(unittest.TestCase):
     ) -> None:
         """再次中断仍门控，原回合提交后才接受下一条行动。"""
 
+        reasoning_canary = "THINKING_CLI_RECOVERY_CANARY_10"
+        profile = deepseek_model_profile(thinking=True)
         tool_response = ModelResponse(
             assistant_message={
                 "role": "assistant",
                 "content": None,
-                "reasoning_content": None,
+                "reasoning_content": reasoning_canary,
                 "tool_calls": [
                     {
                         "id": "call_recovery_check",
@@ -297,7 +299,7 @@ class AgenticCliTest(unittest.TestCase):
                     },
                     ensure_ascii=False,
                 ),
-                "reasoning_content": None,
+                "reasoning_content": "THINKING_CLI_FINAL_CANARY_10",
                 "tool_calls": [],
             },
             finish_reason="stop",
@@ -316,7 +318,7 @@ class AgenticCliTest(unittest.TestCase):
                     },
                     ensure_ascii=False,
                 ),
-                "reasoning_content": None,
+                "reasoning_content": "THINKING_CLI_NEXT_CANARY_10",
                 "tool_calls": [],
             },
             finish_reason="stop",
@@ -342,6 +344,7 @@ class AgenticCliTest(unittest.TestCase):
                     [ModelCallError("request_timeout", "private", retryable=True)]
                 ),
                 turn_id_factory=lambda: "turn_interrupted",
+                model_profile=profile,
                 clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
             ).start_turn(created.game_id, "我检查门锁。")
             recovery_model = ScriptedGameMasterModel(
@@ -358,6 +361,7 @@ class AgenticCliTest(unittest.TestCase):
                 turn_id_factory=lambda: "turn_next",
                 mechanic_id_factory=lambda: "mechanic_recovery",
                 random_source=FixedRandom(),
+                model_profile=profile,
                 clock=lambda: datetime(2026, 8, 7, 0, 2, tzinfo=timezone.utc),
             )
             answers = iter(
@@ -410,6 +414,11 @@ class AgenticCliTest(unittest.TestCase):
         self.assertEqual(rendered.count("公开检定 | 行动：检查门锁上的刮痕"), 1)
         self.assertEqual(rendered.count("你确认门锁刚被人从外侧打开过。"), 1)
         self.assertEqual(rendered.count("你推门离开石牢。"), 1)
+        self.assertNotIn(reasoning_canary, rendered)
+        self.assertNotIn(
+            "THINKING_CLI_",
+            json.dumps(saved, ensure_ascii=False, sort_keys=True),
+        )
 
     def test_recovery_gate_rejects_new_action_and_preserves_state_on_exit_input(
         self,
@@ -560,7 +569,7 @@ class AgenticCliTest(unittest.TestCase):
                 assistant_message={
                     "role": "assistant",
                     "content": json.dumps(payload, ensure_ascii=False),
-                    "reasoning_content": None,
+                    "reasoning_content": reasoning,
                     "tool_calls": [],
                 },
                 finish_reason="stop",
@@ -609,6 +618,7 @@ class AgenticCliTest(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as directory:
+            profile = deepseek_model_profile(thinking=True)
             store = AgenticSessionStore(
                 session_root=Path(directory) / "sessions",
                 game_id_factory=lambda: "game_private_projection",
@@ -668,6 +678,7 @@ class AgenticCliTest(unittest.TestCase):
                 fact_id_factory=lambda: "fact_hidden",
                 mechanic_id_factory=mechanic_ids.__next__,
                 random_source=FixedRandom(),
+                model_profile=profile,
                 clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
             )
             harness.start_turn(created.game_id, "我侧耳听门外。")
@@ -678,7 +689,7 @@ class AgenticCliTest(unittest.TestCase):
             answers = iter(("1", "退出"))
 
             run_agentic_cli(
-                AgenticHarness(store, recovery_model),
+                AgenticHarness(store, recovery_model, model_profile=profile),
                 store,
                 read_line=lambda prompt: next(answers),
                 write_line=output.append,

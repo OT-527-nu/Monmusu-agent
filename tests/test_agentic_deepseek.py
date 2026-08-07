@@ -239,7 +239,98 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
             ),
         )
 
-    def test_complete_rejects_unsupported_thinking_and_stream_before_sdk(
+    def test_complete_enables_thinking_and_preserves_reasoning_envelope(
+        self,
+    ) -> None:
+        reasoning_canary = "THINKING_RECOVERY_CANARY_10"
+        assistant_message = {
+            "role": "assistant",
+            "content": "The lock needs a careful listening check.",
+            "reasoning_content": reasoning_canary,
+            "tool_calls": [
+                {
+                    "id": "call_thinking",
+                    "type": "function",
+                    "function": {
+                        "name": "make_check",
+                        "arguments": '{"ability":"listen"}',
+                    },
+                }
+            ],
+        }
+        sdk_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=Dumpable(assistant_message),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=None,
+        )
+        completions = RecordingCompletions(sdk_response)
+        model = DeepSeekGameMasterModel(
+            "not-a-real-key",
+            client=SimpleNamespace(
+                chat=SimpleNamespace(completions=completions)
+            ),
+        )
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": "call_thinking",
+            "name": "make_check",
+            "content": '{"ok":true}',
+        }
+        replay_messages = (
+            {"role": "user", "content": "I listen."},
+            assistant_message,
+            tool_message,
+        )
+
+        response = model.complete(
+            ModelRequest(
+                messages=replay_messages,
+                tools=(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "make_check",
+                            "description": "Resolve one COC check.",
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                ),
+                request_timeout_seconds=60,
+                model_profile={
+                    "provider": "deepseek",
+                    "model_id": "deepseek-v4-flash",
+                    "thinking": True,
+                    "stream": False,
+                    "response_format": "json_object",
+                    "temperature": None,
+                    "top_p": None,
+                    "max_tokens": 4096,
+                    "prompt_revision": "gm-capability-charter-agentic-mvp-2",
+                    "tool_schema_version": "coc-tools-agentic-mvp-1",
+                    "enabled_tools": ["make_check"],
+                },
+            )
+        )
+
+        sdk_request = completions.requests[0]
+        self.assertEqual(
+            sdk_request["extra_body"],
+            {"thinking": {"type": "enabled"}},
+        )
+        self.assertIs(sdk_request["stream"], False)
+        self.assertEqual(sdk_request["response_format"], {"type": "json_object"})
+        self.assertEqual(sdk_request["messages"], list(replay_messages))
+        self.assertEqual(
+            sdk_request["messages"][-2]["reasoning_content"],
+            reasoning_canary,
+        )
+        self.assertEqual(response.assistant_message, assistant_message)
+
+    def test_complete_rejects_streaming_before_sdk(
         self,
     ) -> None:
         completions = RecordingCompletions(object())
@@ -264,29 +355,24 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
             "enabled_tools": ["make_check"],
         }
 
-        for field, code in (
-            ("thinking", "unsupported_thinking_mode"),
-            ("stream", "unsupported_streaming"),
-        ):
-            with self.subTest(field=field):
-                profile = copy.deepcopy(baseline_profile)
-                profile[field] = True
-                request = ModelRequest(
-                    messages=({"role": "user", "content": "Test."},),
-                    tools=(),
-                    request_timeout_seconds=60,
-                    model_profile=profile,
-                )
+        profile = copy.deepcopy(baseline_profile)
+        profile["stream"] = True
+        request = ModelRequest(
+            messages=({"role": "user", "content": "Test."},),
+            tools=(),
+            request_timeout_seconds=60,
+            model_profile=profile,
+        )
 
-                with self.assertRaises(ModelCallError) as caught:
-                    model.complete(request)
+        with self.assertRaises(ModelCallError) as caught:
+            model.complete(request)
 
-                self.assertEqual(caught.exception.code, code)
-                self.assertFalse(caught.exception.retryable)
-                self.assertNotIn(
-                    "secret-key-must-not-appear",
-                    caught.exception.message,
-                )
+        self.assertEqual(caught.exception.code, "unsupported_streaming")
+        self.assertFalse(caught.exception.retryable)
+        self.assertNotIn(
+            "secret-key-must-not-appear",
+            caught.exception.message,
+        )
         self.assertEqual(completions.requests, [])
 
     def test_complete_normalizes_sdk_tool_call_transport_fields(self) -> None:
@@ -801,7 +887,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
                 "deepseek-v4-flash",
             )
 
-    def test_explicit_composition_rejects_thinking_before_provider_call(
+    def test_explicit_composition_accepts_thinking_without_provider_call(
         self,
     ) -> None:
         from monmusu_agent.agentic_cli import compose_deepseek_harness
@@ -815,16 +901,16 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
                 session_root=Path(directory) / "sessions"
             )
 
-            with self.assertRaises(ModelCallError) as caught:
-                compose_deepseek_harness(
-                    store,
-                    api_key="not-a-real-key",
-                    model_id="deepseek-v4-flash",
-                    thinking=True,
-                    client=client,
-                )
+            harness = compose_deepseek_harness(
+                store,
+                api_key="not-a-real-key",
+                model_id="deepseek-v4-flash",
+                thinking=True,
+                client=client,
+            )
 
-        self.assertEqual(caught.exception.code, "unsupported_thinking_mode")
+        self.assertIs(harness.model_profile["thinking"], True)
+        self.assertIs(harness.model_profile["stream"], False)
         self.assertEqual(completions.requests, [])
 
     def test_explicit_composition_rejects_invalid_model_id_stably(self) -> None:
