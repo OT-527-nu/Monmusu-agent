@@ -24,6 +24,7 @@ from monmusu_agent.agentic_model import (
     ModelRequest,
     ModelResponse,
     ScriptedGameMasterModel,
+    deepseek_model_profile,
 )
 from monmusu_agent.agentic_session import (
     AgenticSessionStore,
@@ -486,6 +487,62 @@ class AgenticCliTest(unittest.TestCase):
                     self.assertIn("只能输入“恢复”或“退出”。", output)
                 if label == "malformed-selection":
                     self.assertIn("请输入有效的未完成会话编号。", output)
+
+    def test_unavailable_frozen_profile_is_a_safe_recovery_interruption(
+        self,
+    ) -> None:
+        """冻结 profile 不可用时不泄露异常，也不调用模型或改档。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_profile_mismatch",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [ModelCallError("request_timeout", "private", retryable=True)]
+                ),
+                turn_id_factory=lambda: "turn_profile_mismatch",
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            ).start_turn(created.game_id, "我检查门锁。")
+            before = created.session_file.read_bytes()
+            recovery_model = ScriptedGameMasterModel([])
+            harness = AgenticHarness(
+                store,
+                recovery_model,
+                model_profile=deepseek_model_profile(
+                    model_id="deepseek-v4-pro"
+                ),
+            )
+            answers = iter(("1", "恢复", "退出"))
+            output: list[str] = []
+
+            result = run_agentic_cli(
+                harness,
+                store,
+                read_line=lambda prompt: next(answers),
+                write_line=output.append,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(recovery_model.requests, [])
+            self.assertEqual(created.session_file.read_bytes(), before)
+
+        rendered = "\n".join(output)
+        self.assertIn(
+            "技术中断（recovery_unavailable）：当前运行配置无法恢复该回合；未完成回合已保留",
+            rendered,
+        )
+        self.assertNotIn("deepseek-v4-pro", rendered)
+        self.assertNotIn("Traceback", rendered)
 
     def test_recovery_startup_filters_all_restricted_incomplete_turn_content(
         self,

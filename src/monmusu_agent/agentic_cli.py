@@ -10,6 +10,7 @@ from typing import Any
 
 from monmusu_agent.agentic_harness import (
     AgenticHarness,
+    AgenticTurnBlockedError,
     PublicMechanic,
     SessionLifecycleView,
     TurnResult,
@@ -150,23 +151,6 @@ def run_agentic_cli(
     )
     if game_id is None:
         return None
-    return run_recovery_cli(
-        harness,
-        game_id,
-        read_line=wrapped_read_line,
-        write_line=write_line,
-    )
-
-
-def run_recovery_cli(
-    harness: AgenticHarness,
-    game_id: str,
-    *,
-    read_line: Callable[[str], str] = input,
-    write_line: Callable[[str], None] = print,
-) -> TurnResult | None:
-    """从已发现的未完成会话进入显式恢复/退出门。"""
-
     return _run_session_cli(
         harness,
         game_id,
@@ -305,13 +289,22 @@ def _run_session_cli(
             if choice == "exit":
                 return last_result
             assert lifecycle.turn_id is not None
-            result = harness.resume_turn(
-                game_id,
-                lifecycle.turn_id,
-                public_mechanic_sink=lambda mechanic: write_line(
-                    _format_public_mechanic(mechanic)
-                ),
-            )
+            try:
+                result = harness.resume_turn(
+                    game_id,
+                    lifecycle.turn_id,
+                    public_mechanic_sink=lambda mechanic: write_line(
+                        _format_public_mechanic(mechanic)
+                    ),
+                )
+            except AgenticTurnBlockedError:
+                # 冻结运行配置不可用时，保持 blocker 并回到同一显式门。
+                write_line(
+                    "技术中断（recovery_unavailable）："
+                    "当前运行配置无法恢复该回合；未完成回合已保留"
+                )
+                show_recovery_state = False
+                continue
             _write_turn_result(result, write_line)
             last_result = result
             show_recovery_state = False
