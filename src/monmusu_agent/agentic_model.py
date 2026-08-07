@@ -325,9 +325,20 @@ def _sdk_request_evidence(request: Mapping[str, Any]) -> dict[str, Any]:
             name = function.get("name") if isinstance(function, Mapping) else None
             function_tools.append(name if isinstance(name, str) else "unsupported")
     return {
+        "model_id": request.get("model"),
         "function_tools": function_tools,
         "response_format": copy.deepcopy(request.get("response_format")),
         "stream": request.get("stream"),
+        "max_tokens": request.get("max_tokens"),
+        "timeout": request.get("timeout"),
+        "thinking": (
+            request.get("extra_body", {})
+            .get("thinking", {})
+            .get("type")
+            if isinstance(request.get("extra_body"), Mapping)
+            and isinstance(request["extra_body"].get("thinking"), Mapping)
+            else None
+        ),
     }
 
 

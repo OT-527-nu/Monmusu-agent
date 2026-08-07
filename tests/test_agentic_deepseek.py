@@ -1175,6 +1175,7 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
 
         output = io.StringIO()
         with (
+            patch("monmusu_agent.agentic_contract.load_dotenv"),
             patch.dict(
                 os.environ,
                 {"MONMUSU_RUN_DEEPSEEK_CONTRACT": "1"},
@@ -1187,6 +1188,214 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("SKIP", output.getvalue())
         self.assertIn("DEEPSEEK_API_KEY", output.getvalue())
+
+    def test_recovery_runner_proves_both_thinking_profiles_without_private_material(
+        self,
+    ) -> None:
+        from monmusu_agent.agentic_contract import run_deepseek_recovery_contract
+
+        reasoning_canary = "TICKET_11_REASONING_CANARY_MUST_NOT_ESCAPE"
+        tool_arguments = {
+            "actor_id": "investigator_tracker",
+            "ability": "strength",
+            "difficulty": "regular",
+            "dice_adjustment": {"kind": "none", "count": 0},
+            "action": "撞击锈蚀牢门的锁扣",
+            "stakes": "失败会发出巨响并引来船工",
+            "visibility": "public",
+        }
+
+        def sdk_response(
+            message: dict[str, Any],
+            finish_reason: str,
+            usage: dict[str, int] | None = None,
+        ) -> object:
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=Dumpable(message),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                usage=Dumpable(usage) if usage is not None else None,
+            )
+
+        def tool_message(
+            *,
+            thinking: bool,
+            call_id: str = "call_ticket_11",
+        ) -> dict[str, Any]:
+            return {
+                "role": "assistant",
+                "content": "先确认锁扣的承重点。" if thinking else None,
+                "reasoning_content": reasoning_canary if thinking else None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "make_check",
+                            "arguments": json.dumps(
+                                tool_arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    }
+                ],
+            }
+
+        def final_message(*, thinking: bool) -> dict[str, Any]:
+            return {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": "锁扣在撞击下松脱，但巨响已经传开。",
+                        "establish": [
+                            {
+                                "visibility": "hidden",
+                                "text": "隐藏事实：船工正在回头",
+                            }
+                        ],
+                        "retire": [],
+                        "session_status": "ongoing",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": reasoning_canary if thinking else None,
+                "tool_calls": [],
+            }
+
+        completions = ScriptedCompletions(
+            [
+                sdk_response(
+                    tool_message(thinking=False),
+                    "tool_calls",
+                    {"prompt_tokens": 100, "completion_tokens": 20},
+                ),
+                sdk_response(
+                    final_message(thinking=False),
+                    "stop",
+                    {"prompt_tokens": 150, "completion_tokens": 30},
+                ),
+                sdk_response(
+                    tool_message(thinking=True),
+                    "tool_calls",
+                    {"prompt_tokens": 200, "completion_tokens": 40},
+                ),
+                sdk_response(
+                    final_message(thinking=True),
+                    "stop",
+                    {"prompt_tokens": 250, "completion_tokens": 50},
+                ),
+            ]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_deepseek_recovery_contract(
+                enabled=True,
+                api_key="sk-ticket-11-test-secret",
+                session_root=Path(directory) / "sessions",
+                client=client,
+            )
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(len(result.records), 2)
+        for record, thinking in zip(
+            result.records,
+            (False, True),
+            strict=True,
+        ):
+            self.assertIs(record["thinking"], thinking)
+            recovery = record["recovery"]
+            self.assertTrue(recovery["same_turn_id"])
+            self.assertTrue(recovery["same_mechanic"])
+            self.assertTrue(recovery["resume_gate_observed"])
+            self.assertEqual(recovery["resume_choice"], "resume")
+            self.assertEqual(recovery["turn_count"], 1)
+            self.assertEqual(recovery["mechanic_count"], 1)
+            self.assertTrue(recovery["turn_ids_unique"])
+            self.assertTrue(recovery["established_fact_ids_unique"])
+            self.assertTrue(recovery["fact_ids_unique"])
+            self.assertEqual(recovery["character_changes"], [])
+            self.assertEqual(
+                recovery["initial_interruption"], "request_timeout"
+            )
+            self.assertTrue(recovery["tool_result_replayed"])
+            self.assertTrue(recovery["reasoning_replay_exact"] if thinking else True)
+            self.assertFalse(recovery["reasoning_body_recorded"])
+            self.assertTrue(recovery["final_state_clean"])
+            self.assertEqual(
+                record["requests"][0]["tool_calls"],
+                [{"tool_call_id": "call_ticket_11", "tool_name": "make_check"}],
+            )
+            self.assertEqual(
+                record["requests"][-1]["tool_result_ids"],
+                ["call_ticket_11"],
+            )
+            self.assertTrue(record["game_id"].startswith("game_"))
+            self.assertTrue(record["fixture_version"].startswith("setup_game_"))
+            self.assertEqual(
+                set(record["dependency_versions"]),
+                {"python", "openai", "python-dotenv"},
+            )
+            self.assertEqual(
+                [
+                    record["hard_gates"][gate]["status"]
+                    for gate in (
+                        "protocol_legality",
+                        "mechanical_truth",
+                        "hidden_content_control",
+                    )
+                ],
+                ["passed", "passed", "passed"],
+            )
+
+        rendered = json.dumps(result.records, ensure_ascii=False)
+        for forbidden in (
+            "sk-ticket-11-test-secret",
+            reasoning_canary,
+            "隐藏事实：船工正在回头",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+        duplicate_completions = ScriptedCompletions(
+            [
+                sdk_response(tool_message(thinking=False), "tool_calls"),
+                sdk_response(
+                    tool_message(
+                        thinking=False,
+                        call_id="call_ticket_11_duplicate",
+                    ),
+                    "tool_calls",
+                ),
+                sdk_response(final_message(thinking=False), "stop"),
+                sdk_response(tool_message(thinking=True), "tool_calls"),
+                sdk_response(final_message(thinking=True), "stop"),
+            ]
+        )
+        duplicate_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=duplicate_completions)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            duplicate_result = run_deepseek_recovery_contract(
+                enabled=True,
+                api_key="sk-ticket-11-test-secret",
+                session_root=Path(directory) / "sessions",
+                client=duplicate_client,
+            )
+
+        duplicate_record = duplicate_result.records[0]
+        self.assertEqual(duplicate_result.status, "failed")
+        self.assertFalse(duplicate_record["passed"])
+        self.assertEqual(duplicate_record["recovery"]["mechanic_count"], 2)
+        self.assertEqual(
+            duplicate_record["hard_gates"]["mechanical_truth"]["status"],
+            "failed",
+        )
 
 
 if __name__ == "__main__":
