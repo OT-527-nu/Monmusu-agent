@@ -3,6 +3,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Mapping
+
+from monmusu_agent.agentic_coc import (
+    MakeCheckError,
+    MakeCheckTool,
+    RandomSource,
+    ToolExecution,
+)
 
 from monmusu_agent.agentic_harness import (
     AgenticHarness,
@@ -37,7 +45,91 @@ class ScriptedRandom:
         return next(self.values)
 
 
+class LifecycleTestTool:
+    """只用于证明非 make_check 工具共享提交、恢复与角色变化。"""
+
+    definition = {
+        "type": "function",
+        "function": {
+            "name": "lifecycle_test",
+            "description": "测试共享工具生命周期。",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["actor_id", "amount", "visibility"],
+                "properties": {
+                    "actor_id": {"type": "string"},
+                    "amount": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "visibility": {"type": "string", "enum": ["public", "hidden"]},
+                },
+            },
+        },
+    }
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]:
+        try:
+            value = json.loads(arguments_raw)
+        except json.JSONDecodeError as error:
+            raise MakeCheckError("invalid_arguments", "测试工具参数不是合法 JSON") from error
+        if not isinstance(value, dict) or set(value) != {"actor_id", "amount", "visibility"}:
+            raise MakeCheckError("invalid_arguments", "测试工具参数字段无效")
+        if (
+            not isinstance(value["actor_id"], str)
+            or not value["actor_id"].strip()
+            or not isinstance(value["amount"], int)
+            or isinstance(value["amount"], bool)
+            or not 1 <= value["amount"] <= 10
+            or value["visibility"] not in {"public", "hidden"}
+        ):
+            raise MakeCheckError("invalid_arguments", "测试工具参数值无效")
+        return dict(value)
+
+    def execute(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution:
+        del mechanics, random_source
+        updated = json.loads(json.dumps(actors))
+        actor = next((item for item in updated if item["actor_id"] == arguments["actor_id"]), None)
+        if actor is None:
+            raise MakeCheckError("unknown_actor", "测试角色不存在")
+        before = actor["luck"]["current"]
+        amount = arguments["amount"]
+        if before < amount:
+            raise MakeCheckError("insufficient_luck", "测试资源不足")
+        actor["luck"]["current"] = before - amount
+        return ToolExecution(
+            mechanic={
+                "mechanic_id": mechanic_id,
+                "kind": "lifecycle_test",
+                "actor_id": arguments["actor_id"],
+                "amount": amount,
+                "luck_before": before,
+                "luck_after": before - amount,
+                "visibility": arguments["visibility"],
+                "committed_at": committed_at,
+            },
+            actors=updated,
+        )
+
+
 class AgenticHarnessTest(unittest.TestCase):
+    @staticmethod
+    def _lifecycle_profile() -> dict[str, Any]:
+        profile = deepseek_model_profile()
+        profile["enabled_tools"] = ["make_check", "lifecycle_test"]
+        return profile
+
+    @staticmethod
+    def _lifecycle_registry() -> dict[str, Any]:
+        return {"make_check": MakeCheckTool(), "lifecycle_test": LifecycleTestTool()}
+
     def _create_session(self, root: Path) -> tuple[AgenticSessionStore, str]:
         store = AgenticSessionStore(
             session_root=root / "sessions",
@@ -143,6 +235,94 @@ class AgenticHarnessTest(unittest.TestCase):
             "stakes": "失败会错过痕迹",
             "visibility": "public",
         }
+
+    def test_non_check_tool_commits_state_then_replays_exactly_once_after_restart(self) -> None:
+        """非检定工具的角色变化先提交，重建进程恢复时按调用 ID 幂等重放。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "amount": 3,
+            "visibility": "public",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, game_id = self._create_session(root)
+            first_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(arguments, name="lifecycle_test"),
+                    ModelCallError("request_timeout", "timeout", retryable=True),
+                ]
+            )
+            first = AgenticHarness(
+                store,
+                first_model,
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: "mechanic_lifecycle_001",
+            ).start_turn(game_id, "我确认测试资源变化。")
+
+            self.assertEqual(first.status, "interrupted")
+            self.assertEqual(first.public_mechanics[0].kind, "lifecycle_test")
+            interrupted = store.load_session(game_id).session
+            self.assertEqual(interrupted["actors"][0]["luck"]["current"], 52)
+            self.assertEqual(len(interrupted["incomplete_turn"]["mechanics"]), 1)
+
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(arguments, name="lifecycle_test"),
+                    self._response(
+                        {
+                            "narration": "已沿用此前提交的测试结果。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                ]
+            )
+            rebuilt_store = AgenticSessionStore(session_root=root / "sessions")
+            resumed = AgenticHarness(
+                rebuilt_store,
+                resumed_model,
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: "mechanic_must_not_allocate",
+            ).resume_turn(game_id, first.turn_id)
+
+            self.assertEqual(resumed.status, "committed")
+            committed = rebuilt_store.load_session(game_id).session
+            self.assertEqual(committed["actors"][0]["luck"]["current"], 52)
+            self.assertEqual(len(committed["turns"][0]["mechanics"]), 1)
+            self.assertEqual(committed["turns"][0]["mechanics"][0]["mechanic_id"], "mechanic_lifecycle_001")
+
+    def test_non_check_invalid_arguments_commit_error_without_state_change(self) -> None:
+        """非检定参数错误保存 raw/error，但不分配机械或改变角色。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        {"actor_id": "investigator_tracker", "amount": 0, "visibility": "public"},
+                        name="lifecycle_test",
+                    ),
+                    ModelCallError("request_timeout", "timeout", retryable=True),
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: self.fail("invalid call allocated mechanic ID"),
+            ).start_turn(game_id, "我提交无效测试调用。")
+
+            self.assertEqual(result.status, "interrupted")
+            session = store.load_session(game_id).session
+            interaction = session["incomplete_turn"]["tool_interactions"][0]
+            self.assertEqual(interaction["error"]["code"], "invalid_arguments")
+            self.assertIsNone(interaction["arguments"])
+            self.assertEqual(session["actors"][0]["luck"]["current"], 55)
 
     @staticmethod
     def _tool_message_count(messages: object) -> int:

@@ -66,6 +66,7 @@ def validated_model_profile(
         if not isinstance(value, str) or not value.strip() or value != value.strip():
             raise ModelProfileValidationError(f"model_profile.{field} 格式无效")
     max_tokens = rebuilt["max_tokens"]
+    profile_tools = rebuilt["enabled_tools"]
     if (
         not isinstance(rebuilt["thinking"], bool)
         or rebuilt["stream"] is not False
@@ -77,7 +78,16 @@ def validated_model_profile(
         or not 1 <= max_tokens <= 1_000_000
         or rebuilt["prompt_revision"] != PROMPT_REVISION
         or rebuilt["tool_schema_version"] != TOOL_SCHEMA_VERSION
-        or rebuilt["enabled_tools"] != list(enabled_tools)
+        or not isinstance(profile_tools, list)
+        or not profile_tools
+        or any(
+            not isinstance(name, str)
+            or not name
+            or name != name.strip()
+            for name in profile_tools
+        )
+        or len(set(profile_tools)) != len(profile_tools)
+        or profile_tools != list(enabled_tools)
     ):
         raise ModelProfileValidationError("model_profile 格式无效")
     return rebuilt
@@ -186,9 +196,12 @@ class DeepSeekGameMasterModel:
                 retryable=False,
             )
         try:
+            profile_tools = profile.get("enabled_tools")
             validated_profile = validated_model_profile(
                 profile,
-                enabled_tools=("make_check",),
+                enabled_tools=(
+                    tuple(profile_tools) if isinstance(profile_tools, list) else ()
+                ),
             )
         except ModelProfileValidationError as error:
             raise ModelCallError(

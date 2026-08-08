@@ -96,12 +96,51 @@ _SUCCESS_LEVELS = frozenset(
         "fumble",
     }
 )
+_LIFECYCLE_TEST_FIELDS = frozenset(
+    {
+        "mechanic_id",
+        "kind",
+        "actor_id",
+        "amount",
+        "luck_before",
+        "luck_after",
+        "visibility",
+        "committed_at",
+    }
+)
 
 
 class RandomSource(Protocol):
     """声明 COC d10 所需的最小可注入随机边界。"""
 
     def randint(self, minimum: int, maximum: int) -> int: ...
+
+
+@dataclass(frozen=True)
+class ToolExecution:
+    """工具在一次原子提交中交付的机械与角色卡新值。"""
+
+    mechanic: Mapping[str, Any]
+    actors: list[dict[str, Any]]
+
+
+class CocTool(Protocol):
+    """其余 COC 工具接入同一 Harness 生命周期所需的窄接口。"""
+
+    definition: Mapping[str, Any]
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]: ...
+
+    def execute(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution: ...
 
 
 class MakeCheckError(ValueError):
@@ -245,6 +284,40 @@ def resolve_prepared_check(
     }
 
 
+class MakeCheckTool:
+    """把既有 make_check 规则适配到共同工具生命周期。"""
+
+    definition = MAKE_CHECK_TOOL
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]:
+        return normalize_make_check_arguments(arguments_raw)
+
+    def execute(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution:
+        del mechanics
+        prepared = prepare_make_check(arguments, actors)
+        mechanic = resolve_prepared_check(
+            prepared,
+            mechanic_id=mechanic_id,
+            random_source=random_source,
+            committed_at=committed_at,
+        )
+        if not isinstance(actors, list):
+            raise MakeCheckError("actor_data_unavailable", "冻结角色卡不可用")
+        return ToolExecution(mechanic=mechanic, actors=json.loads(json.dumps(actors)))
+
+
+DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {"make_check": MakeCheckTool()}
+
+
 def validate_check_result(value: object) -> None:
     """严格校验持久化机械，并复算所有可推导字段。"""
 
@@ -300,6 +373,35 @@ def validate_check_result(value: object) -> None:
         )
     ):
         raise ValueError("check mechanic 格式无效")
+
+
+def validate_mechanic_result(value: object) -> None:
+    """按机械 kind 校验记录；测试 kind 只用于证明共享生命周期。"""
+
+    if isinstance(value, dict) and value.get("kind") == "check":
+        validate_check_result(value)
+        return
+    if not isinstance(value, dict) or set(value) != _LIFECYCLE_TEST_FIELDS:
+        raise ValueError("mechanic 格式无效")
+    for field in ("mechanic_id", "actor_id", "committed_at"):
+        _required_string(value.get(field), field)
+    amount = value.get("amount")
+    before = value.get("luck_before")
+    after = value.get("luck_after")
+    if (
+        value.get("kind") != "lifecycle_test"
+        or not isinstance(amount, int)
+        or isinstance(amount, bool)
+        or not 1 <= amount <= 10
+        or not isinstance(before, int)
+        or isinstance(before, bool)
+        or not isinstance(after, int)
+        or isinstance(after, bool)
+        or after != before - amount
+        or not 0 <= after <= before <= 99
+        or value.get("visibility") not in {"public", "hidden"}
+    ):
+        raise ValueError("mechanic 格式无效")
 
 
 def _required_string(value: object, label: str) -> str:

@@ -17,7 +17,7 @@ from uuid import uuid4
 from monmusu_agent.agentic_coc import (
     MakeCheckError,
     normalize_make_check_arguments,
-    validate_check_result,
+    validate_mechanic_result,
 )
 from monmusu_agent.agentic_model import (
     ModelProfileValidationError,
@@ -193,10 +193,14 @@ def tool_call_matches_interaction(
     persisted_arguments = interaction.get("arguments")
     if isinstance(persisted_arguments, dict):
         try:
-            incoming_arguments = normalize_make_check_arguments(arguments_raw)
-        except MakeCheckError:
+            incoming_arguments = (
+                normalize_make_check_arguments(arguments_raw)
+                if tool_name == "make_check"
+                else json.loads(arguments_raw)
+            )
+        except (MakeCheckError, json.JSONDecodeError):
             return arguments_raw == interaction.get("arguments_raw")
-        return incoming_arguments == persisted_arguments
+        return isinstance(incoming_arguments, dict) and incoming_arguments == persisted_arguments
     return arguments_raw == interaction.get("arguments_raw")
 
 
@@ -766,7 +770,7 @@ class AgenticSessionStore:
         mechanic_ids: set[str] = set()
         for mechanic in mechanics:
             try:
-                validate_check_result(mechanic)
+                validate_mechanic_result(mechanic)
             except (ValueError, TypeError, KeyError) as error:
                 raise AgenticSessionLoadError("CommittedTurn 格式无效") from error
             assert isinstance(mechanic, dict)
@@ -879,7 +883,7 @@ class AgenticSessionStore:
         mechanics_by_id: dict[str, Mapping[str, Any]] = {}
         for mechanic in mechanics:
             try:
-                validate_check_result(mechanic)
+                validate_mechanic_result(mechanic)
             except (ValueError, TypeError, KeyError) as error:
                 raise AgenticSessionLoadError("IncompleteTurn 格式无效") from error
             assert isinstance(mechanic, dict)
@@ -937,7 +941,13 @@ class AgenticSessionStore:
         if not isinstance(profile, Mapping):
             raise AgenticSessionLoadError("model_profile 格式无效")
         try:
-            validated_model_profile(profile, enabled_tools=("make_check",))
+            enabled_tools = profile.get("enabled_tools")
+            validated_model_profile(
+                profile,
+                enabled_tools=(
+                    tuple(enabled_tools) if isinstance(enabled_tools, list) else ()
+                ),
+            )
         except ModelProfileValidationError as error:
             raise AgenticSessionLoadError("model_profile 格式无效") from error
 
@@ -980,13 +990,17 @@ class AgenticSessionStore:
         ):
             raise AgenticSessionLoadError("ToolInteraction 格式无效")
         if arguments is not None:
-            if tool_name != "make_check":
-                raise AgenticSessionLoadError("ToolInteraction 格式无效")
             try:
-                normalized = normalize_make_check_arguments(arguments_raw)
-                persisted_normalized = normalize_make_check_arguments(
-                    json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-                )
+                if tool_name == "make_check":
+                    normalized = normalize_make_check_arguments(arguments_raw)
+                    persisted_normalized = normalize_make_check_arguments(
+                        json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+                    )
+                else:
+                    normalized = json.loads(arguments_raw)
+                    persisted_normalized = arguments
+                    if not isinstance(normalized, dict):
+                        raise ValueError
             except MakeCheckError as normalization_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
@@ -1005,30 +1019,23 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("ToolInteraction 格式无效")
         if ok:
             if (
-                tool_name != "make_check"
-                or not isinstance(arguments, dict)
+                not isinstance(arguments, dict)
                 or tool_error_value is not None
             ):
                 raise AgenticSessionLoadError("ToolInteraction 格式无效")
             try:
-                validate_check_result(result)
+                validate_mechanic_result(result)
             except (ValueError, TypeError, KeyError) as validation_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
                 ) from validation_error
             assert isinstance(result, dict)
-            if any(
-                arguments.get(field) != result.get(field)
-                for field in (
-                    "actor_id",
-                    "ability",
-                    "difficulty",
-                    "dice_adjustment",
-                    "action",
-                    "stakes",
-                    "visibility",
-                )
-            ):
+            fixed_fields = (
+                ("actor_id", "ability", "difficulty", "dice_adjustment", "action", "stakes", "visibility")
+                if tool_name == "make_check"
+                else tuple(arguments)
+            )
+            if any(arguments.get(field) != result.get(field) for field in fixed_fields):
                 raise AgenticSessionLoadError("ToolInteraction 格式无效")
             return tool_call_id, result
         if (
@@ -1290,6 +1297,17 @@ class AgenticSessionStore:
                 raise AgenticSessionLoadError("机械与冻结角色卡不一致")
             mechanic_id = mechanic.get("mechanic_id")
             actor = actors_by_id.get(mechanic.get("actor_id"))
+            if mechanic.get("kind") == "lifecycle_test":
+                if (
+                    not isinstance(mechanic_id, str)
+                    or mechanic_id in seen_mechanic_ids
+                    or not isinstance(actor, dict)
+                    or actor.get("luck", {}).get("current")
+                    != mechanic.get("luck_after")
+                ):
+                    raise AgenticSessionLoadError("机械与冻结角色卡不一致")
+                seen_mechanic_ids.add(mechanic_id)
+                continue
             ability = mechanic.get("ability")
             if (
                 not isinstance(mechanic_id, str)

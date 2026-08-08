@@ -12,6 +12,11 @@
 - [ ] 恢复按 `(turn_id, tool_call_id)` 对每一种已启用工具执行同参数幂等重放；已经提交的骰点、机械 ID 和角色变化不重复生成，相同 ID 搭配不同参数仍被拒绝。
 - [ ] 共同机械校验接受各工具规范定义的 `kind` 和字段，同时强制 Harness 生成的 `mechanic_id`、可信角色引用、提交时间和事前可见性；不能继续把所有机械或投影写死为 `make_check`。
 - [ ] 玩家投影只发布 `public` 机械并保留规定的事前参数与结果；隐藏机械、隐藏事实、provider envelope、私有诊断和 reasoning content 不进入普通输出。
-- [ ] 公开 Harness 生命周期测试使用临时真实 session 和可编程假 model，证明至少一个非 `make_check` 测试工具能走通成功、参数错误、工具后中断、进程重建与同回合恢复；既有 Increment 1/2 全量基线保持通过。
+- [x] 公开 Harness 生命周期测试使用临时真实 session 和可编程假 model，证明至少一个非 `make_check` 测试工具能走通成功、参数错误、工具后中断、进程重建与同回合恢复；既有 Increment 1/2 全量基线保持通过。
+
+## Implementation Notes
+
+- 2026-08-08：`CocTool` 注册器接入统一 Harness 生命周期；`make_check` 通过适配器保持兼容，并由测试专用 `lifecycle_test` 证明规范化、原子机械/幸运变化提交、公开投影、工具后中断、进程重建和 `(turn_id, tool_call_id)` 幂等恢复。
+- 验证：`.venv/bin/python`（Python 3.12.3）；`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`（192 passed）、`compileall`、`git diff --check`。
 
 **Not in this ticket:** 实现 `push_check`、`spend_luck`、`deal_damage` 或 `make_sanity_check` 的具体 COC 规则，增加任意状态补丁工具、通用表达式语言、provider registry、自动模型路由或旧路径删除。
