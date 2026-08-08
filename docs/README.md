@@ -4,7 +4,7 @@
 
 下一版 MVP 的设计权威是 [Agentic MVP 文档集](agentic_mvp/README.md)，由 [ADR-005](adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-044](adr/0044-real-llm-vertical-slice-leads-migration.md) 记录其关键取舍。领域词汇统一见仓库根目录的 [CONTEXT.md](../CONTEXT.md)。
 
-这次权威切换不表示目标架构已经全部实现。截至 2026-07-31，默认 `monmusu-agent` 仍运行旧的规则驱动路径；独立的 opt-in `monmusu-agent-agentic` 已完成 Increment 1：不可变会话、GM 最终答复与事实账本、`make_check`、真实 DeepSeek adapter 和两回合开放行动验证。正式恢复、其余 COC 工具、完整短篇与默认入口切换仍是目标工作。判断“代码现在会做什么”时必须检查源码和测试，判断“下一版应该实现什么”时使用 `docs/agentic_mvp/`；具体差距见[迁移清单](agentic_mvp/migration.md)。
+这次权威切换不表示目标架构已经全部实现。截至 2026-08-08，默认 `monmusu-agent` 仍运行旧的规则驱动路径；独立的 opt-in `monmusu-agent-agentic` 已完成 Increment 1 和 Increment 2，包括不可变会话、GM 最终答复与事实账本、`make_check`、真实 DeepSeek adapter、两回合开放行动、显式恢复门、执行限制、幂等工具结果重放、一次结构修正，以及 non-thinking/thinking 真实恢复传输证据。其余 COC 工具、完整短篇、模型评估矩阵、默认入口切换与旧路径退役仍是目标工作。判断“代码现在会做什么”时必须检查源码和测试，判断“下一版应该实现什么”时使用 `docs/agentic_mvp/`；具体差距见[迁移清单](agentic_mvp/migration.md)。
 
 新设计的核心边界是：GM 裁定虚构因果并建立正典；Markdown 模组是参考书而不是权限表；Harness 提供可信 COC 机械、事实与回合持久化、结构校验和恢复，但不审批故事是否允许发生；运行时只有一个连续 GM Agent Loop。
 

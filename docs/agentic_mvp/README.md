@@ -4,7 +4,7 @@
 
 本目录定义 Monmusu Agent 下一版 MVP 的目标产品、目标架构与验收方式，落实 [ADR-005](../adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-044](../adr/0044-real-llm-vertical-slice-leads-migration.md)。它是新实现的设计权威，但不是当前源码已经完成的能力清单。
 
-截至 2026-07-31，默认入口仍运行旧的模组 JSON、`request_check`、`apply_effect`、效果白名单、关系阶段与六格威胁时钟。独立的 opt-in Agentic 入口已经完成 Increment 1：不可变 `SessionSetup` 与参考快照、自然语言事实账本、GM 最终答复原子提交、`make_check`、non-thinking DeepSeek adapter、连续 CLI 和真实两回合开放行动证据。它会保存技术中断所需的 `IncompleteTurn` 并阻止新行动覆盖，但正式 resume interface、结构修正、执行尝试时限与往返保险丝、thinking 回放及其余 COC 工具尚未实现。具体差异与迁移门见[迁移清单](migration.md)。
+截至 2026-08-08，默认入口仍运行旧的模组 JSON、`request_check`、`apply_effect`、效果白名单、关系阶段与六格威胁时钟。独立的 opt-in Agentic 入口已经完成 Increment 1 和 Increment 2：除 Increment 1 的不可变 `SessionSetup`、自然语言事实账本、GM 最终答复原子提交、`make_check`、non-thinking DeepSeek adapter、连续 CLI 和真实两回合开放行动证据外，现已具备 `IncompleteTurn` 持久化、显式 CLI 恢复门、同 ID 工具结果幂等重放、结构修正、执行尝试时限/往返保险丝、thinking `reasoning_content` 受限回放，以及 non-thinking/thinking 真实恢复合同证据。其余 COC 工具和完整短篇仍未实现；默认入口切换与旧路径退役也尚未发生。具体差异与迁移门见[迁移清单](migration.md)。
 
 ## 产品核心
 

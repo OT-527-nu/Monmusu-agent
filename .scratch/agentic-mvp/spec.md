@@ -1,10 +1,10 @@
 # Agentic MVP：真实 GM 的开放式 CLI 短篇
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## Delivery Status
 
-截至 2026-07-31，Increment 1 已由独立的 opt-in Agentic 路径交付：不可变会话、GM 最终答复与事实账本、`make_check`、真实 DeepSeek adapter、连续 CLI 和两回合开放行动证据均已完成。默认入口仍保留旧规则驱动基线；正式恢复、其余 COC 工具、完整短篇、模型评估矩阵和旧路径退役仍按下述目标与迁移顺序实施。以下 Problem Statement 保留为本规格建立时的迁移起点，不代表当前交付状态。
+截至 2026-08-08，Increment 1 和 Increment 2 已由独立的 opt-in Agentic 路径交付。Increment 1 包含不可变会话、GM 最终答复与事实账本、`make_check`、真实 DeepSeek adapter、连续 CLI 和两回合开放行动证据；Increment 2 又通过确定性 Harness/CLI/session 恢复矩阵，以及 [Ticket 11 真实恢复证据](../../docs/agentic_mvp/evidence/ticket-11-live-recovery-2026-08-07.md)，证明了超时/中断后的显式同回合恢复、已提交工具结果幂等重放、执行限制、一次结构修正和 non-thinking/thinking 的 DeepSeek 协议恢复。默认入口仍保留旧规则驱动基线；其余 COC 工具、完整短篇、模型评估矩阵、默认入口切换和旧路径退役仍按下述目标与迁移顺序实施。以下 Problem Statement 保留为本规格建立时的迁移起点，不代表当前交付状态。
 
 ## Problem Statement
 
@@ -188,8 +188,8 @@ Status: ready-for-agent
 
 - This is a target specification, not a claim about the current checkout. The existing finite loop, engine, tools, rules, state, CLI, and tests remain the migration baseline until the relevant increment passes its exit gate.
 - The accepted seam decision is intentionally narrow: test the highest public Harness behavior with a fake `GameMasterModel`; do not expose internal context assemblers, storage transactions, or COC helpers merely to make tests easier.
-- The first meaningful proof is a real two-turn path in which DeepSeek resolves a reasonable action absent from the reference book, directly or with `make_check`, establishes a fact judged to be caused by that action, and explicitly carries its consequence into the second turn. Deterministic tests separately prove only ID allocation, persistence, and request injection. Full five-tool mechanics, recovery UX, content polish, and model selection follow that proof rather than precede it.
+- The first meaningful proof is a real two-turn path in which DeepSeek resolves a reasonable action absent from the reference book, directly or with `make_check`, establishes a fact judged to be caused by that action, and explicitly carries its consequence into the second turn. Deterministic tests separately prove only ID allocation, persistence, and request injection for this first slice. Full five-tool mechanics, content polish, and model selection follow the delivered recovery increment rather than precede it.
 - Increment 0 is completed migration history and a prerequisite, not future implementation work. A later `$to-tickets` run starts at Increment 1 and must not create a duplicate Increment 0 ticket.
-- Independent comparison and contract review found no remaining blocking contradiction; this revision is `ready-for-agent` for ticket decomposition and implementation from Increment 1 onward.
+- Independent comparison and contract review found no remaining blocking contradiction; Increment 1 and Increment 2 are `ready-for-human`, while Increment 3 onward remain future implementation work.
 - Deterministic tests establish protocol and authority evidence; real DeepSeek tests establish provider and model evidence; human playtests establish quality and immersion evidence. None of these lanes alone proves the whole game.
-- This specification revision changes target documentation only; it does not claim that the Agentic MVP runtime is already implemented or alter the legacy baseline behavior.
+- This specification revision synchronizes the target documentation with the delivered opt-in Increment 1/2 runtime; it does not claim that the full Agentic MVP is complete or alter the legacy baseline behavior.

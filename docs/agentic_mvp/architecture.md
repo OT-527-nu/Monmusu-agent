@@ -4,7 +4,7 @@
 
 本文定义下一版 MVP 的目标模块、接口、seam、权威与数据流。执行时序以 [Agent Loop](agent_loop.md) 为准，持久化与消息字段以[数据契约](contracts.md)为准，产品取舍以 [MVP 产品方案](mvp_design.md)为准。
 
-本文定义目标架构，不把未交付能力写成当前事实。截至 2026-07-31，独立的 opt-in Agentic 路径已通过 `AgenticHarness.start_turn`、`AgenticSessionStore` 和 `GameMasterModel` seam 实现 Increment 1，包括最终答复、事实账本、完整回合记录、`make_check` 与 non-thinking DeepSeek adapter；默认入口及 `agent.py`、`engine.py`、`tools.py`、`rules.py`、`state.py` 仍保留旧规则驱动基线。正式 resume interface、结构修正、执行尝试时限与八次往返执行、thinking 回放和其余 COC 工具仍是目标架构。
+本文定义目标架构，不把未交付能力写成当前事实。截至 2026-08-08，独立的 opt-in Agentic 路径已通过 `AgenticHarness.start_turn`、`resume_turn`、`AgenticSessionStore` 和 `GameMasterModel` seam 实现 Increment 1 与 Increment 2，包括最终答复、事实账本、完整回合记录、`make_check`、non-thinking/thinking DeepSeek adapter、显式恢复、幂等工具结果重放、结构修正、执行限制和真实恢复合同证据；默认入口及 `agent.py`、`engine.py`、`tools.py`、`rules.py`、`state.py` 仍保留旧规则驱动基线。其余 COC 工具、完整短篇、默认入口切换和旧路径清理仍是目标架构。
 
 ## 架构目标
 

@@ -6,17 +6,17 @@
 
 目标模块职责见[系统架构](architecture.md)，接口形状见[数据契约](contracts.md)，执行与恢复顺序见 [Agent Loop](agent_loop.md)。本文只规定迁移结果与依赖顺序，不预先锁定目标 Python 文件布局。
 
-## 截至 2026-07-31 的实现事实
+## 截至 2026-08-08 的实现事实
 
-Increment 1 已在独立的 opt-in Agentic 路径完成并通过真实 DeepSeek 两回合开放行动验证；默认 `monmusu-agent` 与旧存档仍保留规则驱动基线。下表同时列出已经交付的新路径与仍用于迁移对照的旧路径，避免把目标文档误当成当前能力，也避免继续声称新路径不存在。
+Increment 1 和 Increment 2 已在独立的 opt-in Agentic 路径完成：除了真实 DeepSeek 两回合开放行动验证，还完成了确定性故障/恢复矩阵、显式 CLI 恢复门、工具结果幂等重放、thinking 恢复传输和 non-thinking/thinking 真实恢复合同。默认 `monmusu-agent` 与旧存档仍保留规则驱动基线。下表同时列出已经交付的新路径与仍用于迁移对照的旧路径，避免把目标文档误当成当前能力，也避免继续声称新路径不存在。
 
 | 当前区域 | 已有能力 | 与目标设计的差距 | 迁移处理 |
 | --- | --- | --- | --- |
-| [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载 `agentic-mvp-1` 会话聚合、不可变参考快照、角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn` | 没有面向 CLI 的已有会话发现/选择 interface；恢复写入仍由 Harness 增量完成 | 保持 SessionStore 为本地持久化深模块，只增加真实调用者需要的最小会话发现能力 |
-| [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn` 隐藏上下文组装、GM 响应分类、`make_check`、即时机械提交、最终答复原子提交与技术中断；中断阻止新行动覆盖 | 已保存尝试限制与计数形状，但尚无正式 resume interface、同 ID 工具重放、单次结构修正、180 秒尝试时限或八次往返执行 | 在同一 Harness lifecycle seam 增加恢复概念，复用一个内部执行尝试，不拆出第二套 orchestrator |
-| [`agentic_model.py`](../../src/monmusu_agent/agentic_model.py) | `GameMasterModel` 同时有可编程假 adapter 与 OpenAI SDK DeepSeek adapter；non-thinking、JSON Object、function tools、请求 timeout 和稳定错误映射已接通 | 组合入口拒绝 thinking；尚未证明恢复时 `reasoning_content` 完整回放 | 保持薄 provider seam，不把恢复决策、工具幂等或 provider 路由移入 adapter |
-| [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、连续提交行动、展示已提交公开机械/事实/叙事并在技术中断时停止；终端输入固定为 UTF-8 | 启动时总是新建游戏，没有已有会话选择、恢复/退出门或再次启动恢复路径 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
-| [`agentic_contract.py`](../../src/monmusu_agent/agentic_contract.py) | 显式真实契约 runner 已证明 direct final 与一次匹配 `tool_call_id` 的 `make_check` 往返 | 没有 non-thinking/thinking 恢复契约 | 在确定性恢复矩阵完成后增加独立真实恢复证据，不与 GM 质量评估混用 |
+| [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载 `agentic-mvp-1` 会话聚合、不可变参考快照、角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn`；恢复状态可被新的 SessionStore 重新装载 | 没有面向 CLI 的已有会话发现/选择 interface；启动仍不会自动恢复 | 保持 SessionStore 为本地持久化深模块，只增加真实调用者需要的最小会话发现能力 |
+| [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、`make_check`、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝 | 仍只提供 `make_check`；其余四个 COC 工具和完整短篇行为尚未交付 | 在同一 Harness lifecycle seam 继续增加后续工具，不拆出第二套 orchestrator |
+| [`agentic_model.py`](../../src/monmusu_agent/agentic_model.py) | `GameMasterModel` 同时有可编程假 adapter 与 OpenAI SDK DeepSeek adapter；non-thinking/thinking、JSON Object、function tools、请求 timeout、稳定错误映射和 thinking `reasoning_content` 恢复传输已接通 | 没有多 provider、自动路由或 fallback；真实质量矩阵尚未运行 | 保持薄 provider seam，不把恢复决策、工具幂等或 provider 路由移入 adapter |
+| [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 启动时总是新建游戏，没有已有会话发现/选择；完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
+| [`agentic_contract.py`](../../src/monmusu_agent/agentic_contract.py) | 显式真实契约 runner 已证明 direct final、一次匹配 `tool_call_id` 的 `make_check` 往返，以及 non-thinking/thinking 工具中断、重建和恢复；完整脱敏记录见 [Ticket 11 evidence](evidence/ticket-11-live-recovery-2026-08-07.md) | 真实合同只证明 SDK/provider 传输，不评价 GM 质量、其余工具或 72 次模型矩阵 | 保持 live 证据与确定性恢复矩阵、人工质量评估分开 |
 | [`agent.py`](../../src/monmusu_agent/agent.py) | 有限 `GameMasterAgent` 循环、`GameMasterModel` 注入 seam、可测试的模型步骤 | 最终输出仍是 `GameMasterDraft(strategy, narration, suggested_actions)`；没有 DeepSeek adapter、新最终 schema、结构修正或可恢复 provider 轨迹 | 保留薄模型 seam 与有限循环思想，替换模型消息和最终答复契约 |
 | [`engine.py`](../../src/monmusu_agent/engine.py) | 已有 `run_turn`、输入预检和失败分支 | 上下文来自 JSON 模组场景投影与 `public_memory`；失败后会生成 Harness 兜底叙事；没有未完成回合恢复；初始化仍创建关系状态、六格时钟和 `ending_id` | 用 Agent Harness 目标流程替换上下文、提交和失败语义；删除虚构兜底 |
 | [`rules.py`](../../src/monmusu_agent/rules.py) | 可注入随机源、d100 结算与检定记录 | 使用数值修正和旧四档结果，不是角色卡驱动的 COC 常规/困难/极难及奖励/惩罚骰；`request_check` 依赖模组 `check_rules` 和 outcome effects | 保留受信随机与不可篡改记录思想，按 COC 语义重做规则接口 |
@@ -27,7 +27,7 @@ Increment 1 已在独立的 opt-in Agentic 路径完成并通过真实 DeepSeek 
 | [`storage.py`](../../src/monmusu_agent/storage.py) | 单个 JSON 文件原子替换 | 尚无跨机械、回合、事实和恢复数据的完整提交协议 | 复用原子写入原语，并按目标契约建立最小一致性协议 |
 | [`data/modules/escape_thalarion.json`](../../data/modules/escape_thalarion.json) | 集中旧场景、线索、检定和效果数据 | 同时充当叙事内容、规则授权、效果白名单和六格时钟 | 运行时改读 Markdown [模组参考书](module_reference.md)；不把其内容重新拆回权限表 |
 | [`data/characters/characters.json`](../../data/characters/characters.json) | 旧 AI 队友技能与关系初态 | 不是完整预生成 COC 调查员卡，且绑定关系阶段 | 按[角色与预生成调查员](characters.md)建立机械卡与 GM 角色资料；关系只作为自然语言事实 |
-| [`tests/`](../../tests) | 同时保留旧规则基线，并通过真实临时会话与可编程假 model 覆盖 Increment 1 的 Agentic lifecycle、可见性、原子提交和真实 adapter seam | 尚无正式 resume、尝试预算、结构修正、thinking 回放与重复进程恢复矩阵 | 继续在 Harness/CLI 公开 lifecycle seam 增加确定性恢复测试；只有替代证据成立后才删除旧测试 |
+| [`tests/`](../../tests) | 同时保留旧规则基线，并通过真实临时会话与可编程假 model 覆盖 Increment 1/2 的 Agentic lifecycle、可见性、原子提交、恢复、幂等、结构修正、执行限制、thinking 回放和真实 adapter seam | 其余 COC 工具、完整短篇和模型质量矩阵仍未覆盖 | 继续在公开 lifecycle seam 增加后续工具和内容测试；只有替代证据成立后才删除旧测试 |
 
 “已有有限循环”不等于新版 Agent Loop 已经完成；“已有原子 JSON 写入”也不等于多份目标记录已经具备原子性和恢复协议。迁移验收必须观察目标公开 seam 和真实持久化结果，不能由类名相似推断能力存在。
 
@@ -126,9 +126,15 @@ Increment 1 已在独立的 opt-in Agentic 路径完成并通过真实 DeepSeek 
 
 ## 增量 2：未完成回合与运行恢复
 
-实现票按依赖顺序为 [06 有界执行尝试与结构修正](../../.scratch/agentic-mvp/issues/06-bound-and-repair-agentic-attempt.md) → [07 显式恢复同一回合](../../.scratch/agentic-mvp/issues/07-resume-incomplete-turn.md) → [08 工具结果幂等重放](../../.scratch/agentic-mvp/issues/08-replay-tool-results-idempotently.md)；随后 [09 CLI 恢复门](../../.scratch/agentic-mvp/issues/09-gate-cli-on-incomplete-turn.md) 与 [10 thinking 恢复传输](../../.scratch/agentic-mvp/issues/10-support-thinking-recovery-transport.md) 可分别推进，最终由 [11 真实恢复契约](../../.scratch/agentic-mvp/issues/11-prove-live-recovery-contracts.md) 汇合验证。票据只拆交付顺序，规范仍由本文、[数据契约](contracts.md)和 [Agent Loop](agent_loop.md) 共同拥有。
+实现票 [06 有界执行尝试与结构修正](../../.scratch/agentic-mvp/issues/06-bound-and-repair-agentic-attempt.md) → [07 显式恢复同一回合](../../.scratch/agentic-mvp/issues/07-resume-incomplete-turn.md) → [08 工具结果幂等重放](../../.scratch/agentic-mvp/issues/08-replay-tool-results-idempotently.md) → [09 CLI 恢复门](../../.scratch/agentic-mvp/issues/09-gate-cli-on-incomplete-turn.md) → [10 thinking 恢复传输](../../.scratch/agentic-mvp/issues/10-support-thinking-recovery-transport.md) → [11 真实恢复契约](../../.scratch/agentic-mvp/issues/11-prove-live-recovery-contracts.md) 已按依赖顺序交付并完成 Increment 2 汇合验证。票据只记录交付顺序，规范仍由本文、[数据契约](contracts.md)和 [Agent Loop](agent_loop.md) 共同拥有。
 
-### 实现范围
+### 当前交付与证据
+
+- 确定性恢复/幂等/CLI/session 测试与完整测试套件均通过；当前全量基线为 190 tests passed。
+- 真实 non-thinking 与 thinking 恢复合同均通过，使用 `deepseek-v4-flash`、`stream=false`、JSON Object 和 `make_check`；脱敏请求、usage、latency、恢复投影和 hard gates 见 [Ticket 11 evidence](evidence/ticket-11-live-recovery-2026-08-07.md)。
+- live runner 的中断点是工具原子提交后的本地 `request_timeout` 注入；它重建 SessionStore、adapter 和 Harness 后观察恢复门，再调用公开 `AgenticHarness.resume_turn()`。这证明真实 provider 恢复传输，不替代 CLI 选择行为或人工 GM 质量评估。
+
+### 实现范围（已交付）
 
 - 按[数据契约](contracts.md)持久化未完成回合，包含同一 `turn_id`、原玩家输入、冻结的 model/tool profile、provider 消息、assistant tool calls、对应工具结果和已提交机械引用。
 - 工具成功后立即提交机械；GM 的叙事、事实变化和会话状态继续作为一个整体提交。
@@ -287,7 +293,7 @@ Increment 1 已在独立的 opt-in Agentic 路径完成并通过真实 DeepSeek 
 
 ### 模型 ID 和账户能力仍需真实验证
 
-`deepseek-v4-flash` 与 `deepseek-v4-pro` 来自 2026-07-26 的官方资料，但当前设计阶段没有用项目所有者的真实 key 验证账户可用性。增量 1 的真实契约测试是实现门，不是可选的上线后检查；若官方能力变化，应更新 adapter 研究与候选配置，不扩张成多 provider 框架。
+`deepseek-v4-flash` 与 `deepseek-v4-pro` 来自 2026-07-26 的官方资料；Ticket 05 已验证 `deepseek-v4-flash` non-thinking 纵向切片，Ticket 11 又在 `deepseek-v4-flash` non-thinking/thinking profile 上验证了真实恢复传输。`deepseek-v4-pro` 和四配置 72 次模型矩阵仍未验证；若官方能力变化，应更新 adapter 研究与候选配置，不扩张成多 provider 框架。
 
 ## 不迁移进 MVP 的内容
 

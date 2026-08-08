@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义新版 MVP 的规范性目标契约。截至 2026-07-31，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、Increment 1 的 `IncompleteTurn`、`make_check` 和 non-thinking `GameMasterModel` seam；正式恢复、完整运行保险丝、结构修正、thinking 回放和其余工具仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
+本文定义新版 MVP 的规范性目标契约。截至 2026-08-08，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、`make_check`、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放和真实恢复合同证据；其余 COC 工具、完整短篇和默认入口切换仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
 
 ## 契约原则
 

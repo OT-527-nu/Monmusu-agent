@@ -4,7 +4,7 @@
 
 本文定义 Agentic MVP 中唯一一个 GM 的主持职责、运行时上下文和最终答复提示。它是[数据契约](contracts.md)与 [Agent Loop](agent_loop.md) 的补充：前者定义可验证的数据形状，后者定义调用和提交顺序；本文不增加第二个模型、审批阶段或模组权限层。
 
-Increment 1 的 Agentic Harness 已把下述章程作为运行时 System Prompt 主体；其中只依赖 `make_check` 的纵向切片已经实现，其余 COC 工具与后续增量能力仍是目标设计。旧版 `docs/prompts.md` 只保留作迁移对照，不约束 Agentic MVP。
+Increment 1/2 的 Agentic Harness 已把下述章程作为运行时 System Prompt 主体；当前 opt-in 路径实现了只依赖 `make_check` 的纵向切片与正式回合恢复，后续其余 COC 工具、完整短篇和模型评估仍是目标设计。旧版 `docs/prompts.md` 只保留作迁移对照，不约束 Agentic MVP。
 
 ## 设计立场
 
