@@ -1152,13 +1152,24 @@ class AgenticHarness:
                 )
                 execution_mechanic = copy.deepcopy(dict(execution.mechanic))
                 execution_actors = copy.deepcopy(execution.actors)
-                tool.validate_result(execution_mechanic)
+                tool.validate_result(copy.deepcopy(execution_mechanic))
+                tool.validate_result_arguments(
+                    copy.deepcopy(arguments),
+                    copy.deepcopy(execution_mechanic),
+                )
                 self._validate_tool_execution(
                     execution_mechanic,
                     execution_actors,
                     expected_mechanic_id=mechanic_id,
                     expected_committed_at=expected_committed_at,
                     previous_actors=working["actors"],
+                )
+                tool.validate_persistence(
+                    copy.deepcopy(execution_mechanic),
+                    actors=copy.deepcopy(execution_actors),
+                    mechanics=copy.deepcopy(
+                        prior_mechanics + (execution_mechanic,)
+                    ),
                 )
                 if execution_mechanic["visibility"] == "public":
                     public_details = dict(tool.public_details(execution_mechanic))

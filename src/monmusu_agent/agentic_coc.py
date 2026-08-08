@@ -96,20 +96,6 @@ _SUCCESS_LEVELS = frozenset(
         "fumble",
     }
 )
-_LIFECYCLE_TEST_FIELDS = frozenset(
-    {
-        "mechanic_id",
-        "kind",
-        "actor_id",
-        "amount",
-        "luck_before",
-        "luck_after",
-        "visibility",
-        "committed_at",
-    }
-)
-
-
 class RandomSource(Protocol):
     """声明 COC d10 所需的最小可注入随机边界。"""
 
@@ -144,6 +130,20 @@ class CocTool(Protocol):
     ) -> ToolExecution: ...
 
     def validate_result(self, value: object) -> None: ...
+
+    def validate_result_arguments(
+        self,
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> None: ...
+
+    def validate_persistence(
+        self,
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None: ...
 
     def public_details(self, value: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
@@ -324,6 +324,34 @@ class MakeCheckTool:
         validate_check_result(value)
 
     @staticmethod
+    def validate_result_arguments(
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> None:
+        if any(
+            arguments.get(field) != value.get(field)
+            for field in _ARGUMENT_FIELDS
+        ):
+            raise ValueError("check mechanic 与规范参数不一致")
+
+    @staticmethod
+    def validate_persistence(
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        """证明检定保存的能力值来自本局冻结角色卡。"""
+
+        del mechanics
+        prepared = prepare_make_check(value, actors)
+        if (
+            value.get("ability_value") != prepared.ability_value
+            or value.get("target") != prepared.target
+        ):
+            raise ValueError("check mechanic 与冻结角色卡不一致")
+
+    @staticmethod
     def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
         return {
             key: value[key]
@@ -399,35 +427,6 @@ def validate_check_result(value: object) -> None:
         )
     ):
         raise ValueError("check mechanic 格式无效")
-
-
-def validate_mechanic_result(value: object) -> None:
-    """按机械 kind 校验记录；测试 kind 只用于证明共享生命周期。"""
-
-    if isinstance(value, dict) and value.get("kind") == "check":
-        validate_check_result(value)
-        return
-    if not isinstance(value, dict) or set(value) != _LIFECYCLE_TEST_FIELDS:
-        raise ValueError("mechanic 格式无效")
-    for field in ("mechanic_id", "actor_id", "committed_at"):
-        _required_string(value.get(field), field)
-    amount = value.get("amount")
-    before = value.get("luck_before")
-    after = value.get("luck_after")
-    if (
-        value.get("kind") != "lifecycle_test"
-        or not isinstance(amount, int)
-        or isinstance(amount, bool)
-        or not 1 <= amount <= 10
-        or not isinstance(before, int)
-        or isinstance(before, bool)
-        or not isinstance(after, int)
-        or isinstance(after, bool)
-        or after != before - amount
-        or not 0 <= after <= before <= 99
-        or value.get("visibility") not in {"public", "hidden"}
-    ):
-        raise ValueError("mechanic 格式无效")
 
 
 def _required_string(value: object, label: str) -> str:

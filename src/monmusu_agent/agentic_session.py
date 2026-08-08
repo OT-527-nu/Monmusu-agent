@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -18,7 +19,6 @@ from monmusu_agent.agentic_coc import (
     CocTool,
     DEFAULT_COC_TOOLS,
     MakeCheckError,
-    normalize_make_check_arguments,
 )
 from monmusu_agent.agentic_model import (
     ModelProfileValidationError,
@@ -197,13 +197,9 @@ def tool_call_matches_interaction(
     if isinstance(persisted_arguments, dict):
         try:
             incoming_arguments = (
-                (
-                    normalize_make_check_arguments(arguments_raw)
-                    if tool_name == "make_check"
-                    else normalizer(arguments_raw)
-                    if normalizer is not None
-                    else json.loads(arguments_raw)
-                )
+                normalizer(arguments_raw)
+                if normalizer is not None
+                else json.loads(arguments_raw)
             )
         except (MakeCheckError, TypeError, ValueError):
             return arguments_raw == interaction.get("arguments_raw")
@@ -529,7 +525,7 @@ class AgenticSessionStore:
         assert isinstance(setup, dict)
         self._validate_fact_and_turn_references(session, setup)
         self._validate_investigator_references(session)
-        self._validate_mechanic_actor_references(session)
+        self._validate_mechanic_persistence(session)
         module_hash = self._snapshot_hash(
             setup.get("module_reference_sha256"),
             "module_reference_sha256",
@@ -931,7 +927,7 @@ class AgenticSessionStore:
         cls._validate_model_profile(model_profile)
         cls._validate_attempt_limits(incomplete.get("attempt_limits"))
         assert isinstance(model_profile, Mapping)
-        cls._validate_incomplete_messages(
+        self._validate_incomplete_messages(
             incomplete.get("deepseek_messages"),
             interactions,
             thinking=model_profile.get("thinking") is True,
@@ -967,20 +963,24 @@ class AgenticSessionStore:
         except ModelProfileValidationError as error:
             raise AgenticSessionLoadError("model_profile 格式无效") from error
 
-    def _validate_registered_mechanic(self, mechanic: object) -> None:
+    def _validate_registered_mechanic(
+        self,
+        mechanic: object,
+    ) -> tuple[CocTool, ...]:
         if not isinstance(mechanic, dict):
             raise ValueError("mechanic 格式无效")
-        tool = next(
-            (
-                candidate
-                for candidate in self.tool_registry.values()
-                if candidate.mechanic_kind == mechanic.get("kind")
-            ),
-            None,
-        )
-        if tool is None:
+        validators: list[CocTool] = []
+        for candidate in self.tool_registry.values():
+            if candidate.mechanic_kind != mechanic.get("kind"):
+                continue
+            try:
+                candidate.validate_result(copy.deepcopy(mechanic))
+            except (ValueError, TypeError, KeyError):
+                continue
+            validators.append(candidate)
+        if not validators:
             raise ValueError("mechanic kind 未注册")
-        tool.validate_result(mechanic)
+        return tuple(validators)
 
     @classmethod
     def _validate_attempt_limits(cls, limits: object) -> None:
@@ -1022,19 +1022,13 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("ToolInteraction 格式无效")
         if arguments is not None:
             try:
-                if tool_name == "make_check":
-                    normalized = normalize_make_check_arguments(arguments_raw)
-                    persisted_normalized = normalize_make_check_arguments(
-                        json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-                    )
-                else:
-                    tool = self.tool_registry.get(tool_name)
-                    if tool is None:
-                        raise ValueError
-                    normalized = tool.normalize(arguments_raw)
-                    persisted_normalized = tool.normalize(
-                        json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-                    )
+                tool = self.tool_registry.get(tool_name)
+                if tool is None:
+                    raise ValueError
+                normalized = tool.normalize(arguments_raw)
+                persisted_normalized = tool.normalize(
+                    json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+                )
             except MakeCheckError as normalization_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
@@ -1061,19 +1055,18 @@ class AgenticSessionStore:
                 tool = self.tool_registry.get(tool_name)
                 if tool is None:
                     raise ValueError("工具未注册")
-                tool.validate_result(result)
+                if not isinstance(result, dict):
+                    raise ValueError("工具结果格式无效")
+                tool.validate_result(copy.deepcopy(result))
+                tool.validate_result_arguments(
+                    copy.deepcopy(arguments),
+                    copy.deepcopy(result),
+                )
             except (ValueError, TypeError, KeyError) as validation_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
                 ) from validation_error
             assert isinstance(result, dict)
-            fixed_fields = (
-                ("actor_id", "ability", "difficulty", "dice_adjustment", "action", "stakes", "visibility")
-                if tool_name == "make_check"
-                else tuple(arguments)
-            )
-            if any(arguments.get(field) != result.get(field) for field in fixed_fields):
-                raise AgenticSessionLoadError("ToolInteraction 格式无效")
             return tool_call_id, result
         if (
             result is not None
@@ -1091,14 +1084,14 @@ class AgenticSessionStore:
         )
         return tool_call_id, None
 
-    @classmethod
     def _validate_incomplete_messages(
-        cls,
+        self,
         messages: object,
         interactions: list[Any],
         *,
         thinking: bool,
     ) -> None:
+        cls = type(self)
         if not isinstance(messages, list) or len(messages) < 3:
             raise AgenticSessionLoadError("deepseek_messages 格式无效")
         interactions_by_id = {
@@ -1183,6 +1176,11 @@ class AgenticSessionStore:
                             interaction,
                             call["function"]["name"],
                             arguments_raw,
+                            normalizer=(
+                                self.tool_registry[call["function"]["name"]].normalize
+                                if call["function"]["name"] in self.tool_registry
+                                else None
+                            ),
                         )
                     )
                     if (
@@ -1304,20 +1302,14 @@ class AgenticSessionStore:
             if display_names.get(actor.get("actor_id")) is None:
                 raise AgenticSessionLoadError("调查员引用不一致")
 
-    @classmethod
-    def _validate_mechanic_actor_references(
-        cls,
+    def _validate_mechanic_persistence(
+        self,
         session: Mapping[str, Any],
     ) -> None:
         actors = session.get("actors")
         turns = session.get("turns")
         if not isinstance(actors, list) or not isinstance(turns, list):
             raise AgenticSessionLoadError("机械与冻结角色卡不一致")
-        actors_by_id = {
-            actor["actor_id"]: actor
-            for actor in actors
-            if isinstance(actor, dict)
-        }
         records: list[object] = [
             mechanic
             for turn in turns
@@ -1329,54 +1321,33 @@ class AgenticSessionStore:
             records.extend(incomplete.get("mechanics", []))
 
         seen_mechanic_ids: set[str] = set()
-        lifecycle_by_actor: dict[str, list[Mapping[str, Any]]] = {}
+        persisted_mechanics = tuple(
+            mechanic for mechanic in records if isinstance(mechanic, Mapping)
+        )
+        if len(persisted_mechanics) != len(records):
+            raise AgenticSessionLoadError("机械与冻结角色卡不一致")
         for mechanic in records:
             if not isinstance(mechanic, dict):
                 raise AgenticSessionLoadError("机械与冻结角色卡不一致")
             mechanic_id = mechanic.get("mechanic_id")
-            actor = actors_by_id.get(mechanic.get("actor_id"))
-            if mechanic.get("kind") == "lifecycle_test":
-                if (
-                    not isinstance(mechanic_id, str)
-                    or mechanic_id in seen_mechanic_ids
-                    or not isinstance(actor, dict)
-                ):
-                    raise AgenticSessionLoadError("机械与冻结角色卡不一致")
-                seen_mechanic_ids.add(mechanic_id)
-                lifecycle_by_actor.setdefault(mechanic["actor_id"], []).append(
-                    mechanic
-                )
-                continue
-            ability = mechanic.get("ability")
             if (
                 not isinstance(mechanic_id, str)
                 or mechanic_id in seen_mechanic_ids
-                or not isinstance(actor, dict)
-                or not isinstance(ability, str)
             ):
                 raise AgenticSessionLoadError("机械与冻结角色卡不一致")
             seen_mechanic_ids.add(mechanic_id)
-            attributes = actor.get("attributes")
-            skills = actor.get("skills")
-            frozen_value: object = None
-            if isinstance(attributes, dict) and ability in attributes:
-                frozen_value = attributes[ability]
-            elif isinstance(skills, dict) and ability in skills:
-                frozen_value = skills[ability]
-            if mechanic.get("ability_value") != frozen_value:
-                raise AgenticSessionLoadError("机械与冻结角色卡不一致")
-
-        for actor_id, lifecycle_records in lifecycle_by_actor.items():
-            actor = actors_by_id[actor_id]
-            if any(
-                previous["luck_after"] != current["luck_before"]
-                for previous, current in zip(
-                    lifecycle_records,
-                    lifecycle_records[1:],
-                    strict=False,
-                )
-            ) or actor["luck"]["current"] != lifecycle_records[-1]["luck_after"]:
-                raise AgenticSessionLoadError("机械与冻结角色卡不一致")
+            try:
+                validators = self._validate_registered_mechanic(mechanic)
+                for tool in validators:
+                    tool.validate_persistence(
+                        copy.deepcopy(mechanic),
+                        actors=copy.deepcopy(actors),
+                        mechanics=copy.deepcopy(persisted_mechanics),
+                    )
+            except (ValueError, TypeError, KeyError) as error:
+                raise AgenticSessionLoadError(
+                    "机械与冻结角色卡不一致"
+                ) from error
 
     @classmethod
     def _validate_profile(cls, profile: Mapping[str, Any]) -> None:

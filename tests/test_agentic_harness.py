@@ -45,13 +45,11 @@ class ScriptedRandom:
         return next(self.values)
 
 
-class LifecycleTestTool:
-    """只用于证明非 make_check 工具共享提交、恢复与角色变化。"""
-
-    definition = {
+def _lifecycle_tool_definition(name: str) -> dict[str, Any]:
+    return {
         "type": "function",
         "function": {
-            "name": "lifecycle_test",
+            "name": name,
             "description": "测试共享工具生命周期。",
             "parameters": {
                 "type": "object",
@@ -65,7 +63,16 @@ class LifecycleTestTool:
             },
         },
     }
-    mechanic_kind = "lifecycle_test"
+
+
+class LifecycleTestTool:
+    """只用于证明非 make_check 工具共享提交、恢复与角色变化。"""
+
+    result_kind = "lifecycle_test"
+    result_amount_field = "amount"
+
+    definition = _lifecycle_tool_definition("lifecycle_test")
+    mechanic_kind = result_kind
 
     def normalize(self, arguments_raw: str) -> dict[str, Any]:
         try:
@@ -108,9 +115,9 @@ class LifecycleTestTool:
         return ToolExecution(
             mechanic={
                 "mechanic_id": mechanic_id,
-                "kind": "lifecycle_test",
+                "kind": self.result_kind,
                 "actor_id": arguments["actor_id"],
-                "amount": amount,
+                self.result_amount_field: amount,
                 "luck_before": before,
                 "luck_after": before - amount,
                 "visibility": arguments["visibility"],
@@ -119,26 +126,105 @@ class LifecycleTestTool:
             actors=updated,
         )
 
-    @staticmethod
-    def validate_result(value: object) -> None:
-        from monmusu_agent.agentic_coc import validate_mechanic_result
+    @classmethod
+    def validate_result(cls, value: object) -> None:
+        expected_fields = {
+            "mechanic_id",
+            "kind",
+            "actor_id",
+            cls.result_amount_field,
+            "luck_before",
+            "luck_after",
+            "visibility",
+            "committed_at",
+        }
+        if not isinstance(value, dict) or set(value) != expected_fields:
+            raise ValueError("测试 mechanic 格式无效")
+        amount = value.get(cls.result_amount_field)
+        before = value.get("luck_before")
+        after = value.get("luck_after")
+        if (
+            value.get("kind") != cls.result_kind
+            or not isinstance(value.get("mechanic_id"), str)
+            or not value["mechanic_id"]
+            or not isinstance(value.get("actor_id"), str)
+            or not value["actor_id"]
+            or not isinstance(value.get("committed_at"), str)
+            or not value["committed_at"]
+            or not isinstance(amount, int)
+            or isinstance(amount, bool)
+            or not 1 <= amount <= 10
+            or not isinstance(before, int)
+            or isinstance(before, bool)
+            or not isinstance(after, int)
+            or isinstance(after, bool)
+            or after != before - amount
+            or not 0 <= after <= before <= 99
+            or value.get("visibility") not in {"public", "hidden"}
+        ):
+            raise ValueError("测试 mechanic 格式无效")
 
-        validate_mechanic_result(value)
+    @classmethod
+    def validate_result_arguments(
+        cls,
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> None:
+        if (
+            arguments.get("actor_id") != value.get("actor_id")
+            or arguments.get("amount") != value.get(cls.result_amount_field)
+            or arguments.get("visibility") != value.get("visibility")
+        ):
+            raise ValueError("测试 mechanic 与规范参数不一致")
 
-    @staticmethod
-    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    @classmethod
+    def validate_persistence(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        cls.validate_result(value)
+        if not isinstance(actors, list):
+            raise ValueError("测试 mechanic 与冻结角色卡不一致")
+        actor = next(
+            (
+                item
+                for item in actors
+                if isinstance(item, dict)
+                and item.get("actor_id") == value.get("actor_id")
+            ),
+            None,
+        )
+        related = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("kind") == cls.result_kind
+            and mechanic.get("actor_id") == value.get("actor_id")
+        ]
+        if (
+            not isinstance(actor, dict)
+            or not related
+            or any(
+                previous["luck_after"] != current["luck_before"]
+                for previous, current in zip(related, related[1:], strict=False)
+            )
+            or actor["luck"]["current"] != related[-1]["luck_after"]
+        ):
+            raise ValueError("测试 mechanic 与冻结角色卡不一致")
+
+    @classmethod
+    def public_details(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
         return {
-            "amount": value["amount"],
+            cls.result_amount_field: value[cls.result_amount_field],
             "luck_before": value["luck_before"],
             "luck_after": value["luck_after"],
         }
 
 
 class MutatingFailureTool(LifecycleTestTool):
-    definition = {
-        **LifecycleTestTool.definition,
-        "function": {**LifecycleTestTool.definition["function"], "name": "mutating_failure"},
-    }
+    definition = _lifecycle_tool_definition("mutating_failure")
 
     def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
         actors = kwargs["actors"]
@@ -147,16 +233,59 @@ class MutatingFailureTool(LifecycleTestTool):
 
 
 class MalformedResultTool(LifecycleTestTool):
-    definition = {
-        **LifecycleTestTool.definition,
-        "function": {**LifecycleTestTool.definition["function"], "name": "malformed_result"},
-    }
+    definition = _lifecycle_tool_definition("malformed_result")
 
     def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
         return ToolExecution(
             mechanic={"mechanic_id": kwargs["mechanic_id"], "kind": "not_allowed"},
             actors=kwargs["actors"],
         )
+
+
+class AlternateLifecycleTestTool(LifecycleTestTool):
+    """证明新增 mechanic kind 不需要修改 Session 装载器。"""
+
+    definition = _lifecycle_tool_definition("alternate_lifecycle_test")
+    result_kind = "alternate_lifecycle_test"
+    result_amount_field = "points_spent"
+    mechanic_kind = result_kind
+
+
+class InconsistentLifecycleTestTool(LifecycleTestTool):
+    """返回结构合法但与角色最终资源不一致的测试结果。"""
+
+    definition = _lifecycle_tool_definition("inconsistent_lifecycle_test")
+    result_kind = "inconsistent_lifecycle_test"
+    mechanic_kind = result_kind
+
+    def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
+        execution = super().execute(arguments, **kwargs)
+        mechanic = dict(execution.mechanic)
+        mechanic["luck_before"] -= 5
+        mechanic["luck_after"] -= 5
+        return ToolExecution(mechanic=mechanic, actors=execution.actors)
+
+
+class MutatingPersistenceValidatorTool(LifecycleTestTool):
+    """模拟校验器在返回前篡改收到的可变快照。"""
+
+    definition = _lifecycle_tool_definition("mutating_persistence_validator")
+    result_kind = "mutating_persistence_validator"
+    mechanic_kind = result_kind
+
+    @classmethod
+    def validate_persistence(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        super().validate_persistence(value, actors=actors, mechanics=mechanics)
+        assert isinstance(value, dict)
+        assert isinstance(actors, list)
+        value["luck_after"] = 0
+        actors[0]["luck"]["current"] = 0
 
 
 class AgenticHarnessTest(unittest.TestCase):
@@ -337,6 +466,137 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(committed["actors"][0]["luck"]["current"], 52)
             self.assertEqual(len(committed["turns"][0]["mechanics"]), 1)
             self.assertEqual(committed["turns"][0]["mechanics"][0]["mechanic_id"], "mechanic_lifecycle_001")
+
+    def test_registered_tool_validates_new_mechanic_kind_after_restart(self) -> None:
+        """注册工具拥有新 mechanic kind 的恢复校验，不要求 Session 新增分支。"""
+
+        profile = deepseek_model_profile()
+        profile["enabled_tools"] = ["alternate_lifecycle_test"]
+        registry = {"alternate_lifecycle_test": AlternateLifecycleTestTool()}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, game_id = self._create_session(root)
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "amount": 3,
+                                "visibility": "public",
+                            },
+                            name="alternate_lifecycle_test",
+                        ),
+                        ModelCallError("request_timeout", "timeout", retryable=True),
+                    ]
+                ),
+                model_profile=profile,
+                tool_registry=registry,
+                mechanic_id_factory=lambda: "mechanic_alternate_001",
+            ).start_turn(game_id, "我确认另一类测试资源变化。")
+
+            self.assertEqual(first.status, "interrupted")
+            rebuilt_store = AgenticSessionStore(session_root=root / "sessions")
+            resumed = AgenticHarness(
+                rebuilt_store,
+                ScriptedGameMasterModel(
+                    [
+                        self._response(
+                            {
+                                "narration": "另一类已提交结果在恢复后仍然有效。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        )
+                    ]
+                ),
+                model_profile=profile,
+                tool_registry=registry,
+            ).resume_turn(game_id, first.turn_id)
+
+            self.assertEqual(resumed.status, "committed")
+            committed = rebuilt_store.load_session(game_id).session
+            self.assertEqual(committed["actors"][0]["luck"]["current"], 52)
+            self.assertEqual(
+                committed["turns"][0]["mechanics"][0]["kind"],
+                "alternate_lifecycle_test",
+            )
+
+    def test_tool_persistence_mismatch_is_rejected_before_commit(self) -> None:
+        """结构合法但脱离最终角色值的机械不能进入会话聚合。"""
+
+        profile = deepseek_model_profile()
+        profile["enabled_tools"] = ["inconsistent_lifecycle_test"]
+        registry = {"inconsistent_lifecycle_test": InconsistentLifecycleTestTool()}
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "amount": 3,
+                                "visibility": "public",
+                            },
+                            name="inconsistent_lifecycle_test",
+                        ),
+                        ModelCallError("request_timeout", "timeout", retryable=True),
+                    ]
+                ),
+                model_profile=profile,
+                tool_registry=registry,
+            ).start_turn(game_id, "尝试提交与角色资源不一致的机械。")
+
+            self.assertEqual(result.status, "interrupted")
+            session = store.load_session(game_id).session
+            incomplete = session["incomplete_turn"]
+            self.assertEqual(session["actors"][0]["luck"]["current"], 55)
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(
+                incomplete["tool_interactions"][0]["error"]["code"],
+                "tool_execution_error",
+            )
+
+    def test_persistence_validator_cannot_mutate_committed_state(self) -> None:
+        """校验器只能观察机械和角色快照，不能改写待提交对象。"""
+
+        profile = deepseek_model_profile()
+        profile["enabled_tools"] = ["mutating_persistence_validator"]
+        registry = {
+            "mutating_persistence_validator": MutatingPersistenceValidatorTool()
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "amount": 3,
+                                "visibility": "public",
+                            },
+                            name="mutating_persistence_validator",
+                        ),
+                        ModelCallError("request_timeout", "timeout", retryable=True),
+                    ]
+                ),
+                model_profile=profile,
+                tool_registry=registry,
+            ).start_turn(game_id, "验证校验器不能改写待提交角色。")
+
+            self.assertEqual(result.status, "interrupted")
+            session = store.load_session(game_id).session
+            self.assertEqual(session["actors"][0]["luck"]["current"], 52)
+            self.assertEqual(
+                session["incomplete_turn"]["mechanics"][0]["luck_after"],
+                52,
+            )
 
     def test_non_check_invalid_arguments_commit_error_without_state_change(self) -> None:
         """非检定参数错误保存 raw/error，但不分配机械或改变角色。"""
