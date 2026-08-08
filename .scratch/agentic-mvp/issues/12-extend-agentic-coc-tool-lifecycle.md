@@ -17,6 +17,7 @@
 ## Implementation Notes
 
 - 2026-08-08：`CocTool` 注册器接入统一 Harness 生命周期；`make_check` 通过适配器保持兼容，并由测试专用 `lifecycle_test` 证明规范化、原子机械/幸运变化提交、公开投影、工具后中断、进程重建和 `(turn_id, tool_call_id)` 幂等恢复。
-- 验证：`.venv/bin/python`（Python 3.12.3）；`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`（192 passed）、`compileall`、`git diff --check`。
+- 2026-08-08：修复审查发现的可信边界：profile 可选择注册目录子集；工具只接收 actor 快照；异常、坏 mechanic、伪造 actor/ID/时间和隐藏调查员资源变化均在写盘前拒绝；恢复校验使用同一注册工具的 normalizer/result validator/public projection。
+- 验证：`.venv/bin/python`（Python 3.12.3）；`PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`（196 passed）、`compileall`、`git diff --check`。
 
 **Not in this ticket:** 实现 `push_check`、`spend_luck`、`deal_damage` 或 `make_sanity_check` 的具体 COC 规则，增加任意状态补丁工具、通用表达式语言、provider registry、自动模型路由或旧路径删除。

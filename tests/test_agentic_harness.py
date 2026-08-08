@@ -65,6 +65,7 @@ class LifecycleTestTool:
             },
         },
     }
+    mechanic_kind = "lifecycle_test"
 
     def normalize(self, arguments_raw: str) -> dict[str, Any]:
         try:
@@ -116,6 +117,45 @@ class LifecycleTestTool:
                 "committed_at": committed_at,
             },
             actors=updated,
+        )
+
+    @staticmethod
+    def validate_result(value: object) -> None:
+        from monmusu_agent.agentic_coc import validate_mechanic_result
+
+        validate_mechanic_result(value)
+
+    @staticmethod
+    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            "amount": value["amount"],
+            "luck_before": value["luck_before"],
+            "luck_after": value["luck_after"],
+        }
+
+
+class MutatingFailureTool(LifecycleTestTool):
+    definition = {
+        **LifecycleTestTool.definition,
+        "function": {**LifecycleTestTool.definition["function"], "name": "mutating_failure"},
+    }
+
+    def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
+        actors = kwargs["actors"]
+        actors[0]["luck"]["current"] = 0
+        raise MakeCheckError("invalid_arguments", "工具故意失败")
+
+
+class MalformedResultTool(LifecycleTestTool):
+    definition = {
+        **LifecycleTestTool.definition,
+        "function": {**LifecycleTestTool.definition["function"], "name": "malformed_result"},
+    }
+
+    def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
+        return ToolExecution(
+            mechanic={"mechanic_id": kwargs["mechanic_id"], "kind": "not_allowed"},
+            actors=kwargs["actors"],
         )
 
 
@@ -249,7 +289,10 @@ class AgenticHarnessTest(unittest.TestCase):
             store, game_id = self._create_session(root)
             first_model = ScriptedGameMasterModel(
                 [
-                    self._tool_response(arguments, name="lifecycle_test"),
+                    self._tool_response(
+                        '{"visibility":"public","amount":3,"actor_id":"investigator_tracker"}',
+                        name="lifecycle_test",
+                    ),
                     ModelCallError("request_timeout", "timeout", retryable=True),
                 ]
             )
@@ -323,6 +366,121 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(interaction["error"]["code"], "invalid_arguments")
             self.assertIsNone(interaction["arguments"])
             self.assertEqual(session["actors"][0]["luck"]["current"], 55)
+
+    def test_investigator_resource_change_rejects_hidden_visibility(self) -> None:
+        """调查员幸运变化不能借由工具 visibility 隐藏。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        {"actor_id": "investigator_tracker", "amount": 3, "visibility": "hidden"},
+                        name="lifecycle_test",
+                    ),
+                    ModelCallError("request_timeout", "timeout", retryable=True),
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+            ).start_turn(game_id, "我确认测试资源变化，但不应隐藏。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(result.error_code, "request_timeout")
+            session = store.load_session(game_id).session
+            self.assertEqual(session["actors"][0]["luck"]["current"], 55)
+            self.assertEqual(session["incomplete_turn"]["mechanics"], [])
+            self.assertEqual(
+                session["incomplete_turn"]["tool_interactions"][0]["error"]["code"],
+                "tool_execution_error",
+            )
+
+    def test_profile_can_select_make_check_subset_from_registered_tools(self) -> None:
+        """扩大的注册目录不破坏旧的只启用 make_check profile。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            profile = deepseek_model_profile()
+            model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "只提供默认检定。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                model_profile=profile,
+                tool_registry=self._lifecycle_registry(),
+            ).start_turn(game_id, "我观察周围。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(
+                [tool["function"]["name"] for tool in model.requests[0].tools],
+                ["make_check"],
+            )
+
+    def test_failed_tool_cannot_persist_in_place_actor_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            profile = deepseek_model_profile()
+            profile["enabled_tools"] = ["mutating_failure"]
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        {"actor_id": "investigator_tracker", "amount": 1, "visibility": "public"},
+                        name="mutating_failure",
+                    ),
+                    ModelCallError("request_timeout", "timeout", retryable=True),
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                model_profile=profile,
+                tool_registry={"mutating_failure": MutatingFailureTool()},
+            ).start_turn(game_id, "触发失败工具。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(store.load_session(game_id).session["actors"][0]["luck"]["current"], 55)
+
+    def test_malformed_tool_result_is_rejected_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            profile = deepseek_model_profile()
+            profile["enabled_tools"] = ["malformed_result"]
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        {"actor_id": "investigator_tracker", "amount": 1, "visibility": "public"},
+                        name="malformed_result",
+                    ),
+                    ModelCallError("request_timeout", "timeout", retryable=True),
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                model_profile=profile,
+                tool_registry={"malformed_result": MalformedResultTool()},
+            ).start_turn(game_id, "触发坏结果工具。")
+
+            self.assertEqual(result.status, "interrupted")
+            session = store.load_session(game_id).session
+            self.assertEqual(session["incomplete_turn"]["mechanics"], [])
+            self.assertEqual(
+                session["incomplete_turn"]["tool_interactions"][0]["error"]["code"],
+                "tool_execution_error",
+            )
 
     @staticmethod
     def _tool_message_count(messages: object) -> int:

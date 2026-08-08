@@ -233,18 +233,38 @@ class AgenticHarness:
         self.random_source = random_source or Random()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.session_writer = session_writer
-        self.tool_registry = dict(DEFAULT_COC_TOOLS if tool_registry is None else tool_registry)
+        self.tool_registry = dict(
+            DEFAULT_COC_TOOLS if tool_registry is None else tool_registry
+        )
         if not self.tool_registry:
             raise AgenticTurnInputError("tool_registry 不能为空")
+        self.store.configure_tool_registry(self.tool_registry)
         self.attempt_limits = self._validated_attempt_limits(
             _ATTEMPT_LIMITS if attempt_limits is None else attempt_limits
         )
         try:
-            selected_profile = deepseek_model_profile() if model_profile is None else model_profile
+            selected_profile = (
+                deepseek_model_profile()
+                if model_profile is None
+                else model_profile
+            )
+            profile_tools = selected_profile.get("enabled_tools")
+            if not isinstance(profile_tools, list) or not profile_tools:
+                raise AgenticTurnInputError("model_profile.enabled_tools 格式无效")
+            unknown_tools = [
+                name for name in profile_tools if name not in self.tool_registry
+            ]
+            if unknown_tools:
+                raise AgenticTurnInputError(
+                    f"model_profile 启用了未注册工具 {unknown_tools[0]}"
+                )
             self.model_profile = validated_model_profile(
                 selected_profile,
-                enabled_tools=tuple(self.tool_registry),
+                enabled_tools=tuple(profile_tools),
             )
+            self.enabled_tools = {
+                name: self.tool_registry[name] for name in profile_tools
+            }
         except ModelProfileValidationError as error:
             raise AgenticTurnInputError(str(error)) from error
 
@@ -317,11 +337,23 @@ class AgenticHarness:
             )
 
         assert isinstance(incomplete, dict)
-        public_mechanics = tuple(
-            self._public_mechanic(mechanic)
-            for mechanic in incomplete["mechanics"]
-            if mechanic["visibility"] == "public"
-        )
+        public_mechanics_list: list[PublicMechanic | PublicToolMechanic] = []
+        for mechanic in incomplete["mechanics"]:
+            if mechanic["visibility"] != "public":
+                continue
+            interaction = next(
+                item
+                for item in incomplete["tool_interactions"]
+                if item.get("result") == mechanic
+            )
+            tool = self.enabled_tools.get(interaction["tool_name"])
+            if tool is None:
+                raise AgenticTurnInputError(
+                    f"恢复记录需要未启用工具 {interaction['tool_name']}"
+                )
+            details = dict(tool.public_details(mechanic))
+            public_mechanics_list.append(self._public_mechanic(mechanic, details))
+        public_mechanics = tuple(public_mechanics_list)
         last_failure = incomplete["last_failure"]
         raw_code = last_failure.get("code") if isinstance(last_failure, dict) else None
         error_code = (
@@ -427,7 +459,7 @@ class AgenticHarness:
                 tools=()
                 if repair_pending
                 else tuple(
-                    copy.deepcopy(dict(self.tool_registry[name].definition))
+                    copy.deepcopy(dict(self.enabled_tools[name].definition))
                     for name in profile["enabled_tools"]
                 ),
                 request_timeout_seconds=min(
@@ -1045,6 +1077,11 @@ class AgenticHarness:
                 existing_interaction,
                 tool_name,
                 arguments_raw,
+                normalizer=(
+                    self.enabled_tools[tool_name].normalize
+                    if tool_name in self.enabled_tools
+                    else None
+                ),
             ):
                 # 保留最后一个合法前缀；调用 ID 复用但参数改变不能覆盖原结果。
                 raise _FinalValidationError
@@ -1072,8 +1109,9 @@ class AgenticHarness:
         arguments: dict[str, Any] | None = None
         mechanic: dict[str, Any] | None = None
         updated_actors: list[dict[str, Any]] | None = None
+        public_details: Mapping[str, Any] | None = None
         error: dict[str, str] | None = None
-        tool = self.tool_registry.get(tool_name)
+        tool = self.enabled_tools.get(tool_name)
         if tool is None:
             error = {
                 "code": "unknown_tool",
@@ -1103,18 +1141,44 @@ class AgenticHarness:
                     for turn in working["turns"]
                     for item in turn["mechanics"]
                 ) + tuple(incomplete["mechanics"])
+                expected_committed_at = self._timestamp(self.clock())
                 execution = tool.execute(
                     arguments,
-                    actors=working["actors"],
+                    actors=copy.deepcopy(working["actors"]),
                     mechanics=prior_mechanics,
                     mechanic_id=mechanic_id,
                     random_source=self.random_source,
-                    committed_at=self._timestamp(self.clock()),
+                    committed_at=expected_committed_at,
                 )
-                mechanic = copy.deepcopy(dict(execution.mechanic))
-                updated_actors = copy.deepcopy(execution.actors)
+                execution_mechanic = copy.deepcopy(dict(execution.mechanic))
+                execution_actors = copy.deepcopy(execution.actors)
+                tool.validate_result(execution_mechanic)
+                self._validate_tool_execution(
+                    execution_mechanic,
+                    execution_actors,
+                    expected_mechanic_id=mechanic_id,
+                    expected_committed_at=expected_committed_at,
+                    previous_actors=working["actors"],
+                )
+                if execution_mechanic["visibility"] == "public":
+                    public_details = dict(tool.public_details(execution_mechanic))
+                    if any(
+                        key not in execution_mechanic
+                        or execution_mechanic[key] != value
+                        for key, value in public_details.items()
+                    ):
+                        raise ValueError("工具公开投影包含未提交字段")
+                mechanic = execution_mechanic
+                updated_actors = execution_actors
             except MakeCheckError as tool_error:
                 error = {"code": tool_error.code, "message": tool_error.message}
+            except AgenticTurnError:
+                raise
+            except Exception:
+                error = {
+                    "code": "tool_execution_error",
+                    "message": "工具执行结果未通过 Harness 可信校验",
+                }
 
         interaction = {
             "tool_call_id": tool_call_id,
@@ -1150,8 +1214,61 @@ class AgenticHarness:
 
         public = None
         if mechanic is not None and mechanic["visibility"] == "public":
-            public = self._public_mechanic(mechanic)
+            public = self._public_mechanic(mechanic, public_details)
         return candidate, public
+
+    @staticmethod
+    def _validate_tool_execution(
+        mechanic: Mapping[str, Any],
+        actors: object,
+        *,
+        expected_mechanic_id: str,
+        expected_committed_at: str,
+        previous_actors: object,
+    ) -> None:
+        """在原子写入前强制 Harness 拥有的 ID、角色引用和角色卡边界。"""
+
+        if (
+            mechanic.get("mechanic_id") != expected_mechanic_id
+            or not isinstance(mechanic.get("actor_id"), str)
+            or mechanic.get("committed_at") != expected_committed_at
+            or mechanic.get("visibility") not in {"public", "hidden"}
+            or not isinstance(previous_actors, list)
+            or not isinstance(actors, list)
+        ):
+            raise ValueError("工具结果的 Harness 权威字段无效")
+        previous_by_id = {
+            actor.get("actor_id"): actor
+            for actor in previous_actors
+            if isinstance(actor, dict)
+        }
+        if len(previous_by_id) != len(previous_actors):
+            raise ValueError("工具结果的事前角色卡无效")
+        current_by_id = {
+            actor.get("actor_id"): actor
+            for actor in actors
+            if isinstance(actor, dict)
+        }
+        if set(current_by_id) != set(previous_by_id):
+            raise ValueError("工具结果伪造了角色引用")
+        if mechanic["actor_id"] not in previous_by_id:
+            raise ValueError("工具结果引用了未知角色")
+        previous_actor = previous_by_id[mechanic["actor_id"]]
+        current_actor = current_by_id[mechanic["actor_id"]]
+        if previous_actor.get("role") == "investigator":
+            changed_resources = any(
+                previous_actor.get(resource) != current_actor.get(resource)
+                for resource in ("hp", "san", "luck")
+            )
+            if changed_resources and mechanic["visibility"] != "public":
+                raise ValueError("调查员 HP、SAN 或幸运变化必须公开")
+        for actor in actors:
+            if not isinstance(actor, dict):
+                raise ValueError("工具结果角色卡格式无效")
+            AgenticSessionStore._validate_actor_sheet(
+                actor,
+                cast(str, previous_by_id[actor["actor_id"]]["skill_catalog_version"]),
+            )
 
     @staticmethod
     def _tool_message(interaction: Mapping[str, Any]) -> dict[str, Any]:
@@ -1172,20 +1289,14 @@ class AgenticHarness:
     @staticmethod
     def _public_mechanic(
         mechanic: Mapping[str, Any],
+        public_details: Mapping[str, Any] | None,
     ) -> PublicMechanic | PublicToolMechanic:
         if mechanic.get("kind") != "check":
             return PublicToolMechanic(
                 mechanic_id=mechanic["mechanic_id"],
                 kind=mechanic["kind"],
                 actor_id=mechanic["actor_id"],
-                details=MappingProxyType(
-                    {
-                        key: copy.deepcopy(value)
-                        for key, value in mechanic.items()
-                        if key
-                        not in {"mechanic_id", "kind", "actor_id", "visibility", "committed_at"}
-                    }
-                ),
+                details=MappingProxyType(copy.deepcopy(dict(public_details or {}))),
             )
         return PublicMechanic(
             mechanic_id=mechanic["mechanic_id"],
@@ -1237,7 +1348,7 @@ class AgenticHarness:
             "MODULE_REFERENCE": loaded.module_reference,
             "CHARACTER_REFERENCE": loaded.character_reference,
             "AVAILABLE_TOOLS": [
-                copy.deepcopy(dict(self.tool_registry[name].definition))
+                copy.deepcopy(dict(self.enabled_tools[name].definition))
                 for name in self.model_profile["enabled_tools"]
             ],
         }

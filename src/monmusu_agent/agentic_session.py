@@ -15,9 +15,10 @@ from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from monmusu_agent.agentic_coc import (
+    CocTool,
+    DEFAULT_COC_TOOLS,
     MakeCheckError,
     normalize_make_check_arguments,
-    validate_mechanic_result,
 )
 from monmusu_agent.agentic_model import (
     ModelProfileValidationError,
@@ -185,6 +186,8 @@ def tool_call_matches_interaction(
     interaction: Mapping[str, Any],
     tool_name: str,
     arguments_raw: str,
+    *,
+    normalizer: Callable[[str], dict[str, Any]] | None = None,
 ) -> bool:
     """按持久化幂等规则比较一次 provider 工具重发。"""
 
@@ -194,11 +197,15 @@ def tool_call_matches_interaction(
     if isinstance(persisted_arguments, dict):
         try:
             incoming_arguments = (
-                normalize_make_check_arguments(arguments_raw)
-                if tool_name == "make_check"
-                else json.loads(arguments_raw)
+                (
+                    normalize_make_check_arguments(arguments_raw)
+                    if tool_name == "make_check"
+                    else normalizer(arguments_raw)
+                    if normalizer is not None
+                    else json.loads(arguments_raw)
+                )
             )
-        except (MakeCheckError, json.JSONDecodeError):
+        except (MakeCheckError, TypeError, ValueError):
             return arguments_raw == interaction.get("arguments_raw")
         return isinstance(incoming_arguments, dict) and incoming_arguments == persisted_arguments
     return arguments_raw == interaction.get("arguments_raw")
@@ -300,6 +307,7 @@ class AgenticSessionStore:
         game_id_factory: Callable[[], str] | None = None,
         clock: Callable[[], datetime] | None = None,
         directory_publisher: Callable[[Path, Path], None] | None = None,
+        tool_registry: Mapping[str, CocTool] | None = None,
     ) -> None:
         self.session_root = session_root
         self.sources = sources or AgenticSessionSources()
@@ -308,6 +316,14 @@ class AgenticSessionStore:
         )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.directory_publisher = directory_publisher or os.replace
+        self.tool_registry = dict(
+            DEFAULT_COC_TOOLS if tool_registry is None else tool_registry
+        )
+
+    def configure_tool_registry(self, registry: Mapping[str, CocTool]) -> None:
+        """让恢复校验与 Harness 使用同一冻结工具实现集合。"""
+
+        self.tool_registry = dict(registry)
 
     def available_investigators(self) -> tuple[InvestigatorChoice, ...]:
         """返回当前目标数据中可由玩家选择的调查员。"""
@@ -588,12 +604,12 @@ class AgenticSessionStore:
         if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
             raise AgenticSessionLoadError(f"{label} 格式无效")
 
-    @classmethod
     def _validate_fact_and_turn_references(
-        cls,
+        self,
         session: Mapping[str, Any],
         setup: Mapping[str, Any],
     ) -> None:
+        cls = type(self)
         opening_fact_ids = setup.get("opening_fact_ids")
         facts = session.get("facts")
         if (
@@ -642,7 +658,7 @@ class AgenticSessionStore:
         declared_retirements: dict[str, tuple[str, str]] = {}
         for index, turn in enumerate(turns):
             turn_id, established_ids, retirements, turn_status = (
-                cls._validate_committed_turn(turn)
+                self._validate_committed_turn(turn)
             )
             if turn_id in turns_by_id:
                 raise AgenticSessionLoadError("CommittedTurn 格式无效")
@@ -699,7 +715,7 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("会话状态与回合历史不一致")
         incomplete_turn = session.get("incomplete_turn")
         if incomplete_turn is not None:
-            cls._validate_incomplete_turn(incomplete_turn, set(turns_by_id))
+            self._validate_incomplete_turn(incomplete_turn, set(turns_by_id))
 
     @classmethod
     def _validate_fact_record(
@@ -753,11 +769,11 @@ class AgenticSessionStore:
             cls._load_required_string(retire_reason, "retire_reason")
         return fact_id, origin_kind
 
-    @classmethod
     def _validate_committed_turn(
-        cls,
+        self,
         turn: object,
     ) -> tuple[str, list[str], list[dict[str, str]], str]:
+        cls = type(self)
         if not isinstance(turn, dict) or set(turn) != _COMMITTED_TURN_FIELDS:
             raise AgenticSessionLoadError("CommittedTurn 格式无效")
         turn_id = cls._load_required_string(turn.get("turn_id"), "turn_id")
@@ -770,7 +786,7 @@ class AgenticSessionStore:
         mechanic_ids: set[str] = set()
         for mechanic in mechanics:
             try:
-                validate_mechanic_result(mechanic)
+                self._validate_registered_mechanic(mechanic)
             except (ValueError, TypeError, KeyError) as error:
                 raise AgenticSessionLoadError("CommittedTurn 格式无效") from error
             assert isinstance(mechanic, dict)
@@ -822,12 +838,12 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("CommittedTurn 格式无效")
         return turn_id, established, retirements, status
 
-    @classmethod
     def _validate_incomplete_turn(
-        cls,
+        self,
         incomplete: Mapping[str, Any],
         committed_turn_ids: set[str],
     ) -> None:
+        cls = type(self)
         if set(incomplete) != _INCOMPLETE_TURN_FIELDS:
             raise AgenticSessionLoadError("IncompleteTurn 格式无效")
         turn_id = cls._load_required_string(
@@ -883,7 +899,7 @@ class AgenticSessionStore:
         mechanics_by_id: dict[str, Mapping[str, Any]] = {}
         for mechanic in mechanics:
             try:
-                validate_mechanic_result(mechanic)
+                self._validate_registered_mechanic(mechanic)
             except (ValueError, TypeError, KeyError) as error:
                 raise AgenticSessionLoadError("IncompleteTurn 格式无效") from error
             assert isinstance(mechanic, dict)
@@ -899,7 +915,7 @@ class AgenticSessionStore:
         interactions_by_id: dict[str, Mapping[str, Any]] = {}
         successful_mechanic_ids: list[str] = []
         for interaction in interactions:
-            tool_call_id, result = cls._validate_tool_interaction(interaction)
+            tool_call_id, result = self._validate_tool_interaction(interaction)
             if tool_call_id in interactions_by_id:
                 raise AgenticSessionLoadError("IncompleteTurn 格式无效")
             assert isinstance(interaction, dict)
@@ -951,6 +967,21 @@ class AgenticSessionStore:
         except ModelProfileValidationError as error:
             raise AgenticSessionLoadError("model_profile 格式无效") from error
 
+    def _validate_registered_mechanic(self, mechanic: object) -> None:
+        if not isinstance(mechanic, dict):
+            raise ValueError("mechanic 格式无效")
+        tool = next(
+            (
+                candidate
+                for candidate in self.tool_registry.values()
+                if candidate.mechanic_kind == mechanic.get("kind")
+            ),
+            None,
+        )
+        if tool is None:
+            raise ValueError("mechanic kind 未注册")
+        tool.validate_result(mechanic)
+
     @classmethod
     def _validate_attempt_limits(cls, limits: object) -> None:
         if not isinstance(limits, dict) or set(limits) != _ATTEMPT_LIMIT_FIELDS:
@@ -965,11 +996,11 @@ class AgenticSessionStore:
         ):
             raise AgenticSessionLoadError("attempt_limits 格式无效")
 
-    @classmethod
     def _validate_tool_interaction(
-        cls,
+        self,
         interaction: object,
     ) -> tuple[str, Mapping[str, Any] | None]:
+        cls = type(self)
         if (
             not isinstance(interaction, dict)
             or set(interaction) != _TOOL_INTERACTION_FIELDS
@@ -997,15 +1028,18 @@ class AgenticSessionStore:
                         json.dumps(arguments, ensure_ascii=False, sort_keys=True)
                     )
                 else:
-                    normalized = json.loads(arguments_raw)
-                    persisted_normalized = arguments
-                    if not isinstance(normalized, dict):
+                    tool = self.tool_registry.get(tool_name)
+                    if tool is None:
                         raise ValueError
+                    normalized = tool.normalize(arguments_raw)
+                    persisted_normalized = tool.normalize(
+                        json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+                    )
             except MakeCheckError as normalization_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
                 ) from normalization_error
-            except (TypeError, ValueError) as serialization_error:
+            except (KeyError, TypeError, ValueError) as serialization_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
                 ) from serialization_error
@@ -1024,7 +1058,10 @@ class AgenticSessionStore:
             ):
                 raise AgenticSessionLoadError("ToolInteraction 格式无效")
             try:
-                validate_mechanic_result(result)
+                tool = self.tool_registry.get(tool_name)
+                if tool is None:
+                    raise ValueError("工具未注册")
+                tool.validate_result(result)
             except (ValueError, TypeError, KeyError) as validation_error:
                 raise AgenticSessionLoadError(
                     "ToolInteraction 格式无效"
@@ -1292,6 +1329,7 @@ class AgenticSessionStore:
             records.extend(incomplete.get("mechanics", []))
 
         seen_mechanic_ids: set[str] = set()
+        lifecycle_by_actor: dict[str, list[Mapping[str, Any]]] = {}
         for mechanic in records:
             if not isinstance(mechanic, dict):
                 raise AgenticSessionLoadError("机械与冻结角色卡不一致")
@@ -1302,11 +1340,12 @@ class AgenticSessionStore:
                     not isinstance(mechanic_id, str)
                     or mechanic_id in seen_mechanic_ids
                     or not isinstance(actor, dict)
-                    or actor.get("luck", {}).get("current")
-                    != mechanic.get("luck_after")
                 ):
                     raise AgenticSessionLoadError("机械与冻结角色卡不一致")
                 seen_mechanic_ids.add(mechanic_id)
+                lifecycle_by_actor.setdefault(mechanic["actor_id"], []).append(
+                    mechanic
+                )
                 continue
             ability = mechanic.get("ability")
             if (
@@ -1325,6 +1364,18 @@ class AgenticSessionStore:
             elif isinstance(skills, dict) and ability in skills:
                 frozen_value = skills[ability]
             if mechanic.get("ability_value") != frozen_value:
+                raise AgenticSessionLoadError("机械与冻结角色卡不一致")
+
+        for actor_id, lifecycle_records in lifecycle_by_actor.items():
+            actor = actors_by_id[actor_id]
+            if any(
+                previous["luck_after"] != current["luck_before"]
+                for previous, current in zip(
+                    lifecycle_records,
+                    lifecycle_records[1:],
+                    strict=False,
+                )
+            ) or actor["luck"]["current"] != lifecycle_records[-1]["luck_after"]:
                 raise AgenticSessionLoadError("机械与冻结角色卡不一致")
 
     @classmethod

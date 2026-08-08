@@ -128,6 +128,7 @@ class CocTool(Protocol):
     """其余 COC 工具接入同一 Harness 生命周期所需的窄接口。"""
 
     definition: Mapping[str, Any]
+    mechanic_kind: str
 
     def normalize(self, arguments_raw: str) -> dict[str, Any]: ...
 
@@ -141,6 +142,10 @@ class CocTool(Protocol):
         random_source: RandomSource,
         committed_at: str,
     ) -> ToolExecution: ...
+
+    def validate_result(self, value: object) -> None: ...
+
+    def public_details(self, value: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 class MakeCheckError(ValueError):
@@ -288,6 +293,7 @@ class MakeCheckTool:
     """把既有 make_check 规则适配到共同工具生命周期。"""
 
     definition = MAKE_CHECK_TOOL
+    mechanic_kind = "check"
 
     def normalize(self, arguments_raw: str) -> dict[str, Any]:
         return normalize_make_check_arguments(arguments_raw)
@@ -313,6 +319,26 @@ class MakeCheckTool:
         if not isinstance(actors, list):
             raise MakeCheckError("actor_data_unavailable", "冻结角色卡不可用")
         return ToolExecution(mechanic=mechanic, actors=json.loads(json.dumps(actors)))
+
+    def validate_result(self, value: object) -> None:
+        validate_check_result(value)
+
+    @staticmethod
+    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            key: value[key]
+            for key in (
+                "ability",
+                "ability_value",
+                "difficulty",
+                "target",
+                "dice_adjustment",
+                "roll",
+                "success_level",
+                "action",
+                "stakes",
+            )
+        }
 
 
 DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {"make_check": MakeCheckTool()}
