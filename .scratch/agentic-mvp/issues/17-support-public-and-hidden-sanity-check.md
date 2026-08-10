@@ -7,8 +7,9 @@
 **Status:** ready-for-agent
 
 - [ ] `make_sanity_check` 只接受冻结 actor、非空恐怖来源、成功/失败两项受限 SAN 损失表达式和事前 visibility；不接受 SAN 目标、检定骰、损失骰、最终损失、角色行为或状态补丁。
-- [ ] Harness 在任何随机抽取前拒绝未知 actor、非法/过大/理论负损失表达式和不合法 visibility，再依据冻结 SAN 完成 d100 检定并只抽取所选分支的损失表达式。
-- [ ] 成功调用追加 sanity 机械，保存恐怖来源、检定骰、成功与否、选用表达式及骰值、SAN 前后值、本局累计损失和契约规定的临时/不定性疯狂等阈值；SAN 与累计值保持 schema 边界。
+- [ ] `deal_damage` 与 `make_sanity_check` 共用严格表达式解析器；`N <= 20`、`M <= 100`，理论最小值和最大值都必须在 `0..100`。Harness 在任何随机抽取前拒绝未知 actor、非法/过大/理论负损失表达式和不合法 visibility，再依据冻结 SAN 完成 d100 检定并只抽取所选分支的损失表达式。
+- [ ] 成功调用追加 sanity 机械，保存恐怖来源、检定骰、成功与否、选用表达式及骰值、SAN 前后值、本局累计损失和 `temporary_insanity_threshold_reached` / `indefinite_insanity_threshold_crossed` 阈值；SAN 与累计值保持 schema 边界。
+- [ ] SAN 只计算数值和阈值：`target=san_before`，`outcome=success if d100<=target else failure`，只抽取所选分支损失，`san_loss=min(raw_loss, san_before)`；`session_start_san=san_before+previous_session_loss`、`indefinite_threshold=ceil(session_start_san/5)`，临时阈值为 `san_loss>=5`，不定性字段只在 `previous_session_loss < indefinite_threshold <= session_san_loss` 时为 true。固定值 `0` 不调用 RNG。
 - [ ] 调查员 SAN 变化必须公开并结构化拒绝 hidden；契约允许的秘密 NPC 理智机械可以事前 hidden，完整结果供 GM 使用但从玩家记录和普通输出过滤，结果产生后不能改可见性。
 - [ ] sanity 机械、SAN/累计损失变化、交互和协议消息一次原子提交后才返回 GM；写入失败不改变角色，工具后中断与重复恢复不重新检定、重掷损失或重复扣减。
 - [ ] GM 只能忠实表现可信结果，不能用最终叙事覆盖骰点、SAN 数值或规则阈值，也不能借理智结果接管玩家调查员未声明的长期意图、台词或关系承诺。

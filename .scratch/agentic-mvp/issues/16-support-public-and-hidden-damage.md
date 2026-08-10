@@ -7,8 +7,9 @@
 **Status:** ready-for-agent
 
 - [ ] `deal_damage` 只接受冻结 actor、目标契约规定的受限骰子表达式、非空原因、护甲适用性和事前 visibility；不接受最终伤害、HP、阈值结果、状态路径或任意代码表达式。
-- [ ] Harness 在第一次随机抽取前拒绝未知 actor、非法或过大表达式、理论负伤害及不合法护甲参数；合法表达式使用可注入 RNG，并以冻结 armor 与 HP 计算独立可核对的最终伤害。
+- [ ] `deal_damage` 与 `make_sanity_check` 共用严格表达式解析器；`N <= 20`、`M <= 100`，理论最小值和最大值都必须在 `0..100`。Harness 在第一次随机抽取前拒绝未知 actor、非法或过大表达式、理论负伤害及不合法护甲参数；合法表达式使用可注入 RNG，并以冻结 armor 与 HP 计算独立可核对的最终伤害。
 - [ ] 成功调用追加 damage 机械，保存表达式、每次骰值、原始伤害、护甲减免、最终伤害、HP 前后值和重伤/昏迷/死亡等契约阈值；HP 不低于规则下界，零最终伤害也形成可审计结果。
+- [ ] 伤害阈值固定为 `armor_applied=min(raw_damage, armor)`（护甲适用时，否则为 0）、`damage_taken=raw_damage-armor_applied`、`major_wound=damage_taken>=ceil(max_hp/2)`、`dead=damage_taken>=max_hp`、`unconscious=hp_after==0 and not dead`；不增加 CON 检定、濒死、治疗或战斗轮。
 - [ ] 调查员 HP 变化必须公开并结构化拒绝 hidden；只有契约允许的 NPC 机械可以事前标记 hidden，随机结果产生后不能更改 visibility，隐藏记录完整保存但不进入玩家投影。
 - [ ] damage 机械、HP/状态变化、交互与协议消息一次原子提交后才返回 GM；写入失败不改变角色，工具后中断和重复恢复不重新掷伤害或重复扣减。
 - [ ] GM 上下文收到完整可信结果并只能解释它；最终答复若声称不同骰点、伤害、HP 或规则阈值，不会改变机械权威。

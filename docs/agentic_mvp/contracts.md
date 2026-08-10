@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义新版 MVP 的规范性目标契约。截至 2026-08-08，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、`make_check`、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放和真实恢复合同证据；其余 COC 工具、完整短篇和默认入口切换仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
+本文定义新版 MVP 的规范性目标契约。截至 2026-08-10，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、`make_check`、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放和真实恢复合同证据。Ticket 12 已建立动态工具注册目录和共同生命周期，但统一 preflight、统一 `PublicMechanic` 投影及按未完成回合冻结 profile 恢复仍是 Increment 3 的目标差距；其余四个 COC 工具、完整短篇和默认入口切换也仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
 
 ## 契约原则
 
@@ -30,7 +30,7 @@
 
 ## 运行聚合 `session.json`
 
-MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Markdown 参考书全文不内嵌于该 JSON；创建游戏时，Harness 把模组和人物参考保存为按内容哈希寻址的只读会话快照，并把哈希写入 `SessionSetup`。选中的调查员卡、本局需要可信机械的固定 NPC 卡和调查员叙事资料则直接复制进聚合，使本局不受工作树模板或参考书后续修改影响。
+MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Markdown 参考书全文不内嵌于该 JSON；创建游戏时，Harness 把模组和人物参考保存为按内容哈希寻址的只读会话快照，并把哈希写入 `SessionSetup`。生产数据提供三张调查员和三名固定同行者共六张模板；单局只把玩家选中的一张调查员卡、三张固定同行者 NPC 卡和该调查员的叙事资料复制进聚合，使本局不受工作树模板或参考书后续修改影响。未选的两张调查员模板不进入本局存档、上下文或可控角色集合。
 
 ```json
 {
@@ -75,14 +75,14 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
 }
 ```
 
-上例只展示 `session.json` 的顶层关系，`actors: []` 和 `opening_fact_ids: []` 是为了避免重复粘贴初始化阶段示意，不是可以开始游戏的存档。Harness 必须在接受第一条玩家输入前完成 `SessionSetup`、拆分并写入开场事实、填充选中的调查员以及本局需要可信机械的 NPC `ActorSheet`。CLI 展示 `setup.opening_narration` 后才接受第一条输入；这一步不发起没有玩家输入的 GM 回合。
+上例只展示 `session.json` 的顶层关系，`actors: []` 和 `opening_fact_ids: []` 是为了避免重复粘贴初始化阶段示意，不是可以开始游戏的存档。Harness 必须在接受第一条玩家输入前完成 `SessionSetup`、拆分并写入开场事实，并把选中的调查员以及维斯佩拉、萨芙拉、阿兰妮丝共四张 `ActorSheet` 写入本局。CLI 展示 `setup.opening_narration` 后才接受第一条输入；这一步不发起没有玩家输入的 GM 回合。
 
 约束：
 
 - `session_status` 只能是 `ongoing` 或 `complete`。
 - `setup` 在创建游戏时一次写入，之后不可改写；`opening_fact_ids` 必须引用 `facts` 中由该 setup 建立的事实。
 - `skill_catalog_version` 在创建游戏时冻结；每个 `ActorSheet.skill_catalog_version` 必须相同，恢复和机械结算不得读取其他版本。
-- `selected_investigator_id` 必须引用 `actors` 中 `role: "investigator"` 的角色；固定同行者需要可信机械时也必须以 `role: "npc"` 存在于 `actors`。
+- 新建 Increment 3 会话的 `actors` 恰好包含 `selected_investigator_id` 引用的一张 `role: "investigator"` 角色卡，以及 `npc_vespera`、`npc_saphra`、`npc_aranis` 三张 `role: "npc"` 角色卡；另两张未选调查员只留在生产模板目录。旧 schema/version 的最小卡 fixture 按迁移清单的兼容策略处理，不被静默改写。
 - `actor_display_names` 在创建游戏时冻结；每个已装载 `ActorSheet` 必须有一个条目，调查员条目必须与 `investigator_profile.display_name` 一致。它只用于稳定显示，不承载人格或机械规则。
 - `investigator_profile.actor_id` 必须等于 `selected_investigator_id`；调查员自定义资料在创建游戏时冻结，不是机械数值，也不自动变成 GM 事实。
 - 同一 `game_id` 同时只有一个写入者；MVP CLI 串行执行回合。
@@ -138,7 +138,7 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
 
 只有参与可信 COC 计算的数据进入角色卡。人格、关系、欲望、秘密与说话方式属于[人物参考](characters.md)和本局事实。
 
-角色 ID 在[角色参考](characters.md)中稳定定义；玩家的显示姓名等资料保存在 `InvestigatorProfile`，不能改存档中的 `actor_id`。实现期静态模板使用 `data/characters/agentic_mvp_actor_templates.json`，技能目录使用 `data/characters/agentic_mvp_skill_catalog.json`；两者都带冻结版本，装载器按目录把中文显示名映射为规范化技能键，再把解析后的数值复制进本局角色卡。GM 只能引用角色卡实际提供的属性或技能名称。
+角色 ID 在[角色参考](characters.md)中稳定定义；玩家的显示姓名等资料保存在 `InvestigatorProfile`，不能改存档中的 `actor_id`。实现期静态模板使用 `data/characters/agentic_mvp_actor_templates.json`，技能目录使用 `data/characters/agentic_mvp_skill_catalog.json`；两者都带冻结版本。启动器必须在任何模型调用和 session 写入前共同验证三张调查员模板与三张固定同行者模板，再按目录把中文显示名映射为规范化技能键。只有选中的调查员和三名同行者的最终解析值复制进本局角色卡；修改或删除工作树模板不能改变既有会话。GM 只能引用本局四张角色卡实际提供的属性或技能名称。
 
 ```json
 {
@@ -300,7 +300,24 @@ DeepSeek 每次 assistant 响应只能选择一个工具调用或一个最终答
 
 玩家主动检定以及调查员自己的 HP、SAN、幸运变化必须公开。Harness 可以根据角色与数值类型结构化地强制调查员 HP、SAN、幸运变化公开，但不通过自然语言分类判断某次检定是否来自玩家声明；该语义责任由 GM 指令和真实场景硬门槛验证。秘密 NPC 行动或真正会泄露秘密的机械判断可以事前标记为隐藏；模型不能看到结果后再更改可见性。
 
+## 统一玩家投影 `PublicMechanic`
+
+玩家调用层只接收一种不可变公开投影：
+
+```text
+PublicMechanic(
+    mechanic_id: str,
+    kind: str,
+    actor_id: str,
+    details: Mapping[str, JSONValue],
+)
+```
+
+`PublicMechanic` 不是持久化机械 schema，也不把不同工具的完整结果抹平成同一组字段。Harness 只负责包装已提交、事前确定为 `public` 的机械 ID、种类和角色引用；实际执行该调用的 `CocTool` 负责从自己的完整结果中选择并校验 `details`。`make_check` 和 `push_check` 即使都使用 `kind: "check"`，也必须分别保留各自公开契约规定的字段；Harness 不通过 `kind` 猜测投影类型。隐藏机械完整保存并返回 GM，但不构造玩家投影。
+
 `push_check` 与 `spend_luck` 参数中的 `check_id` 不是第二套标识符；它必须等于一条 `kind: "check"` 机械记录的 `mechanic_id`。这个语义化字段名让 Harness 在 schema 层就能拒绝伤害、理智或幸运记录 ID。
+
+`push_eligible` 与 `luck_eligible` 是基础检定提交时的不可变初始资格快照，不是会随补救链变化的当前状态。普通失败只有在它是选中玩家调查员的公开基础检定且规则允许补救时才可保存为 `true`；成功、`fumble`、NPC 或隐藏检定保存为 `false`。一旦使用 Push 或 Luck，原检定和所有派生检定都不回写、不覆盖；当前资格必须由工具 preflight 沿完整不可变补救链推导。`pushed` 派生检定的两个快照字段均为 `false`。
 
 ## `make_check`
 
@@ -349,6 +366,8 @@ DeepSeek 每次 assistant 响应只能选择一个工具调用或一个最终答
 
 `success_level` 使用 COC 7e 的 `critical_success`、`extreme_success`、`hard_success`、`regular_success`、`failure` 或 `fumble`。完整 d100、奖励/惩罚骰和阈值规则由 Harness 实现并通过独立示例测试。
 
+`push_eligible` 与 `luck_eligible` 只记录这条基础检定在提交时是否具备对应资格。`fumble` 两者均为 `false`；它们不会因为后续 Push 或 Luck 而被修改。Push/Luck 的当前可用性由工具沿原始检定及其派生记录组成的补救链重新计算，并且只对选中玩家调查员的公开检定开放。
+
 ## `push_check`
 
 孤注一掷是玩家在一次失败检定后作出的选择。GM 必须先从玩家输入确认新做法，并在重掷前说明更严重的失败风险。
@@ -363,7 +382,7 @@ DeepSeek 每次 assistant 响应只能选择一个工具调用或一个最终答
 }
 ```
 
-Harness 从原检定读取行动者、能力、难度、奖励/惩罚骰和可见性。已经孤注一掷、规则不允许推动或已经花费幸运解决的检定会被拒绝。成功结果仍使用 `kind: "check"`，拥有新的 `mechanic_id`，并增加：
+Harness 从原检定读取行动者、能力、难度、奖励/惩罚骰和可见性。原检定必须是选中玩家调查员的公开、非 `fumble`、失败基础检定，且其补救链尚未采用 Push 或 Luck；已经孤注一掷、规则不允许推动、NPC/隐藏检定或已经花费幸运解决的检定会被拒绝。成功结果仍使用 `kind: "check"`，拥有新的 `mechanic_id`，并增加：
 
 ```json
 {
@@ -385,7 +404,7 @@ Harness 从原检定读取行动者、能力、难度、奖励/惩罚骰和可�
 }
 ```
 
-玩家必须在当前输入中明确选择花费幸运或明确授权花费足够点数。GM 负责忠实理解这项选择；Harness 只验证检定类型、规则适用性、尚未推动、余额和所需点数，不用自然语言分类器审批玩家意图。GM 不能自动替玩家花费。
+玩家必须在当前输入中明确选择花费幸运或明确授权花费足够点数。GM 负责忠实理解这项选择；Harness 只验证检定类型、规则适用性、尚未推动、余额和精确点数，不用自然语言分类器审批玩家意图。GM 不能自动替玩家花费。
 
 ### 结果
 
@@ -405,11 +424,18 @@ Harness 从原检定读取行动者、能力、难度、奖励/惩罚骰和可�
 }
 ```
 
-花费幸运追加新的机械记录，不覆盖原骰点。后续上下文以调整后的有效成功等级解释该检定。
+花费幸运追加新的机械记录，不覆盖原骰点。对原检定记录的 `roll` 与 `target`，合法点数必须严格为：
+
+```text
+points = roll - target
+effective_roll_after = target
+```
+
+`points` 必须为正整数且恰好等于该差值；不足、超量、余额不足或 `target == 0` 都拒绝。成功后有效结果必须达到原检定声明的 `difficulty`，不能仅改善到较低成功等级，也不能制造 `critical_success`。后续上下文以调整后的有效成功等级解释该检定。
 
 ## 骰子表达式
 
-`deal_damage` 与 `make_sanity_check` 使用受限骰子表达式，而不是任意代码。MVP 支持固定非负整数，或 `NdM` 后接可选整数修正，例如 `1d6`、`1d10+2`、`2d6-2`。Harness 在掷骰前验证表达式的理论最小值不小于 0，并限制骰子数量、骰面和理论最大值；负损失、未知语法与过大表达式都会在产生随机数前被拒绝。
+`deal_damage` 与 `make_sanity_check` 共用一个严格骰子表达式解析器，而不是任意代码。MVP 支持固定非负整数，或 `NdM` 后接可选整数修正，例如 `1d6`、`1d10+2`、`2d6-2`。共同限制为 `N <= 20`、`M <= 100`，且表达式的理论最小值与理论最大值都必须落在 `0..100`；固定值也必须落在该范围。Harness 在掷骰前完成语法、数量、骰面和理论范围校验；负损失、未知语法与过大表达式在任何 RNG 前被拒绝。两个工具共用语法和默认限制，但仍分别拥有自己的损失、护甲、HP、SAN 和阈值规则。
 
 ## `deal_damage`
 
@@ -450,7 +476,18 @@ GM 提供伤害表达式、虚构原因以及现有护甲是否适用于这次�
 }
 ```
 
-Harness 报告 COC 规则阈值；GM 裁定这些数值在当前虚构中如何表现。完整战斗轮不属于 MVP。
+Harness 使用以下确定性 MVP 子集报告 COC 规则阈值；GM 裁定这些数值在当前虚构中如何表现：
+
+```text
+armor_applied = armor_applies ? min(raw_damage, armor) : 0
+damage_taken  = raw_damage - armor_applied
+hp_after      = max(0, hp_before - damage_taken)
+major_wound   = damage_taken >= ceil(hp.max / 2)
+dead          = damage_taken >= hp.max
+unconscious   = hp_after == 0 and not dead
+```
+
+护甲不会造成负伤害；最终伤害为 0 也保存完整可审计机械结果。该子集不增加 CON 检定、濒死计时、治疗、急救或战斗轮；完整战斗状态后置。
 
 ## `make_sanity_check`
 
@@ -485,14 +522,32 @@ GM 提供恐怖来源以及成功和失败的 SAN 损失表达式。Harness 从�
   "san_before": 65,
   "san_after": 61,
   "session_san_loss": 4,
-  "temporary_insanity_triggered": false,
-  "indefinite_insanity_triggered": false,
+  "temporary_insanity_threshold_reached": false,
+  "indefinite_insanity_threshold_crossed": false,
   "visibility": "public",
   "committed_at": "2026-07-26T10:13:40Z"
 }
 ```
 
-MVP 只可信计算并报告规则阈值；具体惊恐、失控或精神症状由 GM 根据结果和虚构裁定。更完整的疯狂发作表与长期病症管理后置。
+SAN 只计算数值与阈值，不宣称完成完整疯狂判定。计算顺序为：
+
+```text
+target = san_before
+outcome = success if d100 <= target else failure
+raw_loss = 只抽取 outcome 对应的损失表达式
+san_loss = min(raw_loss, san_before)
+san_after = san_before - san_loss
+session_san_loss = previous_session_loss + san_loss
+session_start_san = san_before + previous_session_loss
+indefinite_threshold = ceil(session_start_san / 5)
+temporary_insanity_threshold_reached = san_loss >= 5
+indefinite_insanity_threshold_crossed = (
+    previous_session_loss < indefinite_threshold
+    and session_san_loss >= indefinite_threshold
+)
+```
+
+固定值 `0` 不调用 RNG；只抽取并记录成功或失败分支实际使用的一个损失表达式。具体惊恐、失控、后续 INT 检定、精神症状或长期病症由 GM 根据结果和虚构裁定，均不在本票实现。
 
 ## GM 最终答复 `GameMasterResponse`
 
@@ -576,7 +631,13 @@ MVP 只可信计算并报告规则阈值；具体惊恐、失控或精神症状�
     "max_tokens": 4096,
     "prompt_revision": "gm-capability-charter-agentic-mvp-2",
     "tool_schema_version": "coc-tools-agentic-mvp-1",
-    "enabled_tools": ["make_check"]
+    "enabled_tools": [
+      "make_check",
+      "push_check",
+      "spend_luck",
+      "deal_damage",
+      "make_sanity_check"
+    ]
   },
   "attempt_limits": {
     "max_round_trips": 8,
@@ -618,7 +679,7 @@ MVP 只可信计算并报告规则阈值；具体惊恐、失控或精神症状�
 
 - Harness 接受玩家输入并分配 `turn_id` 后立即保存未完成回合。
 - 上例展示第一次 provider 请求前的构造状态，因此往返、结构修正和交互数组均为零或空；初始 system/user 消息在发起请求前写入 `deepseek_messages`。
-- `model_profile` 保存恢复该 provider 对话所需的全部非秘密、行为相关配置。恢复必须使用相同模型、thinking 模式、Prompt 修订、工具 schema 版本和 `enabled_tools`；若本地已无法提供该冻结版本，Harness 明确拒绝恢复，不能静默换配置。API key 永不保存。
+- `model_profile` 保存恢复该 provider 对话所需的全部非秘密、行为相关配置。新回合默认冻结五个 COC 工具；恢复必须使用该未完成回合自己的模型、thinking 模式、Prompt 修订、工具 schema 版本和 `enabled_tools`，不要求等于当前新回合默认 profile。Harness 以完整注册表逐项验证冻结工具子集仍受 `coc-tools-agentic-mvp-1` 支持；若版本、工具实现不可用或 profile 损坏，明确拒绝恢复，不能静默换配置。API key 永不保存。
 - `attempt_limits` 描述当前执行尝试。玩家恢复会增加 `attempt_number` 并重置计数与 deadline，但默认继续使用相同的冻结限额；显式开发配置变更必须记录为新的尝试配置。
 - `round_trips_used` 与 `structure_repairs_used` 在新执行尝试中重置；`total_round_trips` 与 `total_structure_repairs` 只增不减，用于恢复与费用诊断。
 - 每次成功机械调用都会把机械记录、相关角色数值、`ToolInteraction`、assistant tool-call 消息和对应 tool result 消息在同一次完整聚合原子替换中写盘，再把结果交给 GM 和 CLI。
@@ -694,6 +755,8 @@ MVP 不提供摘要、RAG、Memory Agent、场景投影或模组权限目录。A
 
 - `model_id` 与 `thinking` 可在运行和评估入口覆盖。
 - `stream` 在首版固定为 `false`。
+- 新回合的 `enabled_tools` 默认是五项 `make_check`、`push_check`、`spend_luck`、`deal_damage`、`make_sanity_check`；旧未完成回合可以继续使用自己冻结的较小子集，只要完整注册表仍支持它。
+- `tool_schema_version` 保持 `coc-tools-agentic-mvp-1`；版本对应的完整工具注册表不得因 profile 只暴露子集而删除已发布验证器。
 - 八次往返包含初始响应、工具结果后的继续响应、协议修正与最终结构修正；本地工具执行不计入。
 - 每次执行尝试拥有独立的 `request_timeout_seconds=60` 请求上限和 `attempt_timeout_seconds=180` 总时限。
 - API key 由项目所有者选择的外部机制注入 adapter，不属于该配置 schema，也不得持久化或输出。

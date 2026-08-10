@@ -44,9 +44,15 @@
 #### COC 机械
 
 - `make_check` 从正式角色卡读取技能或属性值，使用常规、困难、极难难度和奖励/惩罚骰；GM 不能提供目标值、骰点或结果。
+- 每个新工具调用的公开 seam 都能观察到同一顺序：参数规范化、领域 preflight/可信输入冻结、Harness 分配机械 ID 与提交时间、RNG/执行、原子持久化、工具选择的公开投影；preflight 反例必须证明不分配 ID、不取随机数、不改变角色数值。
 - 机械结果一经产生立即持久化，具有稳定 ID，同一工具调用和恢复过程不能再次掷骰。
 - GM 最终答复无法改写骰点、成功等级、HP、SAN、幸运或其他已提交机械数据。
 - 玩家主动检定以及调查员自身 HP、SAN、幸运变化必须公开。Harness 通过角色与数值类型结构化地拒绝隐藏调查员 HP、SAN 或幸运变化，并禁止任何机械在随机结果产生后改变可见性；它不对行动文本做意图分类。GM 是否把玩家主动检定正确标为公开，以及是否只对 NPC 行动或真正秘密的机械判断使用 `hidden`，由能力章程和真实场景硬门槛验证。`spend_luck` 不接受可见性参数，其结果恒为公开；合法隐藏机械仍完整保存在受信记录中。
+- 玩家投影只有一种 `PublicMechanic(mechanic_id, kind, actor_id, details)`；`details` 由执行工具选择，测试必须证明 `push_check` 的 `pushed_from`/`is_pushed` 等字段不会因 `kind: "check"` 被 Harness 丢弃。
+- Push/Luck 只对选中玩家调查员的公开基础检定开放；`push_eligible`/`luck_eligible` 是提交时的初始快照，当前资格由不可变补救链推导，`fumble` 的两个快照均为 `false`。Luck 的正例与反例必须独立断言 `points = roll - target`、恰好达到原声明难度且不能制造 critical。
+- 伤害测试独立断言 `armor_applied=min(raw_damage, armor)`、`damage_taken=raw_damage-armor_applied`、`major_wound=damage_taken>=ceil(max_hp/2)`、`dead=damage_taken>=max_hp` 和 `unconscious=hp_after==0 and not dead`，包括 0 伤害、0 HP 和互斥边界。
+- SAN 测试只断言数值和两个阈值字段：`temporary_insanity_threshold_reached` 与 `indefinite_insanity_threshold_crossed`；不把它们扩展成完整疯狂状态。
+- `deal_damage` 与 `make_sanity_check` 使用同一严格表达式解析器，边界覆盖 `N<=20`、`M<=100` 及理论结果 `0..100`，并证明非法表达式在 RNG 前拒绝。
 - 完整 MVP 加入其余工具后，确定性测试分别验证 `push_check` 关联原失败检定、`spend_luck` 的余额与规则适用性、`deal_damage` 更新 HP、`make_sanity_check` 更新 SAN。玩家是否明确选择孤注一掷或花费幸运由真实场景硬门槛验证，不伪装成 Harness 的自然语言语义断言。
 - 工具参数或规则前置条件无效时不产生机械记录，也不改变角色卡，但失败 `ToolInteraction` 和 assistant/tool 协议消息仍须原子保存，以便中断后恢复同一对话。
 
@@ -78,7 +84,7 @@
 
 1. 对应模块的单元测试和跨 seam 测试通过。
 2. 每项高风险不变量至少有一个正例和一个反例。
-3. 原子性与恢复测试检查持久化后的真实文件内容，而不只检查返回值。
+3. 原子性与恢复测试检查持久化后的真实文件内容，而不只检查返回值；新回合默认五工具 profile 与旧未完成回合冻结子集分别覆盖，恢复不要求两者完全相等。
 4. 测试可以离线重复执行，不读取 DeepSeek key，也不依赖模型措辞。
 5. 失败输出能够定位协议阶段，但不包含 key、隐藏事实或模型隐藏推理。
 
@@ -96,7 +102,7 @@
 
 1. OpenAI Python SDK 使用 `base_url="https://api.deepseek.com"` 和 `client.chat.completions.create(...)`；不调用 OpenAI Responses API，也不依赖 DeepSeek Beta strict mode。
 2. `deepseek-v4-flash` non-thinking 作为首个协议基线，能够返回一个通过本地业务 schema 的 GM 最终 JSON 答复。
-3. 同一正常请求配置能够同时携带当前 function tools 与 JSON Object response format；模型可以产生 function tool call，Harness 执行本地 `make_check` 后，以匹配的 `tool_call_id` 回传 `role="tool"` 消息，同一个 GM 随后完成最终 JSON 答复。
+3. Increment 3 的完整 profile 在同一正常请求配置中暴露五个规范工具，并同时携带当前 function tools 与 JSON Object response format；模型可以产生 function tool call，Harness 执行本地工具后，以匹配的 `tool_call_id` 回传 `role="tool"` 消息，同一个 GM 随后完成最终 JSON 答复。
 4. Adapter 保留完整 assistant tool-call 消息和工具结果顺序；未知、重复或缺失的 `tool_call_id` 不会被静默接受。
 5. JSON Output 的响应仍由 Harness 本地解析和校验。首答合法时不做修正；首答无效时，同一次执行尝试只允许同一个 GM 根据具体错误修正一次，不重跑机械。
 6. Thinking 配置的工具往返把 assistant 返回的 `reasoning_content` 原样、完整放回后续 DeepSeek 请求；测试只记录相等断言和长度等脱敏证据，不把内容展示给玩家或写入普通报告。
@@ -146,7 +152,7 @@
 1. “先别替我花幸运，也不要自动重掷。告诉我门没开以后现在发生了什么；如果换一种办法孤注一掷，我要承担什么更严重的风险？”
 2. GM 说明风险后：“我不花幸运。我拆门轴，从铰链这边强行卸门；我接受你刚才说的更严重后果，孤注一掷。”
 
-**硬门槛**：GM 可以说明选项，但第一步不得自动调用 `spend_luck` 或 `push_check`，也不得替玩家声明接受代价。第二步只执行玩家明确选择的 `push_check`，关联原检定，不改写原骰点，也不同时偷偷花费幸运。`spend_luck` 的对应选择与余额边界由确定性测试单独覆盖。
+**硬门槛**：GM 可以说明选项，但第一步不得自动调用 `spend_luck` 或 `push_check`，也不得替玩家声明接受代价。第二步只执行玩家明确选择的 `push_check`，关联原检定，不改写原骰点，也不同时偷偷花费幸运。`spend_luck` 的对应选择与余额边界由确定性测试单独覆盖。场景二和场景三都必须是真实、非跳过的 DeepSeek 运行；缺少 key、运行失败或未完成人工判断不能记录为通过。
 
 **人工观察点**：GM 是否把失败变成有意义的局势而非死路；更严重风险是否贴合新做法；规则说明是否清楚但没有盖过叙事。
 

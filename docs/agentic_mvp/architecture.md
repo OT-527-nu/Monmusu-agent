@@ -4,7 +4,7 @@
 
 本文定义下一版 MVP 的目标模块、接口、seam、权威与数据流。执行时序以 [Agent Loop](agent_loop.md) 为准，持久化与消息字段以[数据契约](contracts.md)为准，产品取舍以 [MVP 产品方案](mvp_design.md)为准。
 
-本文定义目标架构，不把未交付能力写成当前事实。截至 2026-08-08，独立的 opt-in Agentic 路径已通过 `AgenticHarness.start_turn`、`resume_turn`、`AgenticSessionStore` 和 `GameMasterModel` seam 实现 Increment 1 与 Increment 2，包括最终答复、事实账本、完整回合记录、`make_check`、non-thinking/thinking DeepSeek adapter、显式恢复、幂等工具结果重放、结构修正、执行限制和真实恢复合同证据；默认入口及 `agent.py`、`engine.py`、`tools.py`、`rules.py`、`state.py` 仍保留旧规则驱动基线。其余 COC 工具、完整短篇、默认入口切换和旧路径清理仍是目标架构。
+本文定义目标架构，不把未交付能力写成当前事实。截至 2026-08-10，独立的 opt-in Agentic 路径已通过 `AgenticHarness.start_turn`、`resume_turn`、`AgenticSessionStore` 和 `GameMasterModel` seam 实现 Increment 1 与 Increment 2，包括最终答复、事实账本、完整回合记录、`make_check`、non-thinking/thinking DeepSeek adapter、显式恢复、幂等工具结果重放、结构修正、执行限制和真实恢复合同证据。Ticket 12 已建立动态 COC 工具注册目录和共同生命周期，但源码仍保留 `make_check` 专用 preflight、两种公开机械投影以及恢复 profile 必须等于 Harness 构造期 profile 的限制；这些是 Increment 3 首个实现检查点，不是目标 seam。默认入口及 `agent.py`、`engine.py`、`tools.py`、`rules.py`、`state.py` 仍保留旧规则驱动基线；其余四个 COC 工具、完整短篇、默认入口切换和旧路径清理仍是目标架构。
 
 ## 架构目标
 
@@ -83,15 +83,16 @@ Agent Harness 是运行时的主要深模块。它把复杂的上下文、模型
 
 职责：
 
-- 创建新游戏时先原子写入 `SessionSetup`、按内容哈希寻址的模组/人物只读快照、开场事实、`actor_display_names`、`InvestigatorProfile` 和机械角色卡；CLI 展示开场叙述后才接受第一条玩家输入。
+- 创建新游戏时先验证六张生产 `ActorSheet` 模板与技能目录，再原子写入 `SessionSetup`、按内容哈希寻址的模组/人物只读快照、开场事实、`actor_display_names`、选中调查员的 `InvestigatorProfile`，以及选中调查员和三名固定同行者共四张机械角色卡；未选调查员模板不复制进本局。CLI 展示开场叙述后才接受第一条玩家输入。
 - 确认当前会话允许创建新回合，生成稳定 `turn_id`，并在首次模型请求前保存可恢复的回合外壳。
 - 从主持能力章程、不可变参考书快照、人物资料、选中调查员与参与可信机械的 NPC 角色卡、当前事实、本局完整记录、玩家原文和工具定义组装 GM 上下文。
 - 驱动同一个 GM 的有限模型往返，执行它选择的一个 COC 语义工具，随后把可信结果送回同一对话。
-- 在 COC 工具成功后，把机械记录、角色数值变化、`ToolInteraction` 和 assistant/tool 协议消息一次原子持久化，再向 CLI 发布公开结果。
+- 对每个新工具调用统一执行“参数规范化、领域 preflight 与可信输入冻结、分配 Harness ID/时间、执行 RNG/规则、原子持久化、公开投影”；任何领域拒绝都发生在 ID、时间和 RNG 之前。
+- 在 COC 工具成功后，把机械记录、角色数值变化、`ToolInteraction` 和 assistant/tool 协议消息一次原子持久化，再由实际工具选择允许公开的字段并向 CLI 发布统一 `PublicMechanic` 投影。
 - 本地解析和校验 GM 最终答复；只校验结构、引用和可原子写入性，不审批虚构内容。
 - 将 `narration`、`establish`、`retire`、`session_status` 与回合记录作为一个最终提交写入，并刷新事实索引。
 - 维护每次执行尝试的 8 次模型往返、60 秒单请求时限、180 秒执行尝试时限和一次最终结构修正。
-- 保存未完成回合及冻结的 `model_profile` / `attempt_limits`，恢复 provider 对话和既有工具交互，并保证已提交机械不被重放；冻结 profile 不可用时拒绝恢复，不静默换配置。
+- 保存未完成回合及冻结的 `model_profile` / `attempt_limits`，恢复 provider 对话和既有工具交互，并保证已提交机械不被重放。新回合默认暴露五个 COC 工具；恢复回合使用自己的冻结 profile，只要求其版本与工具子集仍被完整注册表支持，不要求它等于新回合默认 profile。冻结 profile 不可用或损坏时拒绝恢复，不静默换配置。
 - 记录用量、延迟、错误和累计恢复次数等诊断数据，同时从玩家视图和正典记录中隔离这些信息。
 
 Harness 不需要先知道“世界中哪些变化被允许”。如果最终答复结构合法、引用事实存在且可以完整写入，它就接受 GM 的裁定。叙事质量、连续性和玩家意志边界通过[GM 能力章程与 Prompt](gm_prompt.md)、真实评估与试玩改进，不增加一个语义审核 Agent。
@@ -155,18 +156,20 @@ COC 规则工具是 Harness 内部的深模块，对 GM 暴露少量高层语义
 - `deal_damage`
 - `make_sanity_check`
 
-首个纵向切片只实现 `make_check`，后四项在最终 MVP 增量中补齐。工具参数、返回和错误以[数据契约](contracts.md)为准。
+首个纵向切片只实现 `make_check`，后四项在 Increment 3 补齐。工具 schema 版本保持 `coc-tools-agentic-mvp-1`；完整注册表长期保留该版本已经发布的所有工具验证器，而运行 profile 只选择当前模型请求暴露的子集。工具参数、返回和错误以[数据契约](contracts.md)为准。
 
-该模块集中负责：
+每项工具拥有自己的参数规范化、领域 preflight、可信输入快照、规则执行、机械结果校验和公开字段选择；Harness 只编排同一共同生命周期，不按工具名或 `kind` 写规则分支。该模块集中负责：
 
 - 验证角色、能力、原生难度、奖励/惩罚骰及可见性等事前参数。
 - 从正式角色卡读取数值，生成随机结果，计算成功等级和 COC 规则阈值。
 - 验证孤注一掷与原失败检定的机械关联，以及幸运花费的规则适用性、所需点数和余额。玩家是否明确作出选择由同一个 GM 根据原始输入判断，并通过能力章程与真实评估约束；Harness 不增加自然语言意图分类器。
 - 对伤害、HP、理智与 SAN 变化执行可信计算。
-- 为每个成功创建的机械结果生成稳定标识，持久化后才向 GM 和 CLI 报告成功。
+- 在全部领域 preflight 成功后，由 Harness 为每个待创建机械分配稳定标识和提交时间；工具不能接受或伪造这些字段。持久化成功后才向 GM 和 CLI 报告成功。
 - 识别已执行工具调用并复用原结果，保证恢复和协议重放不会再次掷骰或重复扣减数值。
 
 工具不接受 `target_id`、`rule_id`、`effect_id`、任意数据路径或模组专用动作。GM 事前决定使用哪项机械和风险参数；工具不判断这个故事情节是否被模组授权。机械结果对虚构造成什么影响，由 GM 在最终答复中裁定。
+
+玩家调用层只接收一种公开机械外壳 `PublicMechanic(mechanic_id, kind, actor_id, details)`。Harness 从已提交且 `visibility: "public"` 的机械构造这三个可信字段，实际执行该调用的工具从完整机械中选择并校验 `details`；CLI 只格式化这份投影。持久化机械仍按每种工具的严格 schema 保存，统一投影不把基础检定与 pushed 检定合并成松散的可选字段结构。
 
 ### 事实与回合存储
 
@@ -189,7 +192,7 @@ COC 规则工具是 Harness 内部的深模块，对 GM 暴露少量高层语义
 
 - [GM 能力章程与 Prompt](gm_prompt.md)。
 - `SessionSetup` 的不可变开场记录，以及按哈希固定的[完整模组参考书](module_reference.md)和[调查员与 NPC 参考](characters.md)快照。
-- 玩家冻结的 `InvestigatorProfile`、本局选择的正式调查员卡，以及所有参与可信机械的 NPC 角色卡。
+- 玩家冻结的 `InvestigatorProfile`、本局选中的正式调查员卡，以及三名固定同行者的 NPC 角色卡；未选调查员模板不进入本局上下文或存档。
 - 当前公开与隐藏事实索引。
 - 本局从开场至今的完整回合记录及精简机械结果。
 - 本轮玩家原文。
@@ -216,7 +219,7 @@ COC 规则工具是 Harness 内部的深模块，对 GM 暴露少量高层语义
 1. CLI 完成或载入 `SessionSetup`，展示开场叙述；确认没有未完成回合后接受玩家自由文本。
 2. Harness 创建 `turn_id` 与可恢复回合外壳，读取冻结参考快照、正式角色卡、事实索引和完整历史。
 3. Harness 组装完整 GM 上下文，通过 `GameMasterModel` seam 发起非流式 DeepSeek 请求。
-4. GM 若调用工具，Harness 通过 COC 规则模块结算，并在一次原子写入中保存机械、角色数值、幂等映射和协议消息，再把可信结果返回同一 GM；公开结果同时发送 CLI。
+4. GM 若调用工具，Harness 先完成参数规范化与工具拥有的领域 preflight，冻结角色和机械历史输入；成功后才分配机械 ID/时间并执行 RNG 与规则，在一次原子写入中保存机械、角色数值、幂等映射和协议消息，再把可信结果返回同一 GM。提交成功后，实际工具选择公开字段，Harness 以统一 `PublicMechanic` 投影发送 CLI。
 5. GM 返回只含 `narration`、`establish`、`retire`、`session_status` 的最终 JSON。
 6. Harness 本地校验结构和引用；必要时由同一 GM 在本次尝试内修正一次。
 7. Harness 原子提交最终答复、事实变化和完整回合记录，清除未完成标记。
@@ -255,6 +258,8 @@ COC 规则工具是 Harness 内部的深模块，对 GM 暴露少量高层语义
 - `GameMasterModel` seam 同时支持真实 DeepSeek adapter 和确定性假 adapter，且核心不包含 provider 路由框架。
 - 模组参考书与人物资料不包含检定授权、效果白名单、固定路线、关系阶段、威胁时钟或结局枚举。
 - 所有 COC 机械结果都能追溯到具体工具调用和正式角色卡；GM 无法提交骰点或任意机械补丁。
+- Harness 的共同工具路径不按工具名或机械 `kind` 特判 preflight 与公开投影；领域错误发生在机械 ID、时间和 RNG 分配之前。
+- 新回合的五工具默认 profile 与未完成回合自己的冻结 profile 相互独立；旧的 `make_check`-only profile 在完整注册表仍支持时可继续恢复。
 - 所有已提交 GM 叙事都能追溯到玩家输入、此前正典和本轮机械；事实索引缺漏不会撤销完整记录中的正典。
 - 公开、隐藏、provider 协议和诊断数据在玩家输出中保持结构隔离。
 - 工具后故障与多次恢复都不会重掷或重复应用数值变化。

@@ -6,14 +6,14 @@
 
 目标模块职责见[系统架构](architecture.md)，接口形状见[数据契约](contracts.md)，执行与恢复顺序见 [Agent Loop](agent_loop.md)。本文只规定迁移结果与依赖顺序，不预先锁定目标 Python 文件布局。
 
-## 截至 2026-08-08 的实现事实
+## 截至 2026-08-10 的实现事实
 
 Increment 1 和 Increment 2 已在独立的 opt-in Agentic 路径完成：除了真实 DeepSeek 两回合开放行动验证，还完成了确定性故障/恢复矩阵、显式 CLI 恢复门、工具结果幂等重放、thinking 恢复传输和 non-thinking/thinking 真实恢复合同。默认 `monmusu-agent` 与旧存档仍保留规则驱动基线。下表同时列出已经交付的新路径与仍用于迁移对照的旧路径，避免把目标文档误当成当前能力，也避免继续声称新路径不存在。
 
 | 当前区域 | 已有能力 | 与目标设计的差距 | 迁移处理 |
 | --- | --- | --- | --- |
 | [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载 `agentic-mvp-1` 会话聚合、不可变参考快照、角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn`；恢复状态可被新的 SessionStore 重新装载 | 没有面向 CLI 的已有会话发现/选择 interface；启动仍不会自动恢复 | 保持 SessionStore 为本地持久化深模块，只增加真实调用者需要的最小会话发现能力 |
-| [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、`make_check`、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝 | 仍只提供 `make_check`；其余四个 COC 工具和完整短篇行为尚未交付 | 在同一 Harness lifecycle seam 继续增加后续工具，不拆出第二套 orchestrator |
+| [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、`make_check`、动态工具目录、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝 | Ticket 12 仍有 `make_check` 专用 preflight、按 `kind` 分裂公开投影、恢复要求 profile 完全等于构造期 profile；其余四个 COC 工具和完整短篇行为尚未交付 | 在同一 Harness lifecycle seam 补统一 preflight、统一 `PublicMechanic` 和冻结 profile 恢复兼容，再逐项增加后续工具，不拆出第二套 orchestrator |
 | [`agentic_model.py`](../../src/monmusu_agent/agentic_model.py) | `GameMasterModel` 同时有可编程假 adapter 与 OpenAI SDK DeepSeek adapter；non-thinking/thinking、JSON Object、function tools、请求 timeout、稳定错误映射和 thinking `reasoning_content` 恢复传输已接通 | 没有多 provider、自动路由或 fallback；真实质量矩阵尚未运行 | 保持薄 provider seam，不把恢复决策、工具幂等或 provider 路由移入 adapter |
 | [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 启动时总是新建游戏，没有已有会话发现/选择；完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
 | [`agentic_contract.py`](../../src/monmusu_agent/agentic_contract.py) | 显式真实契约 runner 已证明 direct final、一次匹配 `tool_call_id` 的 `make_check` 往返，以及 non-thinking/thinking 工具中断、重建和恢复；完整脱敏记录见 [Ticket 11 evidence](evidence/ticket-11-live-recovery-2026-08-07.md) | 真实合同只证明 SDK/provider 传输，不评价 GM 质量、其余工具或 72 次模型矩阵 | 保持 live 证据与确定性恢复矩阵、人工质量评估分开 |
@@ -162,25 +162,38 @@ Increment 1 和 Increment 2 已在独立的 opt-in Agentic 路径完成：除了
 
 ### 实现范围
 
-在已经验证的单 GM 工具循环中逐个增加，而不是一次建设通用规则平台：
+在已经验证的单 GM 工具循环中逐个增加，而不是一次建设通用规则平台。Ticket 12 必须先把所有工具收敛到同一可信生命周期：
+
+```text
+normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
+-> RNG/execute -> atomic commit -> public projection
+```
+
+领域 preflight 失败时不分配 ID/时间、不调用 RNG；角色、余额、历史引用和资格规则由相应工具拥有，Harness 不按工具名增加特殊分支。玩家调用层统一接收 `PublicMechanic(mechanic_id, kind, actor_id, details)`，`details` 由实际工具选择并校验，Harness 不按 `kind` 猜测结构。新回合默认暴露五项工具，恢复回合继续使用各自 `IncompleteTurn` 冻结的 profile；完整 `coc-tools-agentic-mvp-1` 注册表保留所有已发布工具验证器。
+
+其余工具逐个增加：
 
 - `push_check`：只关联可孤注一掷的原失败检定；玩家必须先提出不同做法，GM 在重掷前说明更严重失败风险。
-- `spend_luck`：GM 只在玩家明确选择后调用；Harness 验证原检定是否允许、所需点数和当前余额，并原子更新幸运，但不建设自然语言意图分类器。
+- `spend_luck`：GM 只在玩家明确选择后调用；Harness 只允许选中玩家调查员的公开基础失败检定，要求 `points = roll - target` 且恰好买到原检定声明的难度，不能制造 critical，并原子更新幸运，但不建设自然语言意图分类器。
 - `deal_damage`：由 GM 提供伤害表达式、原因和适用护甲；Harness 掷骰、更新 HP 并报告重伤、昏迷或死亡等规则结果。
 - `make_sanity_check`：由 GM 提供恐怖来源与成功/失败 SAN 损失表达式；Harness 检定、更新 SAN 并报告相关阈值。
+- 伤害采用冻结的 MVP 子集：`armor_applied = min(raw_damage, armor)`（护甲适用时）、`damage_taken = raw_damage - armor_applied`、`major_wound = damage_taken >= ceil(max_hp / 2)`、`dead = damage_taken >= max_hp`、`unconscious = hp_after == 0 and not dead`；不增加 CON 检定、濒死、治疗或战斗轮。
+- SAN 只计算数值和阈值，结果字段使用 `temporary_insanity_threshold_reached` 与 `indefinite_insanity_threshold_crossed`，不实现后续 INT 检定、疯狂发作表或长期病症。
 - 进入增量 3 时，`make_check` 应已由增量 1 按完整契约交付；本增量只扩展六张生产角色卡的覆盖，并增加与后续四项工具的组合测试。
-- 按[数据契约](contracts.md)和[技能目录](skill_catalog.md)提供全部六张生产角色卡，包含五类 MVP 工具实际读取的属性、规范化技能、HP、SAN、幸运、护甲等机械数据；增量 1 的单张最小卡只用于打通协议。
+- 按[数据契约](contracts.md)和[技能目录](skill_catalog.md)提供三张调查员和三名固定同行者共六张生产模板，包含五类 MVP 工具实际读取的属性、规范化技能、HP、SAN、幸运、护甲等机械数据；每局只冻结选中的调查员和三名同行者共四张卡，增量 1 的单张最小卡只用于打通协议。
 - 需要可信 NPC 机械的固定同行者拥有正式 `ActorSheet`；临时 NPC 若不需要可信结算，不为其动态创建角色卡或增加 GM 改卡工具。
+- `deal_damage` 与 `make_sanity_check` 共用严格解析器，限制 `N <= 20`、`M <= 100`，理论结果范围为 `0..100`；两个工具继续分别拥有自己的领域阈值和数值变化规则。
 
 ### 验收门
 
 - 每个工具都有独立规则示例、边界值、非法前置条件和持久化原子性测试。
 - Seam 测试证明原玩家输入始终进入同一 GM 上下文，真实聚焦场景证明 GM 不会在玩家明确选择前自动调用 `push_check` 或 `spend_luck`；确定性 Harness 测试只证明关联、适用性、余额和提交正确。
 - 玩家主动机械和调查员 HP、SAN、幸运变化立即公开；秘密机械在结果产生前确定可见性。
+- Push/Luck 只适用于选中玩家调查员的公开检定；`push_eligible`/`luck_eligible` 保存提交时的初始资格快照，当前资格由不可变补救链推导，`fumble` 两者均为 `false`。
 - GM 只能解释工具结果，不能在最终答复中覆盖目标值、骰点、成功等级或数值变化。
 - 所有工具引用的角色与能力都能由稳定 ID 解析；缺失能力产生结构化错误而非默认数值。
 - 角色卡加载和机械更新经过 schema、边界与原子持久化测试。
-- 聚焦场景二和三在真实 DeepSeek 上通过硬门槛；场景四的完整 NPC 表现随增量 4 验收。
+- 聚焦场景二和三在真实 DeepSeek 上完成非跳过运行并通过硬门槛；场景四的完整 NPC 表现随增量 4 验收，Ticket 18 不以场景四替代场景二、三的玩家选择证据。
 
 ### 明确延期
 
