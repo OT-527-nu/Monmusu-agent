@@ -1467,6 +1467,21 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertIn('"session_status": "ongoing"', system_text)
             self.assertIn("不得返回空字符串或纯空白", system_text)
             self.assertIn("绝不能包含 fact_id", system_text)
+            package = json.loads(model.requests[0].messages[1]["content"])
+            expected_actor_ids = {
+                "investigator_tracker",
+                "npc_vespera",
+                "npc_saphra",
+                "npc_aranis",
+            }
+            self.assertEqual(
+                {actor["actor_id"] for actor in package["ACTOR_SHEETS"]},
+                expected_actor_ids,
+            )
+            self.assertEqual(
+                set(package["ACTOR_DISPLAY_NAMES"]),
+                expected_actor_ids,
+            )
 
     def test_second_turn_receives_complete_canon_and_retires_active_fact(self) -> None:
         """后续请求携带隐藏正典与完整记录，结束事实仍保留历史。"""
@@ -3867,7 +3882,9 @@ class AgenticHarnessTest(unittest.TestCase):
         }
         cases = (
             ("unknown actor", {**valid, "actor_id": "npc_missing"}, "make_check", "unknown_actor", True),
+            ("unselected investigator", {**valid, "actor_id": "investigator_mediator"}, "make_check", "unknown_actor", True),
             ("unknown ability", {**valid, "ability": "locksmithing"}, "make_check", "unknown_ability", True),
+            ("unowned setting skill", {**valid, "ability": "flight"}, "make_check", "unknown_ability", True),
             ("forged target", {**valid, "target": 99}, "make_check", "invalid_arguments", False),
             ("bad difficulty", {**valid, "difficulty": []}, "make_check", "invalid_difficulty", False),
             ("bad adjustment", {**valid, "dice_adjustment": {"kind": "none", "count": 1}}, "make_check", "invalid_dice_adjustment", False),

@@ -4,15 +4,16 @@ from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 
+from monmusu_agent.agentic_harness import AgenticHarness
+from monmusu_agent.agentic_model import ModelCallError, ScriptedGameMasterModel
 from monmusu_agent.agentic_session import (
     AgenticSessionLoadError,
     AgenticSessionPublishError,
+    AgenticSessionSourceError,
     AgenticSessionSources,
     AgenticSessionStore,
     NewSessionRequest,
 )
-from monmusu_agent.agentic_harness import AgenticHarness
-from monmusu_agent.agentic_model import ModelCallError, ScriptedGameMasterModel
 from monmusu_agent.storage import read_json, write_json_atomic
 
 
@@ -76,7 +77,7 @@ class AgenticSessionStoreTest(unittest.TestCase):
                     "updated_at",
                 },
             )
-            self.assertEqual(session["schema_version"], "agentic-mvp-1")
+            self.assertEqual(session["schema_version"], "agentic-mvp-2")
             self.assertEqual(session["game_id"], "game_test_0001")
             self.assertEqual(session["module_id"], "escape_thalarion")
             self.assertEqual(
@@ -100,28 +101,42 @@ class AgenticSessionStoreTest(unittest.TestCase):
                     "keepsake": "一枚裂了边的铜怀表",
                 },
             )
-            self.assertEqual(len(session["actors"]), 1)
             self.assertEqual(
-                session["actors"][0]["actor_id"],
-                "investigator_tracker",
+                {actor["actor_id"] for actor in session["actors"]},
+                {
+                    "investigator_tracker",
+                    "npc_vespera",
+                    "npc_saphra",
+                    "npc_aranis",
+                },
             )
-            self.assertEqual(session["actors"][0]["role"], "investigator")
-            self.assertEqual(
-                session["actors"][0]["skill_catalog_version"],
-                "coc7e-agentic-mvp-1",
+            selected = next(
+                actor
+                for actor in session["actors"]
+                if actor["actor_id"] == "investigator_tracker"
             )
-            self.assertEqual(session["actors"][0]["skills"]["spot_hidden"], 70)
-            self.assertEqual(session["actors"][0]["skills"]["locksmith"], 1)
-            self.assertEqual(session["actors"][0]["hp"], {"current": 10, "max": 10})
+            self.assertEqual(selected["role"], "investigator")
+            self.assertEqual(selected["skill_catalog_version"], "coc7e-agentic-mvp-1")
+            self.assertEqual(selected["skills"]["spot_hidden"], 70)
+            self.assertEqual(selected["skills"]["locksmith"], 1)
+            self.assertEqual(selected["hp"], {"current": 10, "max": 10})
             self.assertEqual(
-                session["actors"][0]["san"],
+                selected["san"],
                 {"current": 65, "max": 65, "session_loss": 0},
             )
-            self.assertEqual(session["actors"][0]["luck"], {"current": 55})
-            self.assertEqual(session["actors"][0]["armor"], 0)
+            self.assertEqual(selected["luck"], {"current": 55})
+            self.assertEqual(selected["armor"], 0)
             self.assertEqual(
                 session["actor_display_names"]["investigator_tracker"],
                 "林雁",
+            )
+            self.assertNotIn(
+                "investigator_mediator",
+                session["actor_display_names"],
+            )
+            self.assertNotIn(
+                "investigator_mender",
+                session["actor_display_names"],
             )
             opening_fact_ids = session["setup"]["opening_fact_ids"]
             self.assertEqual(
@@ -155,6 +170,212 @@ class AgenticSessionStoreTest(unittest.TestCase):
             )
             self.assertEqual(session["updated_at"], session["created_at"])
             self.assertTrue(created.session_file.is_file())
+
+    def test_create_session_freezes_each_production_investigator_roster(self) -> None:
+        """三种选卡都冻结选中的调查员和三名固定同行者。"""
+
+        expected = {
+            "investigator_tracker": ("investigator", 70, 10, 65, 55),
+            "investigator_mediator": ("investigator", 50, 11, 60, 60),
+            "investigator_mender": ("investigator", 55, 13, 55, 50),
+        }
+        npc_ids = {"npc_vespera", "npc_saphra", "npc_aranis"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions"
+            game_ids = iter(("game_tracker", "game_mediator", "game_mender"))
+            store = AgenticSessionStore(
+                session_root=root,
+                game_id_factory=game_ids.__next__,
+                clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+
+            for investigator_id, (role, spot_hidden, hp, san, luck) in expected.items():
+                request = NewSessionRequest(
+                    investigator_id=investigator_id,
+                    display_name=f"自定义-{investigator_id}",
+                )
+                session = store.create_session(request).session
+                actors = {actor["actor_id"]: actor for actor in session["actors"]}
+                self.assertEqual(set(actors), {investigator_id, *npc_ids})
+                self.assertEqual(len(actors), 4)
+                self.assertEqual(actors[investigator_id]["role"], role)
+                self.assertEqual(actors[investigator_id]["skills"]["spot_hidden"], spot_hidden)
+                self.assertEqual(actors[investigator_id]["hp"]["max"], hp)
+                self.assertEqual(actors[investigator_id]["san"]["max"], san)
+                self.assertEqual(actors[investigator_id]["luck"]["current"], luck)
+                self.assertEqual(
+                    set(session["actor_display_names"]),
+                    {investigator_id, *npc_ids},
+                )
+
+    def test_production_templates_cover_all_stable_actor_ids_and_specialty_values(self) -> None:
+        """生产模板覆盖六个稳定角色及目录中的专长键。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(session_root=Path(directory))
+            choices = store.available_investigators()
+            self.assertEqual(
+                {choice.actor_id for choice in choices},
+                {
+                    "investigator_tracker",
+                    "investigator_mediator",
+                    "investigator_mender",
+                },
+            )
+            created = store.create_session(self._request())
+            actors = {actor["actor_id"]: actor for actor in created.session["actors"]}
+            self.assertEqual(actors["npc_vespera"]["skills"]["flight"], 55)
+            self.assertNotIn("flight", actors["investigator_tracker"]["skills"])
+            self.assertNotIn("flight", actors["npc_saphra"]["skills"])
+            self.assertNotIn("flight", actors["npc_aranis"]["skills"])
+            self.assertEqual(
+                actors["npc_saphra"]["skills"]["language_other__ancient_serpent"],
+                75,
+            )
+            self.assertEqual(actors["npc_aranis"]["skills"]["art_craft__rigging"], 75)
+            self.assertEqual(actors["npc_aranis"]["hp"], {"current": 9, "max": 12})
+
+    def test_profile_customization_does_not_change_frozen_mechanics(self) -> None:
+        """同一预生成卡的身份资料变化不改 actor_id 或机械值。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            game_ids = iter(("game_profile_a", "game_profile_b"))
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=game_ids.__next__,
+                clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+            first = store.create_session(self._request()).session
+            second = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="另一姓名",
+                    occupation="记者",
+                    appearance="戴圆框眼镜",
+                )
+            ).session
+
+            first_actor = next(
+                actor
+                for actor in first["actors"]
+                if actor["role"] == "investigator"
+            )
+            second_actor = next(
+                actor
+                for actor in second["actors"]
+                if actor["role"] == "investigator"
+            )
+            self.assertEqual(first_actor, second_actor)
+            self.assertNotEqual(
+                first["investigator_profile"],
+                second["investigator_profile"],
+            )
+
+    def test_create_session_resolves_catalog_base_and_derived_skills(self) -> None:
+        """建局时把固定基础值和派生值写入冻结卡。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = self._copy_sources(root)
+            templates = read_json(sources.actor_templates)
+            mediator = next(
+                actor
+                for actor in templates["actors"]
+                if actor["actor_id"] == "investigator_mediator"
+            )
+            del mediator["skill_overrides"]["dodge"]
+            write_json_atomic(sources.actor_templates, templates)
+            store = AgenticSessionStore(
+                session_root=root / "sessions",
+                sources=sources,
+                game_id_factory=lambda: "game_catalog_values",
+            )
+
+            session = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_mediator",
+                    display_name="纪澄",
+                )
+            ).session
+            actor = next(
+                item
+                for item in session["actors"]
+                if item["actor_id"] == "investigator_mediator"
+            )
+            catalog = read_json(sources.skill_catalog)
+            self.assertEqual(
+                set(actor["skills"]),
+                set(catalog["skills"]) - {"flight"},
+            )
+            self.assertEqual(actor["skills"]["locksmith"], 1)
+            self.assertEqual(actor["skills"]["dodge"], 27)
+
+    def test_source_failures_publish_no_partial_session(self) -> None:
+        """六卡模板的结构、边界或交叉引用错误都在发布前停止。"""
+
+        cases = (
+            "missing_actor",
+            "duplicate_actor",
+            "bad_role",
+            "unknown_skill",
+            "version_mismatch",
+            "unsupported_catalog_version",
+            "unknown_catalog_skill",
+            "unexpected_template_field",
+            "display_name_boundary",
+            "setting_skill_wrong_owner",
+            "attribute_out_of_bounds",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sources = self._copy_sources(root)
+                templates = read_json(sources.actor_templates)
+                if case == "missing_actor":
+                    templates["actors"].pop()
+                elif case == "duplicate_actor":
+                    templates["actors"].append(dict(templates["actors"][0]))
+                elif case == "bad_role":
+                    templates["actors"][3]["role"] = "investigator"
+                elif case == "unknown_skill":
+                    templates["actors"][3]["skill_overrides"]["invented_skill"] = 40
+                elif case == "version_mismatch":
+                    templates["skill_catalog_version"] = "coc7e-other"
+                elif case == "unsupported_catalog_version":
+                    catalog = read_json(sources.skill_catalog)
+                    catalog["catalog_version"] = "coc7e-other"
+                    templates["skill_catalog_version"] = "coc7e-other"
+                    write_json_atomic(sources.skill_catalog, catalog)
+                elif case == "unknown_catalog_skill":
+                    catalog = read_json(sources.skill_catalog)
+                    catalog["skills"]["invented_skill"] = {
+                        "display_name": "虚构技能",
+                        "base": {"kind": "fixed", "value": 20},
+                    }
+                    write_json_atomic(sources.skill_catalog, catalog)
+                elif case == "unexpected_template_field":
+                    templates["actors"][0]["mechanic_notes"] = "not schema"
+                elif case == "display_name_boundary":
+                    fixture = read_json(sources.setup_fixture)
+                    fixture["actor_display_names"]["investigator_mediator"] = "纪澄"
+                    write_json_atomic(sources.setup_fixture, fixture)
+                elif case == "setting_skill_wrong_owner":
+                    templates["actors"][0]["skill_overrides"]["flight"] = 40
+                else:
+                    templates["actors"][5]["attributes"]["strength"] = 101
+                write_json_atomic(sources.actor_templates, templates)
+                session_root = root / "sessions"
+                store = AgenticSessionStore(
+                    session_root=session_root,
+                    sources=sources,
+                    game_id_factory=lambda: "game_invalid_source",
+                )
+
+                with self.assertRaises(AgenticSessionSourceError):
+                    store.create_session(self._request())
+
+                self.assertFalse(session_root.exists())
 
     def test_create_session_assigns_a_unique_setup_id_per_game(self) -> None:
         """开场 ID 由 Harness 为每局单独创建，而不是复用 fixture 常量。"""
@@ -245,6 +466,26 @@ class AgenticSessionStoreTest(unittest.TestCase):
             )
             self.assertEqual(module_snapshot.stat().st_mode & 0o222, 0)
             self.assertEqual(character_snapshot.stat().st_mode & 0o222, 0)
+
+    def test_load_session_uses_frozen_actor_sheets_after_sources_are_removed(self) -> None:
+        """既有会话装载不回读已删除的模板或技能目录。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = self._copy_sources(root)
+            store = AgenticSessionStore(
+                session_root=root / "sessions",
+                sources=sources,
+                game_id_factory=lambda: "game_frozen_actors",
+            )
+            created = store.create_session(self._request())
+            frozen_actors = created.session["actors"]
+            sources.actor_templates.unlink()
+            sources.skill_catalog.unlink()
+
+            loaded = store.load_session(created.game_id)
+
+            self.assertEqual(loaded.session["actors"], frozen_actors)
 
     def test_load_session_rejects_missing_snapshot_without_fallback(self) -> None:
         """冻结快照缺失时稳定停止，即使原始参考书仍然可读。"""
@@ -564,6 +805,114 @@ class AgenticSessionStoreTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 AgenticSessionLoadError,
                 "ActorSheet 格式无效",
+            ):
+                store.load_session(created.game_id)
+
+    def test_load_session_rejects_skill_outside_frozen_catalog(self) -> None:
+        """目录外技能不能被注入冻结卡并成为可信检定能力。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_unknown_frozen_skill",
+            )
+            created = store.create_session(self._request())
+            session = read_json(created.session_file)
+            session["actors"][0]["skills"]["invented_skill"] = 99
+            write_json_atomic(created.session_file, session)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "ActorSheet 格式无效",
+            ):
+                store.load_session(created.game_id)
+
+    def test_load_session_accepts_historical_single_actor_snapshot_without_upgrading(self) -> None:
+        """历史单卡存档保持原样装载，不从当前模板补入 NPC。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_historical_single_actor",
+            )
+            created = store.create_session(self._request())
+            session = read_json(created.session_file)
+            legacy_actor = next(
+                actor
+                for actor in session["actors"]
+                if actor["actor_id"] == "investigator_tracker"
+            )
+            legacy_actor["skills"]["flight"] = 1
+            session["schema_version"] = "agentic-mvp-1"
+            session["actors"] = [legacy_actor]
+            write_json_atomic(created.session_file, session)
+
+            loaded = store.load_session(created.game_id)
+
+            self.assertEqual(len(loaded.session["actors"]), 1)
+            self.assertEqual(
+                loaded.session["actors"][0]["actor_id"],
+                "investigator_tracker",
+            )
+
+    def test_load_session_rejects_current_schema_single_actor_roster(self) -> None:
+        """v2 会话不能通过删除三张 NPC 卡伪装成历史单卡。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_current_single_actor",
+            )
+            created = store.create_session(self._request())
+            session = read_json(created.session_file)
+            session["actors"] = [session["actors"][0]]
+            write_json_atomic(created.session_file, session)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "ActorSheet 角色集合无效",
+            ):
+                store.load_session(created.game_id)
+
+    def test_load_session_rejects_legacy_schema_four_actor_roster(self) -> None:
+        """v1 只代表历史单卡，不接受当前四卡形状。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_legacy_four_actors",
+            )
+            created = store.create_session(self._request())
+            session = read_json(created.session_file)
+            session["schema_version"] = "agentic-mvp-1"
+            write_json_atomic(created.session_file, session)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "ActorSheet 角色集合无效",
+            ):
+                store.load_session(created.game_id)
+
+    def test_load_session_rejects_partial_production_actor_roster(self) -> None:
+        """新四卡存档缺少任一固定同行者时不能进入 GM 上下文。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_partial_roster",
+            )
+            created = store.create_session(self._request())
+            session = read_json(created.session_file)
+            session["actors"] = [
+                actor
+                for actor in session["actors"]
+                if actor["actor_id"] != "npc_aranis"
+            ]
+            write_json_atomic(created.session_file, session)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "ActorSheet 角色集合无效",
             ):
                 store.load_session(created.game_id)
 

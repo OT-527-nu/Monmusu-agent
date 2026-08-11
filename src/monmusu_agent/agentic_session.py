@@ -16,8 +16,8 @@ from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from monmusu_agent.agentic_coc import (
-    CocTool,
     DEFAULT_COC_TOOLS,
+    CocTool,
     MakeCheckError,
 )
 from monmusu_agent.agentic_model import (
@@ -27,9 +27,73 @@ from monmusu_agent.agentic_model import (
 from monmusu_agent.config import PROJECT_ROOT
 from monmusu_agent.storage import read_json, write_json_atomic
 
-SCHEMA_VERSION = "agentic-mvp-1"
+SCHEMA_VERSION = "agentic-mvp-2"
+LEGACY_SCHEMA_VERSION = "agentic-mvp-1"
 MODULE_ID = "escape_thalarion"
 SKILL_CATALOG_VERSION = "coc7e-agentic-mvp-1"
+ACTOR_TEMPLATE_SCHEMA_VERSION = "agentic-mvp-actor-templates-1"
+
+_INVESTIGATOR_ACTOR_IDS = (
+    "investigator_tracker",
+    "investigator_mediator",
+    "investigator_mender",
+)
+_NPC_ACTOR_IDS = ("npc_vespera", "npc_saphra", "npc_aranis")
+_PRODUCTION_ACTOR_ROLES = {
+    **{actor_id: "investigator" for actor_id in _INVESTIGATOR_ACTOR_IDS},
+    **{actor_id: "npc" for actor_id in _NPC_ACTOR_IDS},
+}
+_SKILL_CATALOG_KEYS = frozenset(
+    {
+        "spot_hidden",
+        "library_use",
+        "listen",
+        "psychology",
+        "persuade",
+        "navigate",
+        "stealth",
+        "first_aid",
+        "fighting__brawl",
+        "dodge",
+        "charm",
+        "credit_rating",
+        "mechanical_repair",
+        "locksmith",
+        "electrical_repair",
+        "climb",
+        "swim",
+        "occult",
+        "history",
+        "anthropology",
+        "language_other__ancient_serpent",
+        "art_craft__rigging",
+        "flight",
+    }
+)
+_SETTING_SKILL_KEYS = frozenset({"flight"})
+_BASE_SKILL_KEYS = _SKILL_CATALOG_KEYS - _SETTING_SKILL_KEYS
+_SETTING_SKILL_OWNERS = {"flight": frozenset({"npc_vespera"})}
+_SKILL_SPECIALTIES = {
+    "fighting__brawl": "brawl",
+    "language_other__ancient_serpent": "ancient_serpent",
+    "art_craft__rigging": "rigging",
+}
+_ACTOR_TEMPLATE_FIELDS = frozenset(
+    {
+        "actor_id",
+        "role",
+        "attributes",
+        "skill_overrides",
+        "hp",
+        "san",
+        "luck",
+        "armor",
+    }
+)
+_INVESTIGATOR_TEMPLATE_FIELDS = _ACTOR_TEMPLATE_FIELDS | {
+    "choice_label",
+    "suggested_display_name",
+}
 
 _SESSION_FIELDS = frozenset(
     {
@@ -399,7 +463,8 @@ class AgenticSessionStore:
             catalog.get("catalog_version"),
             "catalog_version",
         )
-        actor = self._build_actor(
+        self._validate_skill_catalog(catalog, catalog_version)
+        actors = self._build_session_actors(
             request.investigator_id,
             catalog,
             templates,
@@ -422,6 +487,8 @@ class AgenticSessionStore:
         )
         opening_fact_ids = [fact["fact_id"] for fact in facts]
         actor_display_names = self._actor_display_names(fixture)
+        if set(actor_display_names) != set(_NPC_ACTOR_IDS):
+            raise AgenticSessionSourceError("actor_display_names 必须只包含三名固定同行者")
         actor_display_names[request.investigator_id] = profile["display_name"]
         opening_narration = self._required_string(
             fixture.get("opening_narration"),
@@ -448,7 +515,7 @@ class AgenticSessionStore:
             "selected_investigator_id": request.investigator_id,
             "actor_display_names": actor_display_names,
             "investigator_profile": profile,
-            "actors": [actor],
+            "actors": actors,
             "facts": facts,
             "turns": [],
             "incomplete_turn": None,
@@ -516,7 +583,10 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("session.json 无法读取") from error
         if not isinstance(session, dict):
             raise AgenticSessionLoadError("session.json 必须是 JSON 对象")
-        if session.get("schema_version") != SCHEMA_VERSION:
+        if session.get("schema_version") not in {
+            LEGACY_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }:
             raise AgenticSessionLoadError("session.json schema_version 不受支持")
         if session.get("game_id") != expected_game_id:
             raise AgenticSessionLoadError("session.json game_id 与目录不匹配")
@@ -1280,11 +1350,14 @@ class AgenticSessionStore:
         cls._validate_profile(profile)
         cls._validate_display_names(display_names)
         seen_actor_ids: set[str] = set()
+        actor_roles: dict[str, object] = {}
         for actor in actors:
             actor_id = cls._validate_actor_sheet(actor, catalog_version)
             if actor_id in seen_actor_ids:
                 raise AgenticSessionLoadError("ActorSheet 格式无效")
             seen_actor_ids.add(actor_id)
+            assert isinstance(actor, dict)
+            actor_roles[actor_id] = actor.get("role")
         matching_actors = [
             actor
             for actor in actors
@@ -1301,6 +1374,34 @@ class AgenticSessionStore:
         for actor in actors:
             if display_names.get(actor.get("actor_id")) is None:
                 raise AgenticSessionLoadError("调查员引用不一致")
+        schema_version = session.get("schema_version")
+        if schema_version == LEGACY_SCHEMA_VERSION:
+            legacy_actor = matching_actors[0]
+            if (
+                selected_id != "investigator_tracker"
+                or seen_actor_ids != {"investigator_tracker"}
+                or set(display_names)
+                != {"investigator_tracker", *_NPC_ACTOR_IDS}
+                or frozenset(legacy_actor.get("skills", {}))
+                != _SKILL_CATALOG_KEYS
+            ):
+                raise AgenticSessionLoadError("ActorSheet 角色集合无效")
+            return
+        expected_actor_ids = {selected_id, *_NPC_ACTOR_IDS}
+        if (
+            schema_version != SCHEMA_VERSION
+            or seen_actor_ids != expected_actor_ids
+            or set(display_names) != expected_actor_ids
+            or selected_id not in _INVESTIGATOR_ACTOR_IDS
+            or any(actor_roles.get(actor_id) != "npc" for actor_id in _NPC_ACTOR_IDS)
+            or any(
+                frozenset(actor.get("skills", {}))
+                != cls._production_skill_keys(actor.get("actor_id"))
+                for actor in actors
+                if isinstance(actor, dict)
+            )
+        ):
+            raise AgenticSessionLoadError("ActorSheet 角色集合无效")
 
     def _validate_mechanic_persistence(
         self,
@@ -1399,6 +1500,7 @@ class AgenticSessionStore:
             )
             or not isinstance(skills, dict)
             or not skills
+            or frozenset(skills) not in {_BASE_SKILL_KEYS, _SKILL_CATALOG_KEYS}
             or not all(
                 isinstance(key, str)
                 and bool(key)
@@ -1503,13 +1605,17 @@ class AgenticSessionStore:
             "keepsake": cls._optional_string(request.keepsake, "keepsake"),
         }
 
-    def _build_actor(
+    def _build_session_actors(
         self,
-        actor_id: str,
+        selected_investigator_id: str,
         catalog: Mapping[str, Any],
         templates: Mapping[str, Any],
         catalog_version: str,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
+        if set(templates) != {"schema_version", "skill_catalog_version", "actors"}:
+            raise AgenticSessionSourceError("角色模板根字段无效")
+        if templates.get("schema_version") != ACTOR_TEMPLATE_SCHEMA_VERSION:
+            raise AgenticSessionSourceError("角色模板 schema_version 不受支持")
         template_version = self._required_string(
             templates.get("skill_catalog_version"),
             "角色模板 skill_catalog_version",
@@ -1519,16 +1625,56 @@ class AgenticSessionStore:
         actor_templates = templates.get("actors")
         if not isinstance(actor_templates, list):
             raise AgenticSessionSourceError("角色模板 actors 必须是数组")
-        template = next(
-            (
-                item
-                for item in actor_templates
-                if isinstance(item, dict) and item.get("actor_id") == actor_id
-            ),
-            None,
-        )
-        if template is None or template.get("role") != "investigator":
+        templates_by_id: dict[str, Mapping[str, Any]] = {}
+        for item in actor_templates:
+            if not isinstance(item, dict):
+                raise AgenticSessionSourceError("角色模板条目必须是对象")
+            actor_id = self._required_string(item.get("actor_id"), "actor_id")
+            if actor_id in templates_by_id:
+                raise AgenticSessionSourceError("角色模板 actor_id 不能重复")
+            templates_by_id[actor_id] = item
+        if set(templates_by_id) != set(_PRODUCTION_ACTOR_ROLES):
+            raise AgenticSessionSourceError("角色模板必须包含六个稳定 actor_id")
+        if selected_investigator_id not in _INVESTIGATOR_ACTOR_IDS:
             raise AgenticSessionSourceError("未找到可选的预生成调查员卡")
+
+        resolved = {
+            actor_id: self._build_actor(
+                templates_by_id[actor_id],
+                actor_id,
+                catalog,
+                catalog_version,
+            )
+            for actor_id in _PRODUCTION_ACTOR_ROLES
+        }
+        return [
+            resolved[selected_investigator_id],
+            *(resolved[actor_id] for actor_id in _NPC_ACTOR_IDS),
+        ]
+
+    def _build_actor(
+        self,
+        template: Mapping[str, Any],
+        actor_id: str,
+        catalog: Mapping[str, Any],
+        catalog_version: str,
+    ) -> dict[str, Any]:
+        role = _PRODUCTION_ACTOR_ROLES[actor_id]
+        if template.get("role") != role:
+            raise AgenticSessionSourceError("角色模板 role 与稳定 actor_id 不一致")
+        expected_fields = (
+            _INVESTIGATOR_TEMPLATE_FIELDS
+            if role == "investigator"
+            else _ACTOR_TEMPLATE_FIELDS
+        )
+        if set(template) != expected_fields:
+            raise AgenticSessionSourceError("角色模板字段无效")
+        if role == "investigator":
+            self._required_string(template.get("choice_label"), "choice_label")
+            self._required_string(
+                template.get("suggested_display_name"),
+                "suggested_display_name",
+            )
 
         attributes = self._integer_map(template.get("attributes"), "attributes")
         expected_attributes = {
@@ -1549,19 +1695,27 @@ class AgenticSessionStore:
         skills = {
             key: self._base_skill_value(key, value, attributes)
             for key, value in skill_definitions.items()
+            if key not in _SETTING_SKILL_KEYS
         }
         overrides = self._integer_map(
             template.get("skill_overrides"),
             "skill_overrides",
         )
-        unknown_overrides = set(overrides).difference(skills)
+        unknown_overrides = set(overrides).difference(skill_definitions)
         if unknown_overrides:
             raise AgenticSessionSourceError("角色模板包含未知技能键")
+        expected_setting_skills = {
+            key
+            for key, owners in _SETTING_SKILL_OWNERS.items()
+            if actor_id in owners
+        }
+        if set(overrides).intersection(_SETTING_SKILL_KEYS) != expected_setting_skills:
+            raise AgenticSessionSourceError("角色模板 setting skill 归属无效")
         skills.update(overrides)
 
         return {
             "actor_id": actor_id,
-            "role": "investigator",
+            "role": role,
             "skill_catalog_version": catalog_version,
             "attributes": attributes,
             "skills": skills,
@@ -1570,6 +1724,55 @@ class AgenticSessionStore:
             "luck": self._luck_resource(template.get("luck")),
             "armor": self._bounded_integer(template.get("armor"), "armor", 0, 100),
         }
+
+    @staticmethod
+    def _production_skill_keys(actor_id: object) -> frozenset[str]:
+        setting_skills = {
+            key
+            for key, owners in _SETTING_SKILL_OWNERS.items()
+            if actor_id in owners
+        }
+        return _BASE_SKILL_KEYS | setting_skills
+
+    @classmethod
+    def _validate_skill_catalog(
+        cls,
+        catalog: Mapping[str, Any],
+        catalog_version: str,
+    ) -> None:
+        if (
+            set(catalog) != {"catalog_version", "skills"}
+            or catalog_version != SKILL_CATALOG_VERSION
+        ):
+            raise AgenticSessionSourceError("技能目录版本或根字段无效")
+        skills = catalog.get("skills")
+        if not isinstance(skills, dict) or set(skills) != _SKILL_CATALOG_KEYS:
+            raise AgenticSessionSourceError("技能目录规范键集合无效")
+        for key, definition in skills.items():
+            if not isinstance(definition, dict):
+                raise AgenticSessionSourceError("技能定义必须是对象")
+            expected_fields = {"display_name", "base"}
+            specialty = _SKILL_SPECIALTIES.get(key)
+            if specialty is not None:
+                expected_fields.add("specialty")
+            if set(definition) != expected_fields:
+                raise AgenticSessionSourceError("技能定义字段无效")
+            cls._required_string(definition.get("display_name"), "技能显示名")
+            if specialty is not None and definition.get("specialty") != specialty:
+                raise AgenticSessionSourceError("技能专长编码无效")
+            base = definition.get("base")
+            if not isinstance(base, dict):
+                raise AgenticSessionSourceError("技能基础值定义必须是对象")
+            if key == "dodge":
+                if set(base) != {"kind", "formula"} or (
+                    base.get("kind") != "derived"
+                    or base.get("formula") != "floor(dexterity / 2)"
+                ):
+                    raise AgenticSessionSourceError("闪避派生公式无效")
+            elif set(base) != {"kind", "value"} or base.get("kind") != "fixed":
+                raise AgenticSessionSourceError("技能固定基础值定义无效")
+            else:
+                cls._bounded_integer(base.get("value"), "技能基础值", 0, 100)
 
     @classmethod
     def _base_skill_value(

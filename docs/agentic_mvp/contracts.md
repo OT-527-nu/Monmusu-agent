@@ -34,7 +34,7 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
 
 ```json
 {
-  "schema_version": "agentic-mvp-1",
+  "schema_version": "agentic-mvp-2",
   "game_id": "game_01JXYZ",
   "module_id": "escape_thalarion",
   "skill_catalog_version": "coc7e-agentic-mvp-1",
@@ -82,7 +82,8 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
 - `session_status` 只能是 `ongoing` 或 `complete`。
 - `setup` 在创建游戏时一次写入，之后不可改写；`opening_fact_ids` 必须引用 `facts` 中由该 setup 建立的事实。
 - `skill_catalog_version` 在创建游戏时冻结；每个 `ActorSheet.skill_catalog_version` 必须相同，恢复和机械结算不得读取其他版本。
-- 新建 Increment 3 会话的 `actors` 恰好包含 `selected_investigator_id` 引用的一张 `role: "investigator"` 角色卡，以及 `npc_vespera`、`npc_saphra`、`npc_aranis` 三张 `role: "npc"` 角色卡；另两张未选调查员只留在生产模板目录。旧 schema/version 的最小卡 fixture 按迁移清单的兼容策略处理，不被静默改写。
+- 新建 Increment 3 会话使用 `schema_version: "agentic-mvp-2"`；`actors` 恰好包含 `selected_investigator_id` 引用的一张 `role: "investigator"` 角色卡，以及 `npc_vespera`、`npc_saphra`、`npc_aranis` 三张 `role: "npc"` 角色卡，另两张未选调查员只留在生产模板目录。
+- 历史 `schema_version: "agentic-mvp-1"` 只兼容 Increment 1 的精确单卡形状：选中的 `investigator_tracker` 及其当时已展开的完整技能集合。装载器不把 `v1` 补成四卡，也不把缺卡的 `v2` 猜成历史存档；其他版本与角色集合明确拒绝。
 - `actor_display_names` 在创建游戏时冻结；每个已装载 `ActorSheet` 必须有一个条目，调查员条目必须与 `investigator_profile.display_name` 一致。它只用于稳定显示，不承载人格或机械规则。
 - `investigator_profile.actor_id` 必须等于 `selected_investigator_id`；调查员自定义资料在创建游戏时冻结，不是机械数值，也不自动变成 GM 事实。
 - 同一 `game_id` 同时只有一个写入者；MVP CLI 串行执行回合。
@@ -172,7 +173,7 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
 
 - `role` 只能是 `investigator` 或 `npc`。
 - `attributes` 必须包含 COC 的八项键 `strength`、`constitution`、`size`、`dexterity`、`appearance`、`intelligence`、`power`、`education`，数值为 0 到 100 的整数。
-- `skills` 使用本局冻结目录中的规范化技能键和值；每个值必须是 0 到 100 的整数。角色模板未列但目录允许的技能由装载器从冻结的 COC 基础值或派生公式补齐，进入存档后不再依赖模板文件。GM 只能按名称引用，不能提交基础值。中文显示名不是运行时键。
+- `skills` 使用本局冻结目录中的规范化技能键和值；每个值必须是 0 到 100 的整数。角色模板未列但目录允许的普通技能由装载器从冻结的 COC 基础值或派生公式补齐；setting skill 只有被该角色模板显式覆盖时才进入角色卡。进入存档后不再依赖模板文件。GM 只能按名称引用，不能提交基础值。中文显示名不是运行时键。
 - 规范化键及专长编码以[技能目录](skill_catalog.md)为准，例如 `spot_hidden`、`fighting__brawl`、`language_other__ancient_serpent` 和 `art_craft__rigging`；同一含义不得同时存在多个键。
 - `hp.max` 是 1 到 100 的整数，`hp.current` 是 0 到 `hp.max` 的整数。
 - `san.max`、`san.current` 和 `san.session_loss` 是 0 到 99 的整数，且 `san.current <= san.max`；`luck.current` 是 0 到 99 的整数。

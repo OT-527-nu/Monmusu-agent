@@ -33,6 +33,160 @@
       "san": {"current": 65, "max": 65},
       "luck": {"current": 55},
       "armor": 0
+    },
+    {
+      "actor_id": "investigator_mediator",
+      "role": "investigator",
+      "choice_label": "调停者",
+      "suggested_display_name": "纪澄",
+      "attributes": {
+        "strength": 45,
+        "constitution": 60,
+        "size": 55,
+        "dexterity": 55,
+        "appearance": 70,
+        "intelligence": 65,
+        "power": 60,
+        "education": 65
+      },
+      "skill_overrides": {
+        "charm": 70,
+        "persuade": 65,
+        "psychology": 65,
+        "listen": 55,
+        "spot_hidden": 50,
+        "first_aid": 50,
+        "credit_rating": 40,
+        "stealth": 35,
+        "fighting__brawl": 35,
+        "dodge": 30
+      },
+      "hp": {"current": 11, "max": 11},
+      "san": {"current": 60, "max": 60},
+      "luck": {"current": 60},
+      "armor": 0
+    },
+    {
+      "actor_id": "investigator_mender",
+      "role": "investigator",
+      "choice_label": "修补者",
+      "suggested_display_name": "周潮",
+      "attributes": {
+        "strength": 70,
+        "constitution": 65,
+        "size": 65,
+        "dexterity": 65,
+        "appearance": 45,
+        "intelligence": 60,
+        "power": 55,
+        "education": 55
+      },
+      "skill_overrides": {
+        "mechanical_repair": 60,
+        "locksmith": 55,
+        "electrical_repair": 35,
+        "climb": 60,
+        "swim": 60,
+        "navigate": 50,
+        "spot_hidden": 55,
+        "first_aid": 45,
+        "fighting__brawl": 60,
+        "dodge": 45,
+        "stealth": 35
+      },
+      "hp": {"current": 13, "max": 13},
+      "san": {"current": 55, "max": 55},
+      "luck": {"current": 50},
+      "armor": 0
+    },
+    {
+      "actor_id": "npc_vespera",
+      "role": "npc",
+      "attributes": {
+        "strength": 50,
+        "constitution": 60,
+        "size": 50,
+        "dexterity": 75,
+        "appearance": 55,
+        "intelligence": 65,
+        "power": 65,
+        "education": 45
+      },
+      "skill_overrides": {
+        "spot_hidden": 70,
+        "listen": 65,
+        "stealth": 70,
+        "fighting__brawl": 60,
+        "dodge": 55,
+        "occult": 50,
+        "navigate": 45,
+        "first_aid": 40,
+        "flight": 55
+      },
+      "hp": {"current": 11, "max": 11},
+      "san": {"current": 62, "max": 65},
+      "luck": {"current": 50},
+      "armor": 0
+    },
+    {
+      "actor_id": "npc_saphra",
+      "role": "npc",
+      "attributes": {
+        "strength": 45,
+        "constitution": 55,
+        "size": 65,
+        "dexterity": 50,
+        "appearance": 60,
+        "intelligence": 80,
+        "power": 60,
+        "education": 75
+      },
+      "skill_overrides": {
+        "library_use": 75,
+        "language_other__ancient_serpent": 75,
+        "history": 65,
+        "anthropology": 55,
+        "persuade": 55,
+        "psychology": 50,
+        "spot_hidden": 55,
+        "listen": 45,
+        "dodge": 30,
+        "fighting__brawl": 30
+      },
+      "hp": {"current": 12, "max": 12},
+      "san": {"current": 58, "max": 60},
+      "luck": {"current": 45},
+      "armor": 0
+    },
+    {
+      "actor_id": "npc_aranis",
+      "role": "npc",
+      "attributes": {
+        "strength": 65,
+        "constitution": 60,
+        "size": 60,
+        "dexterity": 65,
+        "appearance": 50,
+        "intelligence": 65,
+        "power": 55,
+        "education": 60
+      },
+      "skill_overrides": {
+        "art_craft__rigging": 75,
+        "mechanical_repair": 70,
+        "locksmith": 60,
+        "climb": 55,
+        "first_aid": 50,
+        "spot_hidden": 55,
+        "listen": 50,
+        "fighting__brawl": 45,
+        "dodge": 40,
+        "stealth": 40
+      },
+      "hp": {"current": 9, "max": 12},
+      "san": {"current": 55, "max": 55},
+      "luck": {"current": 55},
+      "armor": 0
     }
   ]
 }

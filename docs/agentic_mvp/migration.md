@@ -12,7 +12,7 @@ Increment 1 和 Increment 2 已在独立的 opt-in Agentic 路径完成：除了
 
 | 当前区域 | 已有能力 | 与目标设计的差距 | 迁移处理 |
 | --- | --- | --- | --- |
-| [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载 `agentic-mvp-1` 会话聚合、不可变参考快照、角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn`；恢复状态可被新的 SessionStore 重新装载 | 没有面向 CLI 的已有会话发现/选择 interface；启动仍不会自动恢复 | 保持 SessionStore 为本地持久化深模块，只增加真实调用者需要的最小会话发现能力 |
+| [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载会话聚合、不可变参考快照、角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn`；`agentic-mvp-1` 历史单卡与 `agentic-mvp-2` 生产四卡按各自精确形状装载，恢复状态可被新的 SessionStore 重新装载 | 没有面向 CLI 的已有会话发现/选择 interface；启动仍不会自动恢复 | 保持 SessionStore 为本地持久化深模块，只增加真实调用者需要的最小会话发现能力 |
 | [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、`make_check`、动态工具目录、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝 | Ticket 12 仍有 `make_check` 专用 preflight、按 `kind` 分裂公开投影、恢复要求 profile 完全等于构造期 profile；其余四个 COC 工具和完整短篇行为尚未交付 | 在同一 Harness lifecycle seam 补统一 preflight、统一 `PublicMechanic` 和冻结 profile 恢复兼容，再逐项增加后续工具，不拆出第二套 orchestrator |
 | [`agentic_model.py`](../../src/monmusu_agent/agentic_model.py) | `GameMasterModel` 同时有可编程假 adapter 与 OpenAI SDK DeepSeek adapter；non-thinking/thinking、JSON Object、function tools、请求 timeout、稳定错误映射和 thinking `reasoning_content` 恢复传输已接通 | 没有多 provider、自动路由或 fallback；真实质量矩阵尚未运行 | 保持薄 provider seam，不把恢复决策、工具幂等或 provider 路由移入 adapter |
 | [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 启动时总是新建游戏，没有已有会话发现/选择；完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
