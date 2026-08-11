@@ -50,11 +50,12 @@ class ScriptedRandom:
 
 
 @dataclass(frozen=True)
-class DamageCaseRun:
-    """保存普通单次伤害 seam 用例需要观察的结果。"""
+class MechanicCaseRun:
+    """保存普通单次机械 seam 用例需要观察的结果。"""
 
     store: AgenticSessionStore
     game_id: str
+    model: ScriptedGameMasterModel
     result: TurnResult
     session: Mapping[str, Any]
     random_source: ScriptedRandom
@@ -648,27 +649,69 @@ class AgenticHarnessTest(unittest.TestCase):
         dice: tuple[int, ...],
         mechanic_id: str,
         investigator_id: str = "investigator_tracker",
-    ) -> DamageCaseRun:
+    ) -> MechanicCaseRun:
         store, game_id = self._create_session(
             root,
             investigator_id=investigator_id,
         )
         random_source = ScriptedRandom(dice)
+        model = ScriptedGameMasterModel(
+            [
+                self._tool_response(dict(arguments), name="deal_damage"),
+                self._response(self._final_payload()),
+            ]
+        )
         result = AgenticHarness(
             store,
-            ScriptedGameMasterModel(
-                [
-                    self._tool_response(dict(arguments), name="deal_damage"),
-                    self._response(self._final_payload()),
-                ]
-            ),
+            model,
             mechanic_id_factory=lambda: mechanic_id,
             random_source=random_source,
         ).start_turn(game_id, "结算已经成立的伤害。")
         self.assertEqual(result.status, "committed")
-        return DamageCaseRun(
+        return MechanicCaseRun(
             store=store,
             game_id=game_id,
+            model=model,
+            result=result,
+            session=store.load_session(game_id).session,
+            random_source=random_source,
+        )
+
+    def _run_sanity_case(
+        self,
+        root: Path,
+        *,
+        arguments: Mapping[str, object],
+        dice: tuple[int, ...],
+        mechanic_id: str,
+        investigator_id: str = "investigator_tracker",
+        narration: str = "理智结果已经解释。",
+    ) -> MechanicCaseRun:
+        store, game_id = self._create_session(
+            root,
+            investigator_id=investigator_id,
+        )
+        random_source = ScriptedRandom(dice)
+        model = ScriptedGameMasterModel(
+            [
+                self._tool_response(
+                    dict(arguments),
+                    name="make_sanity_check",
+                ),
+                self._response(self._final_payload(narration)),
+            ]
+        )
+        result = AgenticHarness(
+            store,
+            model,
+            mechanic_id_factory=lambda: mechanic_id,
+            random_source=random_source,
+        ).start_turn(game_id, "结算已经成立的恐怖来源。")
+        self.assertEqual(result.status, "committed")
+        return MechanicCaseRun(
+            store=store,
+            game_id=game_id,
+            model=model,
             result=result,
             session=store.load_session(game_id).session,
             random_source=random_source,
@@ -1305,66 +1348,6 @@ class AgenticHarnessTest(unittest.TestCase):
                 [tool["function"]["name"] for tool in model.requests[0].tools],
                 expected,
             )
-
-    def test_unimplemented_sanity_tool_normalizes_before_preflight_rejection(
-        self,
-    ) -> None:
-        """SAN 占位目录项保存规范参数，并按规范参数幂等重放失败。"""
-
-        cases = (
-            (
-                "make_sanity_check",
-                {
-                    "actor_id": "investigator_tracker",
-                    "source": "倒影中的苍白侧脸",
-                    "success_loss": "0",
-                    "failure_loss": "1d6",
-                    "visibility": "public",
-                },
-                {
-                    "actor_id": "investigator_tracker",
-                    "source": "倒影中的苍白侧脸",
-                    "success_loss": "0",
-                    "failure_loss": "1d6",
-                    "visibility": "public",
-                },
-            ),
-        )
-        for tool_name, raw_arguments, expected in cases:
-            with self.subTest(tool_name=tool_name), tempfile.TemporaryDirectory() as temporary:
-                store, game_id = self._create_session(Path(temporary))
-                reordered = dict(reversed(tuple(raw_arguments.items())))
-                model = ScriptedGameMasterModel(
-                    [
-                        self._tool_response(
-                            json.dumps(raw_arguments, ensure_ascii=False),
-                            name=tool_name,
-                        ),
-                        self._tool_response(
-                            json.dumps(reordered, ensure_ascii=False, indent=2),
-                            name=tool_name,
-                        ),
-                        ModelCallError("request_timeout", "stop", retryable=True),
-                    ]
-                )
-                random_source = ScriptedRandom(())
-                result = AgenticHarness(
-                    store,
-                    model,
-                    mechanic_id_factory=lambda: self.fail(
-                        "preflight rejection allocated mechanic ID"
-                    ),
-                    random_source=random_source,
-                ).start_turn(game_id, "我提出一项尚未实现的机械调用。")
-
-                self.assertEqual(result.error_code, "request_timeout")
-                self.assertEqual(random_source.calls, [])
-                incomplete = store.load_session(game_id).session["incomplete_turn"]
-                self.assertEqual(len(incomplete["tool_interactions"]), 1)
-                interaction = incomplete["tool_interactions"][0]
-                self.assertEqual(interaction["arguments"], expected)
-                self.assertEqual(interaction["error"]["code"], "tool_not_implemented")
-                self.assertEqual(incomplete["mechanics"], [])
 
     def test_default_tools_reject_invalid_schema_before_preflight(
         self,
@@ -6380,6 +6363,800 @@ class AgenticHarnessTest(unittest.TestCase):
                 "ToolInteraction 格式无效",
             ):
                 store.load_session(game_id)
+
+    def test_public_failed_sanity_check_commits_selected_loss_and_thresholds(self) -> None:
+        """公开理智失败只抽失败损失，并原子更新 SAN 与本局累计。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            arguments = {
+                "actor_id": "investigator_tracker",
+                "source": "积水倒影中出现了苍白侧脸",
+                "success_loss": "0",
+                "failure_loss": "1d6",
+                "visibility": "public",
+            }
+            random_source = ScriptedRandom((1, 7, 4))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(arguments, name="make_sanity_check"),
+                    self._response(self._final_payload("我的 SAN 仍是 65。")),
+                ]
+            )
+            result = AgenticHarness(
+                store,
+                model,
+                mechanic_id_factory=lambda: "mechanic_sanity",
+                random_source=random_source,
+                clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            ).start_turn(game_id, "倒影中的脸让我意识到它并不属于任何人。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(result.narration, "我的 SAN 仍是 65。")
+            expected_details = {
+                "source": "积水倒影中出现了苍白侧脸",
+                "roll": 71,
+                "target": 65,
+                "outcome": "failure",
+                "loss_expression": "1d6",
+                "loss_rolls": [4],
+                "san_loss": 4,
+                "san_before": 65,
+                "san_after": 61,
+                "session_san_loss": 4,
+                "temporary_insanity_threshold_reached": False,
+                "indefinite_insanity_threshold_crossed": False,
+            }
+            self.assertEqual(
+                result.public_mechanics,
+                (
+                    PublicMechanic(
+                        mechanic_id="mechanic_sanity",
+                        kind="sanity_check",
+                        actor_id="investigator_tracker",
+                        details=expected_details,
+                    ),
+                ),
+            )
+            session = store.load_session(game_id).session
+            self.assertEqual(
+                session["turns"][0]["mechanics"][0],
+                {
+                    "mechanic_id": "mechanic_sanity",
+                    "kind": "sanity_check",
+                    "actor_id": "investigator_tracker",
+                    **expected_details,
+                    "visibility": "public",
+                    "committed_at": "2026-07-27T00:00:00Z",
+                },
+            )
+            self.assertEqual(
+                self._actor(session, "investigator_tracker")["san"],
+                {"current": 61, "max": 65, "session_loss": 4},
+            )
+            tool_result = json.loads(model.requests[1].messages[-1]["content"])
+            self.assertEqual(tool_result["result"]["san_after"], 61)
+            self.assertEqual(tool_result["result"]["session_san_loss"], 4)
+            self.assertEqual(
+                random_source.calls,
+                [(0, 9), (0, 9), (1, 6)],
+            )
+
+    def test_successful_sanity_check_uses_only_fixed_success_loss(self) -> None:
+        """roll 等于 SAN 时成功，固定零损失不抽取未选中的失败骰。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run_sanity_case(
+                Path(directory),
+                arguments={
+                    "actor_id": "investigator_tracker",
+                    "source": "倒影短暂露出不自然的侧脸",
+                    "success_loss": "0",
+                    "failure_loss": "1d6",
+                    "visibility": "public",
+                },
+                dice=(5, 6),
+                mechanic_id="mechanic_sanity_success",
+            )
+            sanity = run.session["turns"][0]["mechanics"][0]
+            self.assertEqual(sanity["roll"], 65)
+            self.assertEqual(sanity["target"], 65)
+            self.assertEqual(sanity["outcome"], "success")
+            self.assertEqual(sanity["loss_expression"], "0")
+            self.assertEqual(sanity["loss_rolls"], [])
+            self.assertEqual(sanity["san_loss"], 0)
+            self.assertEqual(sanity["san_after"], 65)
+            self.assertEqual(sanity["session_san_loss"], 0)
+            self.assertFalse(sanity["temporary_insanity_threshold_reached"])
+            self.assertFalse(sanity["indefinite_insanity_threshold_crossed"])
+            self.assertEqual(run.random_source.calls, [(0, 9), (0, 9)])
+
+    def test_hidden_npc_sanity_updates_frozen_actor_without_player_projection(
+        self,
+    ) -> None:
+        """NPC 可事前隐藏 SAN 机械，完整结果仅供 GM 延续虚构。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run_sanity_case(
+                Path(directory),
+                arguments={
+                    "actor_id": "npc_aranis",
+                    "source": "她独自认出了水下倒影的真实身份",
+                    "success_loss": "0",
+                    "failure_loss": "2",
+                    "visibility": "hidden",
+                },
+                dice=(6, 5),
+                mechanic_id="mechanic_hidden_sanity",
+                narration="她没有解释突然的沉默。",
+            )
+            self.assertEqual(run.result.public_mechanics, ())
+            sanity = run.session["turns"][0]["mechanics"][0]
+            self.assertEqual(sanity["actor_id"], "npc_aranis")
+            self.assertEqual(sanity["roll"], 56)
+            self.assertEqual(sanity["target"], 55)
+            self.assertEqual(sanity["outcome"], "failure")
+            self.assertEqual(sanity["san_loss"], 2)
+            self.assertEqual(sanity["san_after"], 53)
+            self.assertEqual(sanity["session_san_loss"], 2)
+            self.assertEqual(sanity["visibility"], "hidden")
+            self.assertEqual(
+                self._actor(run.session, "npc_aranis")["san"],
+                {"current": 53, "max": 55, "session_loss": 2},
+            )
+            tool_result = json.loads(
+                run.model.requests[1].messages[-1]["content"]
+            )
+            self.assertEqual(tool_result["result"], sanity)
+
+    def test_sanity_thresholds_trigger_only_on_loss_and_first_crossing(self) -> None:
+        """临时阈值按单次损失，不定阈值只在本局累计首次跨越时触发。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            responses: list[ModelResponse] = []
+            for index, loss in enumerate((12, 1, 1), start=1):
+                responses.extend(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "source": f"连续恐怖来源 {index}",
+                                "success_loss": "0",
+                                "failure_loss": str(loss),
+                                "visibility": "public",
+                            },
+                            name="make_sanity_check",
+                            tool_call_id=f"call_sanity_{index}",
+                        ),
+                        self._response(self._final_payload()),
+                    ]
+                )
+            random_source = ScriptedRandom((1, 7, 9, 9, 9, 9))
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(responses),
+                mechanic_id_factory=iter(
+                    ("mechanic_sanity_1", "mechanic_sanity_2", "mechanic_sanity_3")
+                ).__next__,
+                random_source=random_source,
+            )
+
+            for index in range(1, 4):
+                self.assertEqual(
+                    harness.start_turn(game_id, f"面对第 {index} 个恐怖来源。").status,
+                    "committed",
+                )
+
+            session = store.load_session(game_id).session
+            mechanics = [turn["mechanics"][0] for turn in session["turns"]]
+            self.assertEqual(
+                [mechanic["san_before"] for mechanic in mechanics],
+                [65, 53, 52],
+            )
+            self.assertEqual(
+                [mechanic["session_san_loss"] for mechanic in mechanics],
+                [12, 13, 14],
+            )
+            self.assertEqual(
+                [
+                    mechanic["temporary_insanity_threshold_reached"]
+                    for mechanic in mechanics
+                ],
+                [True, False, False],
+            )
+            self.assertEqual(
+                [
+                    mechanic["indefinite_insanity_threshold_crossed"]
+                    for mechanic in mechanics
+                ],
+                [False, True, False],
+            )
+            self.assertEqual(
+                self._actor(session, "investigator_tracker")["san"],
+                {"current": 51, "max": 65, "session_loss": 14},
+            )
+            self.assertEqual(random_source.calls, [(0, 9)] * 6)
+
+    def test_sanity_threshold_boundaries_use_exact_five_and_ceiling(self) -> None:
+        """临时阈值含 5；非整除本局起始 SAN 使用向上取整。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            exact_five = self._run_sanity_case(
+                Path(directory),
+                arguments={
+                    "actor_id": "investigator_tracker",
+                    "source": "单次损失恰好达到临时阈值",
+                    "success_loss": "0",
+                    "failure_loss": "5",
+                    "visibility": "public",
+                },
+                dice=(1, 7),
+                mechanic_id="mechanic_sanity_exact_five",
+            )
+            mechanic = exact_five.session["turns"][0]["mechanics"][0]
+            self.assertEqual(mechanic["san_loss"], 5)
+            self.assertTrue(mechanic["temporary_insanity_threshold_reached"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            session_file = store.session_root / game_id / "session.json"
+            seeded = read_json(session_file)
+            self._actor(seeded, "investigator_tracker")["san"].update(
+                {"current": 56, "session_loss": 10}
+            )
+            write_json_atomic(session_file, seeded)
+            self.assertEqual(
+                self._actor(
+                    store.load_session(game_id).session,
+                    "investigator_tracker",
+                )["san"],
+                {"current": 56, "max": 65, "session_loss": 10},
+            )
+
+            responses: list[ModelResponse] = []
+            for index, loss in enumerate((3, 1), start=1):
+                responses.extend(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "source": f"向上取整阈值来源 {index}",
+                                "success_loss": "0",
+                                "failure_loss": str(loss),
+                                "visibility": "public",
+                            },
+                            name="make_sanity_check",
+                            tool_call_id=f"call_sanity_ceiling_{index}",
+                        ),
+                        self._response(self._final_payload()),
+                    ]
+                )
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(responses),
+                mechanic_id_factory=iter(
+                    ("mechanic_sanity_ceiling_1", "mechanic_sanity_ceiling_2")
+                ).__next__,
+                random_source=ScriptedRandom((1, 7, 1, 7)),
+            )
+
+            self.assertEqual(
+                harness.start_turn(game_id, "面对第一处恐怖。").status,
+                "committed",
+            )
+            self.assertEqual(
+                harness.start_turn(game_id, "面对第二处恐怖。").status,
+                "committed",
+            )
+            mechanics = [
+                turn["mechanics"][0]
+                for turn in store.load_session(game_id).session["turns"]
+            ]
+            self.assertEqual(
+                [item["session_san_loss"] for item in mechanics],
+                [13, 14],
+            )
+            self.assertEqual(
+                [item["indefinite_insanity_threshold_crossed"] for item in mechanics],
+                [False, True],
+            )
+
+    def test_sanity_loss_is_capped_at_current_san(self) -> None:
+        """原始损失超过当前 SAN 时截断到零，不让 SAN 或累计值越界。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run_sanity_case(
+                Path(directory),
+                arguments={
+                    "actor_id": "investigator_tracker",
+                    "source": "无法承受的恐怖真相",
+                    "success_loss": "0",
+                    "failure_loss": "100",
+                    "visibility": "public",
+                },
+                dice=(0, 0),
+                mechanic_id="mechanic_sanity_cap",
+            )
+            sanity = run.session["turns"][0]["mechanics"][0]
+            self.assertEqual(sanity["roll"], 100)
+            self.assertEqual(sanity["san_loss"], 65)
+            self.assertEqual(sanity["san_after"], 0)
+            self.assertEqual(sanity["session_san_loss"], 65)
+            self.assertTrue(sanity["temporary_insanity_threshold_reached"])
+            self.assertTrue(sanity["indefinite_insanity_threshold_crossed"])
+            self.assertEqual(
+                self._actor(run.session, "investigator_tracker")["san"],
+                {"current": 0, "max": 65, "session_loss": 65},
+            )
+            self.assertEqual(run.random_source.calls, [(0, 9), (0, 9)])
+
+    def test_sanity_write_failure_leaves_no_partial_loss_or_mechanic(self) -> None:
+        """理智原子写失败时不扣 SAN、不保存机械或发布玩家事件。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            writes = 0
+
+            def fail_sanity_write(path: Path, value: object) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected sanity write failure")
+                write_json_atomic(path, value)
+
+            published: list[PublicMechanic] = []
+            random_source = ScriptedRandom((1, 7, 4))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "source": "积水倒影中出现了苍白侧脸",
+                                "success_loss": "0",
+                                "failure_loss": "1d6",
+                                "visibility": "public",
+                            },
+                            name="make_sanity_check",
+                        )
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_sanity_write_failure",
+                mechanic_id_factory=lambda: "mechanic_uncommitted_sanity",
+                random_source=random_source,
+                session_writer=fail_sanity_write,
+            ).start_turn(
+                game_id,
+                "倒影中的脸让我意识到它并不属于任何人。",
+                public_mechanic_sink=published.append,
+            )
+
+            self.assertEqual(result.error_code, "tool_commit_failed")
+            self.assertEqual(result.public_mechanics, ())
+            self.assertEqual(published, [])
+            self.assertEqual(random_source.calls, [(0, 9), (0, 9), (1, 6)])
+            session = store.load_session(game_id).session
+            self.assertEqual(
+                self._actor(session, "investigator_tracker")["san"],
+                {"current": 65, "max": 65, "session_loss": 0},
+            )
+            incomplete = session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(incomplete["tool_interactions"], [])
+
+    def test_sanity_replays_once_after_interruption_and_repeated_recovery(
+        self,
+    ) -> None:
+        """SAN 提交后反复恢复只回放同一机械，不重掷或重复扣减。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "source": "积水倒影中出现了苍白侧脸",
+            "success_loss": "0",
+            "failure_loss": "1d6+1",
+            "visibility": "public",
+        }
+        final = self._final_payload("理智结果已经解释。")
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first_random = ScriptedRandom((1, 7, 4))
+            interrupted = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            name="make_sanity_check",
+                            tool_call_id="call_sanity",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after sanity",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_sanity",
+                mechanic_id_factory=lambda: "mechanic_sanity",
+                random_source=first_random,
+            ).start_turn(game_id, "我直视积水里的苍白侧脸。")
+
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            self.assertEqual(first_random.calls, [(0, 9), (0, 9), (1, 6)])
+            before_resume = store.load_session(game_id).session
+            original_sanity = json.loads(
+                json.dumps(before_resume["incomplete_turn"]["mechanics"][0])
+            )
+            self.assertEqual(
+                self._actor(before_resume, "investigator_tracker")["san"],
+                {"current": 60, "max": 65, "session_loss": 5},
+            )
+
+            first_replay_random = ScriptedRandom(())
+            first_resume = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            name="make_sanity_check",
+                            tool_call_id="call_sanity",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after first resume",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "first SAN replay allocated a new mechanic ID"
+                ),
+                random_source=first_replay_random,
+            ).resume_turn(game_id, "turn_sanity")
+
+            self.assertEqual(first_resume.error_code, "request_timeout")
+            self.assertEqual(first_replay_random.calls, [])
+            after_first_resume = store.load_session(game_id).session
+            self.assertEqual(
+                after_first_resume["incomplete_turn"]["mechanics"],
+                [original_sanity],
+            )
+            self.assertEqual(
+                self._actor(after_first_resume, "investigator_tracker")["san"],
+                {"current": 60, "max": 65, "session_loss": 5},
+            )
+
+            second_replay_random = ScriptedRandom(())
+            resumed = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            name="make_sanity_check",
+                            tool_call_id="call_sanity",
+                        ),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "second SAN replay allocated a new mechanic ID"
+                ),
+                random_source=second_replay_random,
+            ).resume_turn(game_id, "turn_sanity")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(second_replay_random.calls, [])
+            session = store.load_session(game_id).session
+            self.assertEqual(session["turns"][0]["mechanics"], [original_sanity])
+            self.assertEqual(
+                self._actor(session, "investigator_tracker")["san"],
+                {"current": 60, "max": 65, "session_loss": 5},
+            )
+            self.assertIsNone(session["incomplete_turn"])
+
+    def test_loader_rejects_tampered_sanity_schema_math_actor_and_visibility(
+        self,
+    ) -> None:
+        """装载时拒绝 SAN schema、算术、角色余额、阈值和公开性篡改。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run_sanity_case(
+                Path(directory),
+                arguments={
+                    "actor_id": "investigator_tracker",
+                    "source": "积水倒影中出现了苍白侧脸",
+                    "success_loss": "0",
+                    "failure_loss": "1d6",
+                    "visibility": "public",
+                },
+                dice=(1, 7, 4),
+                mechanic_id="mechanic_sanity",
+            )
+            session_file = run.store.session_root / run.game_id / "session.json"
+            baseline = read_json(session_file)
+
+            for label in (
+                "extra field",
+                "invalid loss roll",
+                "broken loss math",
+                "broken san arithmetic",
+                "actor san balance",
+                "wrong temporary threshold",
+                "wrong indefinite threshold",
+                "hidden investigator",
+                "boolean numeric",
+            ):
+                with self.subTest(label=label):
+                    tampered = json.loads(json.dumps(baseline))
+                    sanity = tampered["turns"][0]["mechanics"][0]
+                    if label == "extra field":
+                        sanity["unexpected"] = True
+                    elif label == "invalid loss roll":
+                        sanity["loss_rolls"] = [7]
+                    elif label == "broken loss math":
+                        sanity["san_loss"] = 3
+                        sanity["san_after"] = 62
+                        sanity["session_san_loss"] = 3
+                        self._actor(
+                            tampered,
+                            "investigator_tracker",
+                        )["san"].update({"current": 62, "session_loss": 3})
+                    elif label == "broken san arithmetic":
+                        sanity["san_after"] = 60
+                    elif label == "actor san balance":
+                        self._actor(
+                            tampered,
+                            "investigator_tracker",
+                        )["san"]["current"] = 60
+                    elif label == "wrong temporary threshold":
+                        sanity["temporary_insanity_threshold_reached"] = True
+                    elif label == "wrong indefinite threshold":
+                        sanity["indefinite_insanity_threshold_crossed"] = True
+                    elif label == "hidden investigator":
+                        sanity["visibility"] = "hidden"
+                    else:
+                        sanity["san_loss"] = True
+                    write_json_atomic(session_file, tampered)
+                    with self.assertRaisesRegex(
+                        AgenticSessionLoadError,
+                        "CommittedTurn 格式无效|机械与冻结角色卡不一致",
+                    ):
+                        run.store.load_session(run.game_id)
+                    write_json_atomic(session_file, baseline)
+
+    def test_loader_rejects_tampered_sanity_continuity_between_turns(self) -> None:
+        """单条算术仍合法时，也不能断开相邻 SAN 与本局累计链。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            responses: list[ModelResponse] = []
+            for index, loss in enumerate((4, 2), start=1):
+                responses.extend(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "source": f"连续恐怖来源 {index}",
+                                "success_loss": "0",
+                                "failure_loss": str(loss),
+                                "visibility": "public",
+                            },
+                            name="make_sanity_check",
+                            tool_call_id=f"call_sanity_continuity_{index}",
+                        ),
+                        self._response(self._final_payload()),
+                    ]
+                )
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(responses),
+                mechanic_id_factory=iter(
+                    ("mechanic_sanity_continuity_1", "mechanic_sanity_continuity_2")
+                ).__next__,
+                random_source=ScriptedRandom((1, 7, 1, 7)),
+            )
+            self.assertEqual(
+                harness.start_turn(game_id, "面对第一处恐怖。").status,
+                "committed",
+            )
+            self.assertEqual(
+                harness.start_turn(game_id, "面对第二处恐怖。").status,
+                "committed",
+            )
+
+            session_file = store.session_root / game_id / "session.json"
+            tampered = read_json(session_file)
+            second = tampered["turns"][1]["mechanics"][0]
+            second["target"] = 60
+            second["san_before"] = 60
+            second["san_after"] = 58
+            self._actor(
+                tampered,
+                "investigator_tracker",
+            )["san"]["current"] = 58
+            write_json_atomic(session_file, tampered)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "机械与冻结角色卡不一致",
+            ):
+                store.load_session(game_id)
+
+    def test_sanity_binds_selected_loss_and_freezes_unselected_branch(self) -> None:
+        """成功/失败结果绑定所选表达式，未选分支也参与幂等比较。"""
+
+        cases = (
+            (
+                "success",
+                (5, 6, 3),
+                "success_loss",
+                "failure_loss",
+                "1d4",
+                [3],
+                62,
+            ),
+            (
+                "failure",
+                (1, 7, 4),
+                "failure_loss",
+                "success_loss",
+                "1d6",
+                [4],
+                61,
+            ),
+        )
+        for (
+            outcome,
+            dice,
+            selected_field,
+            unselected_field,
+            selected_expression,
+            selected_rolls,
+            san_after,
+        ) in cases:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                arguments = {
+                    "actor_id": "investigator_tracker",
+                    "source": f"{outcome} 分支恐怖来源",
+                    "success_loss": "1d4",
+                    "failure_loss": "1d6",
+                    "visibility": "public",
+                }
+                random_source = ScriptedRandom(dice)
+                first = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                arguments,
+                                name="make_sanity_check",
+                                tool_call_id=f"call_sanity_{outcome}",
+                            ),
+                            ModelCallError(
+                                "request_timeout",
+                                "stop after selected SAN branch",
+                                retryable=True,
+                            ),
+                        ]
+                    ),
+                    turn_id_factory=lambda outcome=outcome: f"turn_sanity_{outcome}",
+                    mechanic_id_factory=(
+                        lambda outcome=outcome: f"mechanic_sanity_{outcome}"
+                    ),
+                    random_source=random_source,
+                ).start_turn(game_id, "结算已经成立的恐怖来源。")
+
+                self.assertEqual(first.error_code, "request_timeout")
+                self.assertEqual(
+                    random_source.calls,
+                    [(0, 9), (0, 9), (1, 4 if outcome == "success" else 6)],
+                )
+                incomplete = store.load_session(game_id).session["incomplete_turn"]
+                sanity = incomplete["mechanics"][0]
+                self.assertEqual(sanity["outcome"], outcome)
+                self.assertEqual(arguments[selected_field], selected_expression)
+                self.assertEqual(sanity["loss_expression"], selected_expression)
+                self.assertEqual(sanity["loss_rolls"], selected_rolls)
+                self.assertEqual(sanity["san_after"], san_after)
+                original_interaction = json.loads(
+                    json.dumps(incomplete["tool_interactions"][0])
+                )
+
+                changed = {**arguments, unselected_field: "2"}
+                replay_random = ScriptedRandom(())
+                replayed = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                changed,
+                                name="make_sanity_check",
+                                tool_call_id=f"call_sanity_{outcome}",
+                            )
+                        ]
+                    ),
+                    mechanic_id_factory=lambda: self.fail(
+                        "changed unselected SAN branch allocated a mechanic ID"
+                    ),
+                    random_source=replay_random,
+                ).resume_turn(game_id, f"turn_sanity_{outcome}")
+
+                self.assertEqual(replayed.error_code, "provider_protocol_error")
+                self.assertEqual(replay_random.calls, [])
+                after_replay = store.load_session(game_id).session["incomplete_turn"]
+                self.assertEqual(
+                    after_replay["tool_interactions"],
+                    [original_interaction],
+                )
+                self.assertEqual(after_replay["mechanics"], [sanity])
+                self.assertEqual(len(after_replay["provider_protocol_errors"]), 1)
+
+    def test_sanity_preflight_rejects_invalid_inputs_before_id_rng_and_san(self) -> None:
+        """理智 schema、角色、可见性与两条表达式都在随机前拒绝。"""
+
+        valid = {
+            "actor_id": "investigator_tracker",
+            "source": "积水倒影中的苍白侧脸",
+            "success_loss": "0",
+            "failure_loss": "1d6",
+            "visibility": "public",
+        }
+        cases = (
+            ("unknown actor", {**valid, "actor_id": "actor_missing"}, "unknown_actor"),
+            ("submitted san result", {**valid, "san_after": 0}, "invalid_arguments"),
+            ("empty source", {**valid, "source": ""}, "invalid_arguments"),
+            ("non-string success loss", {**valid, "success_loss": 0}, "invalid_arguments"),
+            ("unknown visibility", {**valid, "visibility": "secret"}, "invalid_arguments"),
+            ("hidden investigator", {**valid, "visibility": "hidden"}, "invalid_visibility"),
+            ("invalid success expression", {**valid, "success_loss": "21d1"}, "invalid_dice_expression"),
+            ("invalid failure expression", {**valid, "failure_loss": "1d101"}, "invalid_dice_expression"),
+            ("negative theoretical loss", {**valid, "failure_loss": "1d6-2"}, "invalid_dice_expression"),
+        )
+        for label, arguments, expected_code in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                allocated: list[str] = []
+                random_source = ScriptedRandom(())
+                result = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                arguments,
+                                name="make_sanity_check",
+                            ),
+                            ModelCallError(
+                                "request_timeout",
+                                "stop after sanity rejection",
+                                retryable=True,
+                            ),
+                        ]
+                    ),
+                    mechanic_id_factory=lambda allocated=allocated: (
+                        allocated.append("allocated") or "unexpected"
+                    ),
+                    random_source=random_source,
+                ).start_turn(game_id, "结算已经成立的恐怖来源。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(allocated, [])
+                self.assertEqual(random_source.calls, [])
+                session = store.load_session(game_id).session
+                self.assertEqual(
+                    self._actor(session, "investigator_tracker")["san"],
+                    {"current": 65, "max": 65, "session_loss": 0},
+                )
+                incomplete = session["incomplete_turn"]
+                self.assertEqual(incomplete["mechanics"], [])
+                self.assertEqual(
+                    incomplete["tool_interactions"][0]["error"]["code"],
+                    expected_code,
+                )
 
     def test_invalid_make_check_is_persisted_before_same_gm_continues(self) -> None:
         """可关联的工具错误不掷骰，并以完整交互反馈同一个 GM。"""

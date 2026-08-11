@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol
+from itertools import pairwise
+from typing import Any, Mapping, Protocol
 
 MAKE_CHECK_TOOL: dict[str, Any] = {
     "type": "function",
@@ -217,6 +218,27 @@ _DAMAGE_RESULT_FIELDS = frozenset(
         "committed_at",
     }
 )
+_SANITY_RESULT_FIELDS = frozenset(
+    {
+        "mechanic_id",
+        "kind",
+        "actor_id",
+        "source",
+        "roll",
+        "target",
+        "outcome",
+        "loss_expression",
+        "loss_rolls",
+        "san_loss",
+        "san_before",
+        "san_after",
+        "session_san_loss",
+        "temporary_insanity_threshold_reached",
+        "indefinite_insanity_threshold_crossed",
+        "visibility",
+        "committed_at",
+    }
+)
 _DIFFICULTIES = frozenset({"regular", "hard", "extreme"})
 _DECLARED_DIFFICULTY_SUCCESS_LEVEL = {
     "regular": "regular_success",
@@ -395,6 +417,38 @@ class PreparedDamage:
     arguments: Mapping[str, Any]
     dice: PreparedDiceExpression
     actor: DamageActorSnapshot
+    actors: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class SanityActorSnapshot:
+    """保存理智工具从一张冻结角色卡读取的可信数值。"""
+
+    role: str
+    san_current: int
+    san_max: int
+    session_loss: int
+
+
+@dataclass(frozen=True)
+class SanityOutcome:
+    """保存一次 SAN 损失产生的全部数值与阈值。"""
+
+    san_loss: int
+    san_after: int
+    session_san_loss: int
+    temporary_insanity_threshold_reached: bool
+    indefinite_insanity_threshold_crossed: bool
+
+
+@dataclass(frozen=True)
+class PreparedSanityCheck:
+    """冻结理智检定两条损失分支与角色数值。"""
+
+    arguments: Mapping[str, Any]
+    success_loss: PreparedDiceExpression
+    failure_loss: PreparedDiceExpression
+    actor: SanityActorSnapshot
     actors: list[dict[str, Any]]
 
 
@@ -1284,6 +1338,34 @@ def _parse_dice_expression(expression: str) -> PreparedDiceExpression:
     )
 
 
+def _validate_resolved_dice_expression(
+    expression_value: object,
+    rolls_value: object,
+    *,
+    error_message: str,
+) -> tuple[PreparedDiceExpression, list[int], int]:
+    """复核持久化表达式、每颗骰值及其原始总和。"""
+
+    if not isinstance(expression_value, str):
+        raise ValueError(error_message)
+    try:
+        expression = _parse_dice_expression(expression_value)
+    except CocToolError as error:
+        raise ValueError(error_message) from error
+    if (
+        not isinstance(rolls_value, list)
+        or len(rolls_value) != expression.count
+        or any(
+            not isinstance(roll, int)
+            or isinstance(roll, bool)
+            or not 1 <= roll <= expression.sides
+            for roll in rolls_value
+        )
+    ):
+        raise ValueError(error_message)
+    return expression, rolls_value, sum(rolls_value) + expression.modifier
+
+
 def _read_damage_actor_snapshot(
     actors: object,
     actor_id: str,
@@ -1339,6 +1421,71 @@ def _resolve_dice_expression(
         for _ in range(prepared.count)
     ]
     return rolls, sum(rolls) + prepared.modifier
+
+
+def _read_sanity_actor_snapshot(
+    actors: object,
+    actor_id: str,
+) -> SanityActorSnapshot:
+    if not isinstance(actors, list):
+        raise TypeError("冻结角色卡不可用")
+    actor = next(
+        (
+            candidate
+            for candidate in actors
+            if isinstance(candidate, dict)
+            and candidate.get("actor_id") == actor_id
+        ),
+        None,
+    )
+    if actor is None:
+        raise LookupError("未找到理智检定角色")
+    role = actor.get("role")
+    san = actor.get("san")
+    san_current = san.get("current") if isinstance(san, dict) else None
+    san_max = san.get("max") if isinstance(san, dict) else None
+    session_loss = san.get("session_loss") if isinstance(san, dict) else None
+    if (
+        role not in {"investigator", "npc"}
+        or not isinstance(san_current, int)
+        or isinstance(san_current, bool)
+        or not isinstance(san_max, int)
+        or isinstance(san_max, bool)
+        or not isinstance(session_loss, int)
+        or isinstance(session_loss, bool)
+        or not 0 <= san_current <= san_max <= 99
+        or not 0 <= session_loss <= 99
+    ):
+        raise ValueError("冻结角色理智数值不可用")
+    assert isinstance(role, str)
+    return SanityActorSnapshot(
+        role=role,
+        san_current=san_current,
+        san_max=san_max,
+        session_loss=session_loss,
+    )
+
+
+def _calculate_sanity_outcome(
+    *,
+    raw_loss: int,
+    san_before: int,
+    previous_session_loss: int,
+) -> SanityOutcome:
+    san_loss = min(raw_loss, san_before)
+    san_after = san_before - san_loss
+    session_san_loss = previous_session_loss + san_loss
+    session_start_san = san_before + previous_session_loss
+    indefinite_threshold = (session_start_san + 4) // 5
+    return SanityOutcome(
+        san_loss=san_loss,
+        san_after=san_after,
+        session_san_loss=session_san_loss,
+        temporary_insanity_threshold_reached=san_loss >= 5,
+        indefinite_insanity_threshold_crossed=(
+            previous_session_loss < indefinite_threshold <= session_san_loss
+        ),
+    )
 
 
 def _calculate_damage_outcome(
@@ -1467,22 +1614,11 @@ class DealDamageTool:
             "committed_at",
         ):
             _required_string(value.get(field), field)
-        try:
-            expression = _parse_dice_expression(value["damage_expression"])
-        except CocToolError as error:
-            raise ValueError("damage mechanic 格式无效") from error
-        rolls = value.get("rolls")
-        if (
-            not isinstance(rolls, list)
-            or len(rolls) != expression.count
-            or any(
-                not isinstance(roll, int)
-                or isinstance(roll, bool)
-                or not 1 <= roll <= expression.sides
-                for roll in rolls
-            )
-        ):
-            raise ValueError("damage mechanic 格式无效")
+        _, _, resolved_raw_damage = _validate_resolved_dice_expression(
+            value.get("damage_expression"),
+            value.get("rolls"),
+            error_message="damage mechanic 格式无效",
+        )
         raw_damage = value.get("raw_damage")
         armor_applied = value.get("armor_applied")
         damage_taken = value.get("damage_taken")
@@ -1516,7 +1652,7 @@ class DealDamageTool:
         assert isinstance(hp_before, int)
         assert isinstance(hp_after, int)
         if (
-            raw_damage != sum(rolls) + expression.modifier
+            raw_damage != resolved_raw_damage
             or not 0 <= armor_applied <= raw_damage <= 100
             or damage_taken != raw_damage - armor_applied
             or not 0 <= hp_after <= hp_before <= 100
@@ -1643,20 +1779,14 @@ class DealDamageTool:
         }
 
 
-@dataclass(frozen=True)
-class UnimplementedCocTool:
-    """为后续票保留规范目录项，但不提前实现具体 COC 规则。"""
+class MakeSanityCheckTool:
+    """从冻结角色卡执行理智检定并结算所选 SAN 损失分支。"""
 
-    definition: Mapping[str, Any]
-    mechanic_kind: str
-    argument_normalizer: Callable[[str], dict[str, Any]]
-
-    @property
-    def name(self) -> str:
-        return str(self.definition["function"]["name"])
+    definition = MAKE_SANITY_CHECK_TOOL
+    mechanic_kind = "sanity_check"
 
     def normalize(self, arguments_raw: str) -> dict[str, Any]:
-        return self.argument_normalizer(arguments_raw)
+        return normalize_make_sanity_check_arguments(arguments_raw)
 
     def preflight(
         self,
@@ -1665,9 +1795,32 @@ class UnimplementedCocTool:
         actors: object,
         mechanics: tuple[Mapping[str, Any], ...],
         current_turn_mechanics: tuple[Mapping[str, Any], ...],
-    ) -> object:
-        del arguments, actors, mechanics, current_turn_mechanics
-        raise CocToolError("tool_not_implemented", f"工具 {self.name} 尚未实现")
+    ) -> PreparedSanityCheck:
+        del mechanics, current_turn_mechanics
+        if not isinstance(actors, list):
+            raise CocToolError("actor_data_unavailable", "冻结角色卡不可用")
+        frozen_actors = json.loads(json.dumps(actors))
+        try:
+            actor = _read_sanity_actor_snapshot(
+                frozen_actors,
+                arguments["actor_id"],
+            )
+        except LookupError as error:
+            raise CocToolError("unknown_actor", "未找到理智检定角色") from error
+        except (TypeError, ValueError) as error:
+            raise CocToolError(
+                "actor_data_unavailable",
+                "冻结角色理智数值不可用",
+            ) from error
+        if actor.role == "investigator" and arguments["visibility"] != "public":
+            raise CocToolError("invalid_visibility", "调查员 SAN 变化必须公开")
+        return PreparedSanityCheck(
+            arguments=dict(arguments),
+            success_loss=_parse_dice_expression(arguments["success_loss"]),
+            failure_loss=_parse_dice_expression(arguments["failure_loss"]),
+            actor=actor,
+            actors=frozen_actors,
+        )
 
     def execute(
         self,
@@ -1677,48 +1830,238 @@ class UnimplementedCocTool:
         random_source: RandomSource,
         committed_at: str,
     ) -> ToolExecution:
-        del prepared, mechanic_id, random_source, committed_at
-        raise ValueError("未实现工具不应进入 execute")
+        if not isinstance(prepared, PreparedSanityCheck):
+            raise TypeError("make_sanity_check 冻结输入无效")
+        roll = _roll_d100(random_source, "none", 0)
+        outcome_label = (
+            "success"
+            if roll <= prepared.actor.san_current
+            else "failure"
+        )
+        selected_loss = (
+            prepared.success_loss
+            if outcome_label == "success"
+            else prepared.failure_loss
+        )
+        loss_rolls, raw_loss = _resolve_dice_expression(
+            selected_loss,
+            random_source,
+        )
+        outcome = _calculate_sanity_outcome(
+            raw_loss=raw_loss,
+            san_before=prepared.actor.san_current,
+            previous_session_loss=prepared.actor.session_loss,
+        )
+        updated_actors = json.loads(json.dumps(prepared.actors))
+        actor = next(
+            candidate
+            for candidate in updated_actors
+            if candidate.get("actor_id") == prepared.arguments["actor_id"]
+        )
+        actor["san"]["current"] = outcome.san_after
+        actor["san"]["session_loss"] = outcome.session_san_loss
+        return ToolExecution(
+            mechanic={
+                "mechanic_id": mechanic_id,
+                "kind": "sanity_check",
+                "actor_id": prepared.arguments["actor_id"],
+                "source": prepared.arguments["source"],
+                "roll": roll,
+                "target": prepared.actor.san_current,
+                "outcome": outcome_label,
+                "loss_expression": selected_loss.expression,
+                "loss_rolls": loss_rolls,
+                "san_loss": outcome.san_loss,
+                "san_before": prepared.actor.san_current,
+                "san_after": outcome.san_after,
+                "session_san_loss": outcome.session_san_loss,
+                "temporary_insanity_threshold_reached": (
+                    outcome.temporary_insanity_threshold_reached
+                ),
+                "indefinite_insanity_threshold_crossed": (
+                    outcome.indefinite_insanity_threshold_crossed
+                ),
+                "visibility": prepared.arguments["visibility"],
+                "committed_at": committed_at,
+            },
+            actors=updated_actors,
+        )
 
-    def validate_result(self, value: object) -> None:
-        del value
-        raise ValueError(f"工具 {self.name} 尚未实现")
+    @staticmethod
+    def validate_result(value: object) -> None:
+        if not isinstance(value, dict) or set(value) != _SANITY_RESULT_FIELDS:
+            raise ValueError("sanity mechanic 格式无效")
+        for field in (
+            "mechanic_id",
+            "actor_id",
+            "source",
+            "loss_expression",
+            "committed_at",
+        ):
+            _required_string(value.get(field), field)
+        _, _, raw_loss = _validate_resolved_dice_expression(
+            value.get("loss_expression"),
+            value.get("loss_rolls"),
+            error_message="sanity mechanic 格式无效",
+        )
+        roll = value.get("roll")
+        target = value.get("target")
+        san_loss = value.get("san_loss")
+        san_before = value.get("san_before")
+        san_after = value.get("san_after")
+        session_san_loss = value.get("session_san_loss")
+        numeric_fields = (
+            roll,
+            target,
+            san_loss,
+            san_before,
+            san_after,
+            session_san_loss,
+        )
+        if (
+            value.get("kind") != "sanity_check"
+            or value.get("visibility") not in {"public", "hidden"}
+            or value.get("outcome") not in {"success", "failure"}
+            or any(
+                not isinstance(number, int) or isinstance(number, bool)
+                for number in numeric_fields
+            )
+            or any(
+                not isinstance(value.get(field), bool)
+                for field in (
+                    "temporary_insanity_threshold_reached",
+                    "indefinite_insanity_threshold_crossed",
+                )
+            )
+        ):
+            raise ValueError("sanity mechanic 格式无效")
+        assert isinstance(roll, int)
+        assert isinstance(target, int)
+        assert isinstance(san_loss, int)
+        assert isinstance(san_before, int)
+        assert isinstance(san_after, int)
+        assert isinstance(session_san_loss, int)
+        previous_session_loss = session_san_loss - san_loss
+        expected = _calculate_sanity_outcome(
+            raw_loss=raw_loss,
+            san_before=san_before,
+            previous_session_loss=previous_session_loss,
+        )
+        if (
+            not 1 <= roll <= 100
+            or not 0 <= target <= 99
+            or target != san_before
+            or value.get("outcome")
+            != ("success" if roll <= target else "failure")
+            or not 0 <= san_before <= 99
+            or not 0 <= previous_session_loss <= 99
+            or not 0 <= session_san_loss <= 99
+            or san_loss != expected.san_loss
+            or san_after != expected.san_after
+            or session_san_loss != expected.session_san_loss
+            or value.get("temporary_insanity_threshold_reached")
+            is not expected.temporary_insanity_threshold_reached
+            or value.get("indefinite_insanity_threshold_crossed")
+            is not expected.indefinite_insanity_threshold_crossed
+        ):
+            raise ValueError("sanity mechanic 格式无效")
 
+    @staticmethod
     def validate_result_arguments(
-        self,
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
         *,
         actors: object,
     ) -> None:
-        del arguments, value, actors
-        raise ValueError(f"工具 {self.name} 尚未实现")
+        del actors
+        try:
+            _parse_dice_expression(arguments["success_loss"])
+            _parse_dice_expression(arguments["failure_loss"])
+        except (CocToolError, KeyError, TypeError) as error:
+            raise ValueError("sanity mechanic 与规范参数不一致") from error
+        selected_expression = (
+            arguments.get("success_loss")
+            if value.get("outcome") == "success"
+            else arguments.get("failure_loss")
+        )
+        if (
+            arguments.get("actor_id") != value.get("actor_id")
+            or arguments.get("source") != value.get("source")
+            or arguments.get("visibility") != value.get("visibility")
+            or selected_expression != value.get("loss_expression")
+        ):
+            raise ValueError("sanity mechanic 与规范参数不一致")
 
+    @staticmethod
     def validate_persistence(
-        self,
         value: Mapping[str, Any],
         *,
         actors: object,
         mechanics: tuple[Mapping[str, Any], ...],
     ) -> None:
-        del value, actors, mechanics
-        raise ValueError(f"工具 {self.name} 尚未实现")
+        MakeSanityCheckTool.validate_result(value)
+        try:
+            actor = _read_sanity_actor_snapshot(
+                actors,
+                value["actor_id"],
+            )
+        except (LookupError, TypeError, ValueError) as error:
+            raise ValueError("sanity mechanic 与冻结角色卡不一致") from error
+        related = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("kind") == "sanity_check"
+            and mechanic.get("actor_id") == value.get("actor_id")
+        ]
+        if (
+            actor.role == "investigator"
+            and value.get("visibility") != "public"
+            or len(
+                [
+                    mechanic
+                    for mechanic in related
+                    if mechanic.get("mechanic_id") == value.get("mechanic_id")
+                ]
+            )
+            != 1
+            or any(
+                previous.get("san_after") != current.get("san_before")
+                or previous.get("session_san_loss")
+                != current["session_san_loss"] - current["san_loss"]
+                for previous, current in pairwise(related)
+            )
+            or not related
+            or actor.san_current != related[-1].get("san_after")
+            or actor.session_loss != related[-1].get("session_san_loss")
+        ):
+            raise ValueError("sanity mechanic 与冻结角色卡不一致")
 
-    def public_details(self, value: Mapping[str, Any]) -> Mapping[str, Any]:
-        del value
-        raise ValueError(f"工具 {self.name} 尚未实现")
-
+    @staticmethod
+    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            key: value[key]
+            for key in (
+                "source",
+                "roll",
+                "target",
+                "outcome",
+                "loss_expression",
+                "loss_rolls",
+                "san_loss",
+                "san_before",
+                "san_after",
+                "session_san_loss",
+                "temporary_insanity_threshold_reached",
+                "indefinite_insanity_threshold_crossed",
+            )
+        }
 
 DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {
     "make_check": MakeCheckTool(),
     "push_check": PushCheckTool(),
     "spend_luck": SpendLuckTool(),
     "deal_damage": DealDamageTool(),
-    "make_sanity_check": UnimplementedCocTool(
-        MAKE_SANITY_CHECK_TOOL,
-        "sanity_check",
-        normalize_make_sanity_check_arguments,
-    ),
+    "make_sanity_check": MakeSanityCheckTool(),
 }
 
 
