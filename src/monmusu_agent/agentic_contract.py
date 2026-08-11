@@ -200,6 +200,7 @@ def run_deepseek_contract(
     profile = deepseek_model_profile(
         model_id="deepseek-v4-flash",
         thinking=False,
+        enabled_tools=("make_check",),
     )
     store = AgenticSessionStore(session_root=session_root)
     records: list[Mapping[str, Any]] = []
@@ -306,6 +307,7 @@ def _run_recovery_scenario(
     profile = deepseek_model_profile(
         model_id="deepseek-v4-flash",
         thinking=scenario.thinking,
+        enabled_tools=("make_check",),
     )
     created = store.create_session(
         NewSessionRequest(
@@ -1132,31 +1134,34 @@ def _sanitized_tool_calls(
 
 def _public_mechanic(mechanic: Any) -> dict[str, Any]:
     if isinstance(mechanic, Mapping):
+        details = mechanic.get("details")
+        if not isinstance(details, Mapping):
+            details = {
+                key: copy.deepcopy(mechanic[key])
+                for key in (
+                    "ability",
+                    "ability_value",
+                    "difficulty",
+                    "target",
+                    "dice_adjustment",
+                    "roll",
+                    "success_level",
+                    "action",
+                    "stakes",
+                )
+                if key in mechanic
+            }
         return {
             "mechanic_id": mechanic["mechanic_id"],
+            "kind": mechanic["kind"],
             "actor_id": mechanic["actor_id"],
-            "ability": mechanic["ability"],
-            "ability_value": mechanic["ability_value"],
-            "difficulty": mechanic["difficulty"],
-            "target": mechanic["target"],
-            "dice_adjustment": copy.deepcopy(dict(mechanic["dice_adjustment"])),
-            "roll": mechanic["roll"],
-            "success_level": mechanic["success_level"],
-            "action": mechanic["action"],
-            "stakes": mechanic["stakes"],
+            "details": copy.deepcopy(dict(details)),
         }
     return {
         "mechanic_id": mechanic.mechanic_id,
+        "kind": mechanic.kind,
         "actor_id": mechanic.actor_id,
-        "ability": mechanic.ability,
-        "ability_value": mechanic.ability_value,
-        "difficulty": mechanic.difficulty,
-        "target": mechanic.target,
-        "dice_adjustment": copy.deepcopy(dict(mechanic.dice_adjustment)),
-        "roll": mechanic.roll,
-        "success_level": mechanic.success_level,
-        "action": mechanic.action,
-        "stakes": mechanic.stakes,
+        "details": mechanic.details_as_json(),
     }
 
 

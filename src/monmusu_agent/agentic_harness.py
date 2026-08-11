@@ -16,9 +16,8 @@ from uuid import uuid4
 from monmusu_agent.agentic_coc import (
     DEFAULT_COC_TOOLS,
     CocTool,
-    MakeCheckError,
+    CocToolError,
     RandomSource,
-    prepare_make_check,
 )
 from monmusu_agent.agentic_model import (
     GameMasterModel,
@@ -132,31 +131,49 @@ class PublicFactChange:
     text: str
 
 
+def _freeze_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
+
+
+def _copy_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _copy_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_copy_json_value(item) for item in value]
+    return copy.deepcopy(value)
+
+
 @dataclass(frozen=True)
 class PublicMechanic:
-    """只携带允许 CLI 展示的已提交公开检定。"""
-
-    mechanic_id: str
-    actor_id: str
-    ability: str
-    ability_value: int
-    difficulty: str
-    target: int
-    dice_adjustment: Mapping[str, Any]
-    roll: int
-    success_level: str
-    action: str
-    stakes: str
-
-
-@dataclass(frozen=True)
-class PublicToolMechanic:
-    """公开非检定机械的不可变通用投影。"""
+    """统一携带允许 CLI 展示的已提交公开机械。"""
 
     mechanic_id: str
     kind: str
     actor_id: str
     details: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.details, Mapping):
+            raise TypeError("PublicMechanic.details 必须是映射")
+        object.__setattr__(
+            self,
+            "details",
+            cast(
+                Mapping[str, Any],
+                _freeze_json_value(_copy_json_value(self.details)),
+            ),
+        )
+
+    def details_as_json(self) -> dict[str, Any]:
+        """返回供玩家输出或脱敏证据序列化的独立 JSON 对象。"""
+
+        return cast(dict[str, Any], _copy_json_value(self.details))
 
 
 @dataclass(frozen=True)
@@ -166,7 +183,7 @@ class TurnResult:
     status: Literal["committed", "interrupted"]
     turn_id: str
     narration: str | None
-    public_mechanics: tuple[PublicMechanic | PublicToolMechanic, ...]
+    public_mechanics: tuple[PublicMechanic, ...]
     public_fact_changes: tuple[PublicFactChange, ...]
     error_code: str | None
     error_message: str | None
@@ -180,7 +197,7 @@ class SessionLifecycleView:
     technical_status: Literal["ready", "interrupted", "complete"]
     has_incomplete_turn: bool
     turn_id: str | None
-    public_mechanics: tuple[PublicMechanic | PublicToolMechanic, ...]
+    public_mechanics: tuple[PublicMechanic, ...]
     error_code: str | None
     error_message: str | None
 
@@ -262,18 +279,45 @@ class AgenticHarness:
                 selected_profile,
                 enabled_tools=tuple(profile_tools),
             )
-            self.enabled_tools = {
+            self.default_tools = {
                 name: self.tool_registry[name] for name in profile_tools
             }
         except ModelProfileValidationError as error:
             raise AgenticTurnInputError(str(error)) from error
+
+    def _tools_for_profile(
+        self,
+        profile: object,
+    ) -> dict[str, CocTool]:
+        """从完整注册表解析一个已冻结 profile 的工具子集。"""
+
+        if not isinstance(profile, Mapping):
+            raise AgenticTurnInputError("model_profile 格式无效")
+        enabled_tools = profile.get("enabled_tools")
+        if not isinstance(enabled_tools, list) or not enabled_tools:
+            raise AgenticTurnInputError("model_profile.enabled_tools 格式无效")
+        try:
+            validated_profile = validated_model_profile(
+                profile,
+                enabled_tools=tuple(enabled_tools),
+            )
+        except ModelProfileValidationError as error:
+            raise AgenticTurnInputError(str(error)) from error
+        if validated_profile["provider"] != self.model_profile["provider"]:
+            raise AgenticTurnInputError("model_profile.provider 当前不可用")
+        unknown_tools = [name for name in enabled_tools if name not in self.tool_registry]
+        if unknown_tools:
+            raise AgenticTurnInputError(
+                f"model_profile 启用了未注册工具 {unknown_tools[0]}"
+            )
+        return {name: self.tool_registry[name] for name in enabled_tools}
 
     def start_turn(
         self,
         game_id: str,
         player_input: str,
         *,
-        public_mechanic_sink: Callable[[PublicMechanic | PublicToolMechanic], None] | None = None,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
     ) -> TurnResult:
         """开始新回合，并委托一个有界的单次 GM 执行尝试。"""
 
@@ -337,7 +381,19 @@ class AgenticHarness:
             )
 
         assert isinstance(incomplete, dict)
-        public_mechanics_list: list[PublicMechanic | PublicToolMechanic] = []
+        try:
+            profile_tools = self._tools_for_profile(incomplete["model_profile"])
+        except AgenticTurnInputError:
+            return SessionLifecycleView(
+                session_status="ongoing",
+                technical_status="interrupted",
+                has_incomplete_turn=True,
+                turn_id=cast(str, incomplete["turn_id"]),
+                public_mechanics=(),
+                error_code="recovery_unavailable",
+                error_message="冻结的模型运行配置当前不可用，需要修复后恢复",
+            )
+        public_mechanics_list: list[PublicMechanic] = []
         for mechanic in incomplete["mechanics"]:
             if mechanic["visibility"] != "public":
                 continue
@@ -346,7 +402,7 @@ class AgenticHarness:
                 for item in incomplete["tool_interactions"]
                 if item.get("result") == mechanic
             )
-            tool = self.enabled_tools.get(interaction["tool_name"])
+            tool = profile_tools.get(interaction["tool_name"])
             if tool is None:
                 raise AgenticTurnInputError(
                     f"恢复记录需要未启用工具 {interaction['tool_name']}"
@@ -376,7 +432,7 @@ class AgenticHarness:
         game_id: str,
         turn_id: str,
         *,
-        public_mechanic_sink: Callable[[PublicMechanic | PublicToolMechanic], None] | None = None,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
     ) -> TurnResult:
         """以明确 ID 恢复同一未完成回合，并开启新的有界尝试。"""
 
@@ -386,8 +442,10 @@ class AgenticHarness:
         incomplete = current["incomplete_turn"]
         if incomplete is None or incomplete.get("turn_id") != recovery_turn_id:
             raise AgenticTurnBlockedError("指定回合当前不可恢复")
-        if incomplete["model_profile"] != self.model_profile:
-            raise AgenticTurnBlockedError("冻结的模型运行配置当前不可用")
+        try:
+            self._tools_for_profile(incomplete["model_profile"])
+        except AgenticTurnInputError as error:
+            raise AgenticTurnBlockedError("冻结的模型运行配置当前不可用") from error
 
         attempt_started = self.clock()
         attempt_started_at = self._timestamp(attempt_started)
@@ -414,7 +472,7 @@ class AgenticHarness:
         working: dict[str, Any],
         attempt_started: datetime,
         *,
-        public_mechanic_sink: Callable[[PublicMechanic | PublicToolMechanic], None] | None = None,
+        public_mechanic_sink: Callable[[PublicMechanic], None] | None = None,
     ) -> TurnResult:
         """执行已准备的新回合或恢复尝试。"""
 
@@ -423,8 +481,9 @@ class AgenticHarness:
         turn_id = cast(str, incomplete["turn_id"])
         action = cast(str, incomplete["player_input"])
         profile = cast(dict[str, Any], incomplete["model_profile"])
+        profile_tools = self._tools_for_profile(profile)
         limits = cast(dict[str, int], incomplete["attempt_limits"])
-        public_mechanics: list[PublicMechanic | PublicToolMechanic] = []
+        public_mechanics: list[PublicMechanic] = []
         attempt_deadline = attempt_started + timedelta(
             seconds=limits["attempt_timeout_seconds"]
         )
@@ -459,7 +518,7 @@ class AgenticHarness:
                 tools=()
                 if repair_pending
                 else tuple(
-                    copy.deepcopy(dict(self.enabled_tools[name].definition))
+                    copy.deepcopy(dict(profile_tools[name].definition))
                     for name in profile["enabled_tools"]
                 ),
                 request_timeout_seconds=min(
@@ -569,6 +628,7 @@ class AgenticHarness:
                             loaded,
                             working,
                             assistant_message,
+                            profile_tools=profile_tools,
                             thinking=profile["thinking"],
                         )
                     except _FinalValidationError:
@@ -619,6 +679,7 @@ class AgenticHarness:
                             loaded,
                             working,
                             assistant_message,
+                            profile_tools=profile_tools,
                             thinking=profile["thinking"],
                         )
                     except _FinalValidationError:
@@ -845,6 +906,7 @@ class AgenticHarness:
         working: dict[str, Any],
         assistant_message: Mapping[str, Any],
         *,
+        profile_tools: Mapping[str, CocTool],
         thinking: bool,
     ) -> dict[str, Any]:
         tool_calls = assistant_message["tool_calls"]
@@ -878,6 +940,11 @@ class AgenticHarness:
                         existing_interaction,
                         tool_name,
                         arguments_raw,
+                        normalizer=(
+                            profile_tools[tool_name].normalize
+                            if tool_name in profile_tools
+                            else None
+                        ),
                     )
                     or existing_interaction.get("ok") is not False
                     or existing_interaction.get("error") != error
@@ -887,11 +954,18 @@ class AgenticHarness:
                     self._tool_message(existing_interaction)
                 )
                 continue
+            arguments: dict[str, Any] | None = None
+            tool = profile_tools.get(tool_name)
+            if tool is not None:
+                try:
+                    arguments = tool.normalize(arguments_raw)
+                except (CocToolError, TypeError, ValueError):
+                    pass
             interaction = {
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
                 "arguments_raw": arguments_raw,
-                "arguments": None,
+                "arguments": copy.deepcopy(arguments),
                 "ok": False,
                 "result": None,
                 "error": copy.deepcopy(error),
@@ -918,7 +992,7 @@ class AgenticHarness:
         player_input: str,
         final: _ValidatedFinal,
         attempt_deadline: datetime,
-        public_mechanics: tuple[PublicMechanic | PublicToolMechanic, ...],
+        public_mechanics: tuple[PublicMechanic, ...],
     ) -> TurnResult:
         if self._remaining_seconds(attempt_deadline) <= 0:
             return self._interrupt(
@@ -988,7 +1062,7 @@ class AgenticHarness:
         code: str,
         message: str,
         *,
-        public_mechanics: tuple[PublicMechanic | PublicToolMechanic, ...] = (),
+        public_mechanics: tuple[PublicMechanic, ...] = (),
     ) -> TurnResult:
         incomplete = working["incomplete_turn"]
         assert isinstance(incomplete, dict)
@@ -1026,8 +1100,9 @@ class AgenticHarness:
         working: dict[str, Any],
         assistant_message: Mapping[str, Any],
         *,
+        profile_tools: Mapping[str, CocTool],
         thinking: bool,
-    ) -> tuple[dict[str, Any], PublicMechanic | PublicToolMechanic | None]:
+    ) -> tuple[dict[str, Any], PublicMechanic | None]:
         tool_calls = assistant_message["tool_calls"]
         if (
             assistant_message.get("content") is not None
@@ -1078,8 +1153,8 @@ class AgenticHarness:
                 tool_name,
                 arguments_raw,
                 normalizer=(
-                    self.enabled_tools[tool_name].normalize
-                    if tool_name in self.enabled_tools
+                    profile_tools[tool_name].normalize
+                    if tool_name in profile_tools
                     else None
                 ),
             ):
@@ -1111,7 +1186,7 @@ class AgenticHarness:
         updated_actors: list[dict[str, Any]] | None = None
         public_details: Mapping[str, Any] | None = None
         error: dict[str, str] | None = None
-        tool = self.enabled_tools.get(tool_name)
+        tool = profile_tools.get(tool_name)
         if tool is None:
             error = {
                 "code": "unknown_tool",
@@ -1120,8 +1195,16 @@ class AgenticHarness:
         else:
             try:
                 arguments = tool.normalize(arguments_raw)
-                if tool_name == "make_check":
-                    prepare_make_check(arguments, working["actors"])
+                prior_mechanics = tuple(
+                    item
+                    for turn in working["turns"]
+                    for item in turn["mechanics"]
+                ) + tuple(incomplete["mechanics"])
+                prepared = tool.preflight(
+                    copy.deepcopy(arguments),
+                    actors=copy.deepcopy(working["actors"]),
+                    mechanics=copy.deepcopy(prior_mechanics),
+                )
                 mechanic_id = self._new_identifier(
                     self.mechanic_id_factory(),
                     "mechanic_id",
@@ -1136,16 +1219,9 @@ class AgenticHarness:
                 )
                 if mechanic_id in existing_ids:
                     raise AgenticTurnError("mechanic_id 与既有机械冲突")
-                prior_mechanics = tuple(
-                    item
-                    for turn in working["turns"]
-                    for item in turn["mechanics"]
-                ) + tuple(incomplete["mechanics"])
                 expected_committed_at = self._timestamp(self.clock())
                 execution = tool.execute(
-                    arguments,
-                    actors=copy.deepcopy(working["actors"]),
-                    mechanics=prior_mechanics,
+                    prepared,
                     mechanic_id=mechanic_id,
                     random_source=self.random_source,
                     committed_at=expected_committed_at,
@@ -1181,7 +1257,7 @@ class AgenticHarness:
                         raise ValueError("工具公开投影包含未提交字段")
                 mechanic = execution_mechanic
                 updated_actors = execution_actors
-            except MakeCheckError as tool_error:
+            except CocToolError as tool_error:
                 error = {"code": tool_error.code, "message": tool_error.message}
             except AgenticTurnError:
                 raise
@@ -1301,28 +1377,12 @@ class AgenticHarness:
     def _public_mechanic(
         mechanic: Mapping[str, Any],
         public_details: Mapping[str, Any] | None,
-    ) -> PublicMechanic | PublicToolMechanic:
-        if mechanic.get("kind") != "check":
-            return PublicToolMechanic(
-                mechanic_id=mechanic["mechanic_id"],
-                kind=mechanic["kind"],
-                actor_id=mechanic["actor_id"],
-                details=MappingProxyType(copy.deepcopy(dict(public_details or {}))),
-            )
+    ) -> PublicMechanic:
         return PublicMechanic(
             mechanic_id=mechanic["mechanic_id"],
+            kind=mechanic["kind"],
             actor_id=mechanic["actor_id"],
-            ability=mechanic["ability"],
-            ability_value=mechanic["ability_value"],
-            difficulty=mechanic["difficulty"],
-            target=mechanic["target"],
-            dice_adjustment=MappingProxyType(
-                copy.deepcopy(mechanic["dice_adjustment"])
-            ),
-            roll=mechanic["roll"],
-            success_level=mechanic["success_level"],
-            action=mechanic["action"],
-            stakes=mechanic["stakes"],
+            details=copy.deepcopy(dict(public_details or {})),
         )
 
     def _assemble_messages(
@@ -1359,7 +1419,7 @@ class AgenticHarness:
             "MODULE_REFERENCE": loaded.module_reference,
             "CHARACTER_REFERENCE": loaded.character_reference,
             "AVAILABLE_TOOLS": [
-                copy.deepcopy(dict(self.enabled_tools[name].definition))
+                copy.deepcopy(dict(self.default_tools[name].definition))
                 for name in self.model_profile["enabled_tools"]
             ],
         }

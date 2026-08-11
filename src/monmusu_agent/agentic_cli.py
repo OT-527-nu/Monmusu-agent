@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Callable
@@ -320,14 +321,14 @@ def _run_session_cli(
 
 
 def _format_public_mechanic(mechanic: PublicMechanic) -> str:
-    adjustment = mechanic.dice_adjustment
+    details = json.dumps(
+        mechanic.details_as_json(),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     return (
-        f"公开检定 | 行动：{mechanic.action} | "
-        f"能力：{mechanic.ability}（{mechanic.ability_value}） | "
-        f"难度：{mechanic.difficulty}（目标 {mechanic.target}） | "
-        f"奖励/惩罚骰：{adjustment['kind']} {adjustment['count']} | "
-        f"事前风险：{mechanic.stakes} | 骰点：{mechanic.roll} | "
-        f"结果：{mechanic.success_level}"
+        f"公开机械 | 类型：{mechanic.kind} | 角色：{mechanic.actor_id} | "
+        f"详情：{details}"
     )
 
 

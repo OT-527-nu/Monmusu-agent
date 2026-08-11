@@ -790,7 +790,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
             self.assertEqual(result.status, "committed")
             self.assertEqual(result.narration, final["narration"])
             self.assertEqual(len(result.public_mechanics), 1)
-            self.assertEqual(result.public_mechanics[0].roll, 43)
+            self.assertEqual(result.public_mechanics[0].details["roll"], 43)
             self.assertEqual(len(completions.requests), 2)
             continuation = completions.requests[1]
             self.assertEqual(continuation["messages"][-2], assistant_tool_call)

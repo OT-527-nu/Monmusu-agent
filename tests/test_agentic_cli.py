@@ -17,7 +17,7 @@ from monmusu_agent.agentic_cli import (
     run_new_session_cli,
     run_turn_cli,
 )
-from monmusu_agent.agentic_harness import AgenticHarness
+from monmusu_agent.agentic_harness import AgenticHarness, PublicMechanic, TurnResult
 from monmusu_agent.agentic_model import (
     GameMasterModel,
     ModelCallError,
@@ -30,6 +30,7 @@ from monmusu_agent.agentic_session import (
     AgenticSessionStore,
     NewSessionRequest,
 )
+from monmusu_agent.storage import write_json_atomic
 
 
 class ForbiddenModelLoop:
@@ -111,9 +112,13 @@ class PersistedMechanicThenFinalModel(GameMasterModel):
         ]:
             raise AssertionError("第二次 GM 请求前机械尚未持久化")
         if self.output != [
-            "公开检定 | 行动：检查牢门铰链 | 能力：spot_hidden（70） | "
-            "难度：regular（目标 70） | 奖励/惩罚骰：none 0 | "
-            "事前风险：失败会错过新鲜刮痕 | 骰点：43 | 结果：regular_success"
+            "公开机械 | 类型：check | 角色：investigator_tracker | 详情："
+            '{"ability": "spot_hidden", "ability_value": 70, '
+            '"action": "检查牢门铰链", '
+            '"dice_adjustment": {"count": 0, "kind": "none"}, '
+            '"difficulty": "regular", "roll": 43, '
+            '"stakes": "失败会错过新鲜刮痕", '
+            '"success_level": "regular_success", "target": 70}'
         ]:
             raise AssertionError("第二次 GM 请求前 CLI 尚未收到公开机械")
         return ModelResponse(
@@ -138,6 +143,62 @@ class PersistedMechanicThenFinalModel(GameMasterModel):
 
 
 class AgenticCliTest(unittest.TestCase):
+    def test_turn_cli_preserves_all_tool_owned_public_details(self) -> None:
+        """同 kind 的不同工具仍完整显示各自选择的公开字段。"""
+
+        class PushProjectionHarness:
+            def start_turn(
+                self,
+                game_id: str,
+                player_input: str,
+                *,
+                public_mechanic_sink: object,
+            ) -> TurnResult:
+                del game_id, player_input
+                assert callable(public_mechanic_sink)
+                public_mechanic_sink(
+                    PublicMechanic(
+                        mechanic_id="mechanic_push_0001",
+                        kind="check",
+                        actor_id="investigator_tracker",
+                        details={
+                            "ability": "locksmith",
+                            "ability_value": 55,
+                            "difficulty": "regular",
+                            "target": 55,
+                            "dice_adjustment": {"kind": "none", "count": 0},
+                            "roll": 42,
+                            "success_level": "regular_success",
+                            "action": "从铰链侧卸门",
+                            "stakes": "门轴会断裂并夹伤手掌",
+                            "pushed_from": "mechanic_check_0001",
+                            "is_pushed": True,
+                        },
+                    )
+                )
+                return TurnResult(
+                    status="committed",
+                    turn_id="turn_0001",
+                    narration="门轴应声脱落。",
+                    public_mechanics=(),
+                    public_fact_changes=(),
+                    error_code=None,
+                    error_message=None,
+                )
+
+        output: list[str] = []
+
+        run_turn_cli(
+            PushProjectionHarness(),  # type: ignore[arg-type]
+            "game_0001",
+            "我从铰链侧卸门。",
+            write_line=output.append,
+        )
+
+        self.assertIn('"pushed_from": "mechanic_check_0001"', output[0])
+        self.assertIn('"is_pushed": true', output[0])
+        self.assertEqual(output[1], "门轴应声脱落。")
+
     def test_startup_discovers_incomplete_session_and_exit_preserves_it(
         self,
     ) -> None:
@@ -411,7 +472,7 @@ class AgenticCliTest(unittest.TestCase):
         )
         rendered = "\n".join(output)
         self.assertIn("只能输入“恢复”或“退出”。", output)
-        self.assertEqual(rendered.count("公开检定 | 行动：检查门锁上的刮痕"), 1)
+        self.assertEqual(rendered.count('"action": "检查门锁上的刮痕"'), 1)
         self.assertEqual(rendered.count("你确认门锁刚被人从外侧打开过。"), 1)
         self.assertEqual(rendered.count("你推门离开石牢。"), 1)
         self.assertNotIn(reasoning_canary, rendered)
@@ -522,14 +583,16 @@ class AgenticCliTest(unittest.TestCase):
                 turn_id_factory=lambda: "turn_profile_mismatch",
                 clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
             ).start_turn(created.game_id, "我检查门锁。")
+            interrupted = json.loads(created.session_file.read_text(encoding="utf-8"))
+            interrupted["incomplete_turn"]["model_profile"]["enabled_tools"] = [
+                "removed_coc_tool"
+            ]
+            write_json_atomic(created.session_file, interrupted)
             before = created.session_file.read_bytes()
             recovery_model = ScriptedGameMasterModel([])
             harness = AgenticHarness(
                 store,
                 recovery_model,
-                model_profile=deepseek_model_profile(
-                    model_id="deepseek-v4-pro"
-                ),
             )
             answers = iter(("1", "恢复", "退出"))
             output: list[str] = []
@@ -550,7 +613,7 @@ class AgenticCliTest(unittest.TestCase):
             "技术中断（recovery_unavailable）：当前运行配置无法恢复该回合；未完成回合已保留",
             rendered,
         )
-        self.assertNotIn("deepseek-v4-pro", rendered)
+        self.assertNotIn("removed_coc_tool", rendered)
         self.assertNotIn("Traceback", rendered)
 
     def test_recovery_startup_filters_all_restricted_incomplete_turn_content(
@@ -698,7 +761,7 @@ class AgenticCliTest(unittest.TestCase):
         rendered = "\n".join(output)
         self.assertEqual(recovery_model.requests, [])
         self.assertEqual(
-            rendered.count("公开检定 | 行动：检查墙缝上的新鲜刮痕"),
+            rendered.count('"action": "检查墙缝上的新鲜刮痕"'),
             1,
         )
         for restricted in (

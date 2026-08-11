@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 MAKE_CHECK_TOOL: dict[str, Any] = {
     "type": "function",
@@ -44,6 +44,99 @@ MAKE_CHECK_TOOL: dict[str, Any] = {
                 },
                 "action": {"type": "string", "minLength": 1},
                 "stakes": {"type": "string", "minLength": 1},
+                "visibility": {
+                    "type": "string",
+                    "enum": ["public", "hidden"],
+                },
+            },
+        },
+    },
+}
+
+PUSH_CHECK_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "push_check",
+        "description": "关联一次失败检定并执行玩家选择的孤注一掷。",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["check_id", "new_approach", "failure_stakes"],
+            "properties": {
+                "check_id": {"type": "string", "minLength": 1},
+                "new_approach": {"type": "string", "minLength": 1},
+                "failure_stakes": {"type": "string", "minLength": 1},
+            },
+        },
+    },
+}
+
+SPEND_LUCK_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "spend_luck",
+        "description": "按玩家明确选择为一次失败检定花费幸运。",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["check_id", "points"],
+            "properties": {
+                "check_id": {"type": "string", "minLength": 1},
+                "points": {"type": "integer", "minimum": 1},
+            },
+        },
+    },
+}
+
+DEAL_DAMAGE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "deal_damage",
+        "description": "按受限伤害表达式结算一次伤害与 HP 变化。",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "actor_id",
+                "damage_expression",
+                "cause",
+                "armor_applies",
+                "visibility",
+            ],
+            "properties": {
+                "actor_id": {"type": "string", "minLength": 1},
+                "damage_expression": {"type": "string", "minLength": 1},
+                "cause": {"type": "string", "minLength": 1},
+                "armor_applies": {"type": "boolean"},
+                "visibility": {
+                    "type": "string",
+                    "enum": ["public", "hidden"],
+                },
+            },
+        },
+    },
+}
+
+MAKE_SANITY_CHECK_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "make_sanity_check",
+        "description": "按恐怖来源及成功/失败损失表达式结算一次 SAN 检定。",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "actor_id",
+                "source",
+                "success_loss",
+                "failure_loss",
+                "visibility",
+            ],
+            "properties": {
+                "actor_id": {"type": "string", "minLength": 1},
+                "source": {"type": "string", "minLength": 1},
+                "success_loss": {"type": "string", "minLength": 1},
+                "failure_loss": {"type": "string", "minLength": 1},
                 "visibility": {
                     "type": "string",
                     "enum": ["public", "hidden"],
@@ -113,17 +206,26 @@ class ToolExecution:
 class CocTool(Protocol):
     """其余 COC 工具接入同一 Harness 生命周期所需的窄接口。"""
 
-    definition: Mapping[str, Any]
-    mechanic_kind: str
+    @property
+    def definition(self) -> Mapping[str, Any]: ...
+
+    @property
+    def mechanic_kind(self) -> str: ...
 
     def normalize(self, arguments_raw: str) -> dict[str, Any]: ...
 
-    def execute(
+    def preflight(
         self,
         arguments: Mapping[str, Any],
         *,
         actors: object,
         mechanics: tuple[Mapping[str, Any], ...],
+    ) -> object: ...
+
+    def execute(
+        self,
+        prepared: object,
+        *,
         mechanic_id: str,
         random_source: RandomSource,
         committed_at: str,
@@ -148,13 +250,16 @@ class CocTool(Protocol):
     def public_details(self, value: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
-class MakeCheckError(ValueError):
+class CocToolError(ValueError):
     """携带可安全返回同一个 GM 的稳定工具错误。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+MakeCheckError = CocToolError
 
 
 @dataclass(frozen=True)
@@ -164,6 +269,14 @@ class PreparedCheck:
     arguments: Mapping[str, Any]
     ability_value: int
     target: int
+
+
+@dataclass(frozen=True)
+class PreparedMakeCheck:
+    """保存 make_check 的领域快照，执行阶段不再读取会话状态。"""
+
+    check: PreparedCheck
+    actors: list[dict[str, Any]]
 
 
 def normalize_make_check_arguments(arguments_raw: str) -> dict[str, Any]:
@@ -298,27 +411,42 @@ class MakeCheckTool:
     def normalize(self, arguments_raw: str) -> dict[str, Any]:
         return normalize_make_check_arguments(arguments_raw)
 
-    def execute(
+    def preflight(
         self,
         arguments: Mapping[str, Any],
         *,
         actors: object,
         mechanics: tuple[Mapping[str, Any], ...],
+    ) -> PreparedMakeCheck:
+        del mechanics
+        check = prepare_make_check(arguments, actors)
+        if not isinstance(actors, list):
+            raise CocToolError("actor_data_unavailable", "冻结角色卡不可用")
+        return PreparedMakeCheck(
+            check=check,
+            actors=json.loads(json.dumps(actors)),
+        )
+
+    def execute(
+        self,
+        prepared: object,
+        *,
         mechanic_id: str,
         random_source: RandomSource,
         committed_at: str,
     ) -> ToolExecution:
-        del mechanics
-        prepared = prepare_make_check(arguments, actors)
+        if not isinstance(prepared, PreparedMakeCheck):
+            raise ValueError("make_check 冻结输入无效")
         mechanic = resolve_prepared_check(
-            prepared,
+            prepared.check,
             mechanic_id=mechanic_id,
             random_source=random_source,
             committed_at=committed_at,
         )
-        if not isinstance(actors, list):
-            raise MakeCheckError("actor_data_unavailable", "冻结角色卡不可用")
-        return ToolExecution(mechanic=mechanic, actors=json.loads(json.dumps(actors)))
+        return ToolExecution(
+            mechanic=mechanic,
+            actors=json.loads(json.dumps(prepared.actors)),
+        )
 
     def validate_result(self, value: object) -> None:
         validate_check_result(value)
@@ -369,7 +497,186 @@ class MakeCheckTool:
         }
 
 
-DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {"make_check": MakeCheckTool()}
+def _parse_tool_arguments(
+    arguments_raw: str,
+    *,
+    fields: frozenset[str],
+    tool_name: str,
+) -> dict[str, Any]:
+    try:
+        value = json.loads(arguments_raw)
+    except json.JSONDecodeError as error:
+        raise CocToolError(
+            "invalid_arguments",
+            f"{tool_name} 参数不是合法 JSON",
+        ) from error
+    if not isinstance(value, dict) or set(value) != fields:
+        raise CocToolError("invalid_arguments", f"{tool_name} 参数字段无效")
+    return value
+
+
+def normalize_push_check_arguments(arguments_raw: str) -> dict[str, Any]:
+    value = _parse_tool_arguments(
+        arguments_raw,
+        fields=frozenset({"check_id", "new_approach", "failure_stakes"}),
+        tool_name="push_check",
+    )
+    return {
+        field: _required_string(value.get(field), field)
+        for field in ("check_id", "new_approach", "failure_stakes")
+    }
+
+
+def normalize_spend_luck_arguments(arguments_raw: str) -> dict[str, Any]:
+    value = _parse_tool_arguments(
+        arguments_raw,
+        fields=frozenset({"check_id", "points"}),
+        tool_name="spend_luck",
+    )
+    points = value.get("points")
+    if not isinstance(points, int) or isinstance(points, bool) or points < 1:
+        raise CocToolError("invalid_arguments", "points 必须是正整数")
+    return {
+        "check_id": _required_string(value.get("check_id"), "check_id"),
+        "points": points,
+    }
+
+
+def normalize_deal_damage_arguments(arguments_raw: str) -> dict[str, Any]:
+    value = _parse_tool_arguments(
+        arguments_raw,
+        fields=frozenset(
+            {
+                "actor_id",
+                "damage_expression",
+                "cause",
+                "armor_applies",
+                "visibility",
+            }
+        ),
+        tool_name="deal_damage",
+    )
+    armor_applies = value.get("armor_applies")
+    visibility = value.get("visibility")
+    if not isinstance(armor_applies, bool):
+        raise CocToolError("invalid_arguments", "armor_applies 必须是布尔值")
+    if visibility not in {"public", "hidden"}:
+        raise CocToolError("invalid_arguments", "visibility 必须是 public 或 hidden")
+    return {
+        "actor_id": _required_string(value.get("actor_id"), "actor_id"),
+        "damage_expression": _required_string(
+            value.get("damage_expression"),
+            "damage_expression",
+        ),
+        "cause": _required_string(value.get("cause"), "cause"),
+        "armor_applies": armor_applies,
+        "visibility": visibility,
+    }
+
+
+def normalize_make_sanity_check_arguments(arguments_raw: str) -> dict[str, Any]:
+    value = _parse_tool_arguments(
+        arguments_raw,
+        fields=frozenset(
+            {"actor_id", "source", "success_loss", "failure_loss", "visibility"}
+        ),
+        tool_name="make_sanity_check",
+    )
+    visibility = value.get("visibility")
+    if visibility not in {"public", "hidden"}:
+        raise CocToolError("invalid_arguments", "visibility 必须是 public 或 hidden")
+    return {
+        field: _required_string(value.get(field), field)
+        for field in ("actor_id", "source", "success_loss", "failure_loss")
+    } | {"visibility": visibility}
+
+
+@dataclass(frozen=True)
+class UnimplementedCocTool:
+    """为后续票保留规范目录项，但不提前实现具体 COC 规则。"""
+
+    definition: Mapping[str, Any]
+    mechanic_kind: str
+    argument_normalizer: Callable[[str], dict[str, Any]]
+
+    @property
+    def name(self) -> str:
+        return str(self.definition["function"]["name"])
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]:
+        return self.argument_normalizer(arguments_raw)
+
+    def preflight(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> object:
+        del arguments, actors, mechanics
+        raise CocToolError("tool_not_implemented", f"工具 {self.name} 尚未实现")
+
+    def execute(
+        self,
+        prepared: object,
+        *,
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution:
+        del prepared, mechanic_id, random_source, committed_at
+        raise ValueError("未实现工具不应进入 execute")
+
+    def validate_result(self, value: object) -> None:
+        del value
+        raise ValueError(f"工具 {self.name} 尚未实现")
+
+    def validate_result_arguments(
+        self,
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> None:
+        del arguments, value
+        raise ValueError(f"工具 {self.name} 尚未实现")
+
+    def validate_persistence(
+        self,
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        del value, actors, mechanics
+        raise ValueError(f"工具 {self.name} 尚未实现")
+
+    def public_details(self, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        del value
+        raise ValueError(f"工具 {self.name} 尚未实现")
+
+
+DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {
+    "make_check": MakeCheckTool(),
+    "push_check": UnimplementedCocTool(
+        PUSH_CHECK_TOOL,
+        "check",
+        normalize_push_check_arguments,
+    ),
+    "spend_luck": UnimplementedCocTool(
+        SPEND_LUCK_TOOL,
+        "luck_spend",
+        normalize_spend_luck_arguments,
+    ),
+    "deal_damage": UnimplementedCocTool(
+        DEAL_DAMAGE_TOOL,
+        "damage",
+        normalize_deal_damage_arguments,
+    ),
+    "make_sanity_check": UnimplementedCocTool(
+        MAKE_SANITY_CHECK_TOOL,
+        "sanity_check",
+        normalize_make_sanity_check_arguments,
+    ),
+}
 
 
 def validate_check_result(value: object) -> None:

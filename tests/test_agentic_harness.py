@@ -11,7 +11,6 @@ from monmusu_agent.agentic_coc import (
     RandomSource,
     ToolExecution,
 )
-
 from monmusu_agent.agentic_harness import (
     AgenticHarness,
     AgenticSessionCompleteError,
@@ -92,25 +91,50 @@ class LifecycleTestTool:
             raise MakeCheckError("invalid_arguments", "测试工具参数值无效")
         return dict(value)
 
-    def execute(
+    def preflight(
         self,
         arguments: Mapping[str, Any],
         *,
         actors: object,
         mechanics: tuple[Mapping[str, Any], ...],
+    ) -> object:
+        del mechanics
+        if not isinstance(actors, list):
+            raise MakeCheckError("actor_data_unavailable", "测试角色卡不可用")
+        frozen_actors = json.loads(json.dumps(actors))
+        actor = next(
+            (
+                item
+                for item in frozen_actors
+                if item["actor_id"] == arguments["actor_id"]
+            ),
+            None,
+        )
+        if actor is None:
+            raise MakeCheckError("unknown_actor", "测试角色不存在")
+        if actor["luck"]["current"] < arguments["amount"]:
+            raise MakeCheckError("insufficient_luck", "测试资源不足")
+        if actor["role"] == "investigator" and arguments["visibility"] != "public":
+            raise MakeCheckError("invalid_visibility", "调查员资源变化必须公开")
+        return {"arguments": dict(arguments), "actors": frozen_actors}
+
+    def execute(
+        self,
+        prepared: object,
+        *,
         mechanic_id: str,
         random_source: RandomSource,
         committed_at: str,
     ) -> ToolExecution:
-        del mechanics, random_source
-        updated = json.loads(json.dumps(actors))
+        del random_source
+        if not isinstance(prepared, dict):
+            raise ValueError("测试冻结输入无效")
+        arguments = prepared["arguments"]
+        updated = json.loads(json.dumps(prepared["actors"]))
         actor = next((item for item in updated if item["actor_id"] == arguments["actor_id"]), None)
-        if actor is None:
-            raise MakeCheckError("unknown_actor", "测试角色不存在")
+        assert actor is not None
         before = actor["luck"]["current"]
         amount = arguments["amount"]
-        if before < amount:
-            raise MakeCheckError("insufficient_luck", "测试资源不足")
         actor["luck"]["current"] = before - amount
         return ToolExecution(
             mechanic={
@@ -226,8 +250,9 @@ class LifecycleTestTool:
 class MutatingFailureTool(LifecycleTestTool):
     definition = _lifecycle_tool_definition("mutating_failure")
 
-    def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
-        actors = kwargs["actors"]
+    def execute(self, prepared: object, **kwargs: Any) -> ToolExecution:
+        assert isinstance(prepared, dict)
+        actors = prepared["actors"]
         actors[0]["luck"]["current"] = 0
         raise MakeCheckError("invalid_arguments", "工具故意失败")
 
@@ -235,10 +260,11 @@ class MutatingFailureTool(LifecycleTestTool):
 class MalformedResultTool(LifecycleTestTool):
     definition = _lifecycle_tool_definition("malformed_result")
 
-    def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
+    def execute(self, prepared: object, **kwargs: Any) -> ToolExecution:
+        assert isinstance(prepared, dict)
         return ToolExecution(
             mechanic={"mechanic_id": kwargs["mechanic_id"], "kind": "not_allowed"},
-            actors=kwargs["actors"],
+            actors=prepared["actors"],
         )
 
 
@@ -258,8 +284,8 @@ class InconsistentLifecycleTestTool(LifecycleTestTool):
     result_kind = "inconsistent_lifecycle_test"
     mechanic_kind = result_kind
 
-    def execute(self, arguments: Mapping[str, Any], **kwargs: Any) -> ToolExecution:
-        execution = super().execute(arguments, **kwargs)
+    def execute(self, prepared: object, **kwargs: Any) -> ToolExecution:
+        execution = super().execute(prepared, **kwargs)
         mechanic = dict(execution.mechanic)
         mechanic["luck_before"] -= 5
         mechanic["luck_after"] -= 5
@@ -467,6 +493,155 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(len(committed["turns"][0]["mechanics"]), 1)
             self.assertEqual(committed["turns"][0]["mechanics"][0]["mechanic_id"], "mechanic_lifecycle_001")
 
+    def test_all_public_tools_use_one_public_mechanic_projection(self) -> None:
+        """不同工具的公开结果都通过同一个 PublicMechanic 外壳交付。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "amount": 3,
+            "visibility": "public",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments, name="lifecycle_test"),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: "mechanic_public_projection",
+            ).start_turn(game_id, "我确认资源变化。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(len(result.public_mechanics), 1)
+            public = result.public_mechanics[0]
+            self.assertIs(type(public), PublicMechanic)
+            self.assertEqual(
+                public,
+                PublicMechanic(
+                    mechanic_id="mechanic_public_projection",
+                    kind="lifecycle_test",
+                    actor_id="investigator_tracker",
+                    details={
+                        "amount": 3,
+                        "luck_before": 55,
+                        "luck_after": 52,
+                    },
+                ),
+            )
+            self.assertEqual(public.kind, "lifecycle_test")
+            self.assertEqual(public.details["amount"], 3)
+
+    def test_public_mechanic_details_are_deeply_immutable(self) -> None:
+        """玩家投影中的嵌套 JSON 值也不能在发布后被调用者改写。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "ability": "spot_hidden",
+            "difficulty": "regular",
+            "dice_adjustment": {"kind": "none", "count": 0},
+            "action": "检查牢门铰链",
+            "stakes": "失败会错过新鲜刮痕",
+            "visibility": "public",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                mechanic_id_factory=lambda: "mechanic_immutable_projection",
+                random_source=ScriptedRandom((3, 4)),
+            ).start_turn(game_id, "我检查牢门铰链。")
+
+            public = result.public_mechanics[0]
+            adjustment = public.details["dice_adjustment"]
+            self.assertIsInstance(adjustment, Mapping)
+            with self.assertRaises(TypeError):
+                adjustment["count"] = 2
+
+    def test_public_mechanic_constructor_deeply_freezes_details(self) -> None:
+        """直接构造公开投影也不能绕过嵌套对象与数组的只读边界。"""
+
+        public = PublicMechanic(
+            mechanic_id="mechanic_direct_projection",
+            kind="test",
+            actor_id="investigator_tracker",
+            details={
+                "nested": {"value": 1},
+                "items": [{"value": 2}],
+            },
+        )
+
+        with self.assertRaises(TypeError):
+            public.details["nested"]["value"] = 9
+        items = public.details["items"]
+        self.assertIsInstance(items, tuple)
+        with self.assertRaises(TypeError):
+            items[0]["value"] = 9
+
+    def test_resume_uses_frozen_profile_and_registered_tool_subset(self) -> None:
+        """重建 Harness 时沿用未完成回合冻结的工具 profile。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "amount": 3,
+            "visibility": "public",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, game_id = self._create_session(root)
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments, name="lifecycle_test"),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: "mechanic_frozen_profile",
+            ).start_turn(game_id, "我确认资源变化。")
+            self.assertEqual(first.status, "interrupted")
+
+            rebuilt_store = AgenticSessionStore(session_root=root / "sessions")
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "沿用冻结 profile 完成回合。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            default_profile = deepseek_model_profile(
+                model_id="deepseek-v4-pro",
+                enabled_tools=("make_check",),
+            )
+            resumed = AgenticHarness(
+                rebuilt_store,
+                resumed_model,
+                model_profile=default_profile,
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: "mechanic_must_not_allocate",
+            ).resume_turn(game_id, first.turn_id)
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(rebuilt_store.load_session(game_id).session["actors"][0]["luck"]["current"], 52)
+            self.assertEqual(resumed_model.requests[0].model_profile["enabled_tools"], ["make_check", "lifecycle_test"])
+
     def test_registered_tool_validates_new_mechanic_kind_after_restart(self) -> None:
         """注册工具拥有新 mechanic kind 的恢复校验，不要求 Session 新增分支。"""
 
@@ -627,6 +802,43 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertIsNone(interaction["arguments"])
             self.assertEqual(session["actors"][0]["luck"]["current"], 55)
 
+    def test_non_check_preflight_rejects_before_id_or_rng(self) -> None:
+        """非检定领域拒绝与 make_check 一样发生在 Harness 权威分配前。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            random_source = ScriptedRandom(())
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "npc_missing",
+                                "amount": 3,
+                                "visibility": "public",
+                            },
+                            name="lifecycle_test",
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                model_profile=self._lifecycle_profile(),
+                tool_registry=self._lifecycle_registry(),
+                mechanic_id_factory=lambda: self.fail(
+                    "preflight rejection allocated mechanic ID"
+                ),
+                random_source=random_source,
+            ).start_turn(game_id, "我尝试让不存在的角色消耗资源。")
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertEqual(random_source.calls, [])
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            interaction = incomplete["tool_interactions"][0]
+            self.assertEqual(interaction["arguments"]["actor_id"], "npc_missing")
+            self.assertEqual(interaction["error"]["code"], "unknown_actor")
+
     def test_investigator_resource_change_rejects_hidden_visibility(self) -> None:
         """调查员幸运变化不能借由工具 visibility 隐藏。"""
 
@@ -655,7 +867,7 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(session["incomplete_turn"]["mechanics"], [])
             self.assertEqual(
                 session["incomplete_turn"]["tool_interactions"][0]["error"]["code"],
-                "tool_execution_error",
+                "invalid_visibility",
             )
 
     def test_profile_can_select_make_check_subset_from_registered_tools(self) -> None:
@@ -663,7 +875,7 @@ class AgenticHarnessTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             store, game_id = self._create_session(Path(temporary))
-            profile = deepseek_model_profile()
+            profile = deepseek_model_profile(enabled_tools=("make_check",))
             model = ScriptedGameMasterModel(
                 [
                     self._response(
@@ -688,6 +900,198 @@ class AgenticHarnessTest(unittest.TestCase):
                 [tool["function"]["name"] for tool in model.requests[0].tools],
                 ["make_check"],
             )
+
+    def test_default_profile_exposes_five_registered_coc_tools(self) -> None:
+        """新回合默认一次暴露 Increment 3 的五个规范工具名。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, game_id = self._create_session(Path(temporary))
+            model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "无需机械即可继续。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+            result = AgenticHarness(store, model).start_turn(
+                game_id,
+                "我先观察周围。",
+            )
+
+            expected = [
+                "make_check",
+                "push_check",
+                "spend_luck",
+                "deal_damage",
+                "make_sanity_check",
+            ]
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(model.requests[0].model_profile["enabled_tools"], expected)
+            self.assertEqual(
+                [tool["function"]["name"] for tool in model.requests[0].tools],
+                expected,
+            )
+
+    def test_unimplemented_default_tools_normalize_before_preflight_rejection(
+        self,
+    ) -> None:
+        """占位目录项也保存规范参数，并按规范参数幂等重放失败。"""
+
+        cases = (
+            (
+                "push_check",
+                {
+                    "check_id": "mechanic_check_0001",
+                    "new_approach": "从铰链侧卸门",
+                    "failure_stakes": "门轴会断裂并夹伤手掌",
+                },
+                {
+                    "check_id": "mechanic_check_0001",
+                    "new_approach": "从铰链侧卸门",
+                    "failure_stakes": "门轴会断裂并夹伤手掌",
+                },
+            ),
+            (
+                "spend_luck",
+                {"check_id": "mechanic_check_0001", "points": 3},
+                {"check_id": "mechanic_check_0001", "points": 3},
+            ),
+            (
+                "deal_damage",
+                {
+                    "actor_id": "investigator_tracker",
+                    "damage_expression": "1d6+1",
+                    "cause": "从湿滑石阶跌落",
+                    "armor_applies": True,
+                    "visibility": "public",
+                },
+                {
+                    "actor_id": "investigator_tracker",
+                    "damage_expression": "1d6+1",
+                    "cause": "从湿滑石阶跌落",
+                    "armor_applies": True,
+                    "visibility": "public",
+                },
+            ),
+            (
+                "make_sanity_check",
+                {
+                    "actor_id": "investigator_tracker",
+                    "source": "倒影中的苍白侧脸",
+                    "success_loss": "0",
+                    "failure_loss": "1d6",
+                    "visibility": "public",
+                },
+                {
+                    "actor_id": "investigator_tracker",
+                    "source": "倒影中的苍白侧脸",
+                    "success_loss": "0",
+                    "failure_loss": "1d6",
+                    "visibility": "public",
+                },
+            ),
+        )
+        for tool_name, raw_arguments, expected in cases:
+            with self.subTest(tool_name=tool_name), tempfile.TemporaryDirectory() as temporary:
+                store, game_id = self._create_session(Path(temporary))
+                reordered = dict(reversed(tuple(raw_arguments.items())))
+                model = ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            json.dumps(raw_arguments, ensure_ascii=False),
+                            name=tool_name,
+                        ),
+                        self._tool_response(
+                            json.dumps(reordered, ensure_ascii=False, indent=2),
+                            name=tool_name,
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                )
+                random_source = ScriptedRandom(())
+                result = AgenticHarness(
+                    store,
+                    model,
+                    mechanic_id_factory=lambda: self.fail(
+                        "preflight rejection allocated mechanic ID"
+                    ),
+                    random_source=random_source,
+                ).start_turn(game_id, "我提出一项尚未实现的机械调用。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(random_source.calls, [])
+                incomplete = store.load_session(game_id).session["incomplete_turn"]
+                self.assertEqual(len(incomplete["tool_interactions"]), 1)
+                interaction = incomplete["tool_interactions"][0]
+                self.assertEqual(interaction["arguments"], expected)
+                self.assertEqual(interaction["error"]["code"], "tool_not_implemented")
+                self.assertEqual(incomplete["mechanics"], [])
+
+    def test_unimplemented_default_tools_reject_invalid_schema_before_preflight(
+        self,
+    ) -> None:
+        """占位工具也必须在领域 preflight 前严格拒绝公开 schema 反例。"""
+
+        cases = (
+            (
+                "push_check",
+                {"check_id": "mechanic_check_0001", "new_approach": "卸下门轴"},
+            ),
+            (
+                "spend_luck",
+                {"check_id": "mechanic_check_0001", "points": True},
+            ),
+            (
+                "deal_damage",
+                {
+                    "actor_id": "investigator_tracker",
+                    "damage_expression": "1d6",
+                    "cause": "从石阶跌落",
+                    "armor_applies": 1,
+                    "visibility": "public",
+                },
+            ),
+            (
+                "make_sanity_check",
+                {
+                    "actor_id": "investigator_tracker",
+                    "source": "倒影中的苍白侧脸",
+                    "success_loss": "0",
+                    "failure_loss": "1d6",
+                    "visibility": "secret",
+                },
+            ),
+        )
+        for tool_name, arguments in cases:
+            with self.subTest(tool_name=tool_name), tempfile.TemporaryDirectory() as temporary:
+                store, game_id = self._create_session(Path(temporary))
+                random_source = ScriptedRandom(())
+                result = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(arguments, name=tool_name),
+                            ModelCallError("request_timeout", "stop", retryable=True),
+                        ]
+                    ),
+                    mechanic_id_factory=lambda: self.fail(
+                        "schema rejection allocated mechanic ID"
+                    ),
+                    random_source=random_source,
+                ).start_turn(game_id, "我提交一项无效机械调用。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(random_source.calls, [])
+                incomplete = store.load_session(game_id).session["incomplete_turn"]
+                interaction = incomplete["tool_interactions"][0]
+                self.assertIsNone(interaction["arguments"])
+                self.assertEqual(interaction["error"]["code"], "invalid_arguments")
+                self.assertEqual(incomplete["mechanics"], [])
 
     def test_failed_tool_cannot_persist_in_place_actor_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -792,6 +1196,7 @@ class AgenticHarnessTest(unittest.TestCase):
             harness = AgenticHarness(
                 store,
                 model,
+                model_profile=deepseek_model_profile(enabled_tools=("make_check",)),
                 turn_id_factory=lambda: next(turn_ids),
                 mechanic_id_factory=lambda: "mechanic_0001",
                 random_source=random_source,
@@ -802,16 +1207,19 @@ class AgenticHarnessTest(unittest.TestCase):
 
             expected_mechanic = PublicMechanic(
                 mechanic_id="mechanic_0001",
+                kind="check",
                 actor_id="investigator_tracker",
-                ability="spot_hidden",
-                ability_value=70,
-                difficulty="regular",
-                target=70,
-                dice_adjustment={"kind": "none", "count": 0},
-                roll=43,
-                success_level="regular_success",
-                action="检查牢门铰链附近的刮痕",
-                stakes="失败会错过守卫留下的关键痕迹",
+                details={
+                    "ability": "spot_hidden",
+                    "ability_value": 70,
+                    "difficulty": "regular",
+                    "target": 70,
+                    "dice_adjustment": {"kind": "none", "count": 0},
+                    "roll": 43,
+                    "success_level": "regular_success",
+                    "action": "检查牢门铰链附近的刮痕",
+                    "stakes": "失败会错过守卫留下的关键痕迹",
+                },
             )
             self.assertEqual(result.status, "committed")
             self.assertEqual(result.public_mechanics, (expected_mechanic,))
@@ -1107,6 +1515,7 @@ class AgenticHarnessTest(unittest.TestCase):
             harness = AgenticHarness(
                 store,
                 model,
+                model_profile=deepseek_model_profile(enabled_tools=("make_check",)),
                 turn_id_factory=lambda: next(turn_ids),
                 fact_id_factory=lambda: next(fact_ids),
                 clock=lambda: datetime(2026, 7, 27, 0, 2, tzinfo=timezone.utc),
@@ -2700,6 +3109,99 @@ class AgenticHarnessTest(unittest.TestCase):
                 6,
             )
 
+    def test_multiple_tool_errors_normalize_and_replay_semantic_arguments(self) -> None:
+        """合法多工具参数保存规范值，并允许同义 JSON 按调用 ID 重放。"""
+
+        def multiple_check_response(
+            first_arguments: str,
+            second_arguments: str,
+        ) -> ModelResponse:
+            return ModelResponse(
+                assistant_message={
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": {
+                                "name": "make_check",
+                                "arguments": first_arguments,
+                            },
+                        },
+                        {
+                            "id": "call_b",
+                            "type": "function",
+                            "function": {
+                                "name": "make_check",
+                                "arguments": second_arguments,
+                            },
+                        },
+                    ],
+                },
+                finish_reason="tool_calls",
+                usage=None,
+                latency_ms=10,
+            )
+
+        first_arguments = self._valid_check_arguments()
+        second_arguments = {
+            **first_arguments,
+            "action": "倾听门外脚步",
+            "stakes": "失败会错过守卫接近的声音",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        multiple_check_response(
+                            json.dumps(first_arguments, ensure_ascii=False),
+                            json.dumps(second_arguments, ensure_ascii=False),
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_multiple_semantic_replay",
+                mechanic_id_factory=lambda: self.fail(
+                    "multiple-tool rejection allocated mechanic ID"
+                ),
+                random_source=ScriptedRandom(()),
+            ).start_turn(game_id, "我同时提出两项检定。")
+
+            self.assertEqual(first.error_code, "request_timeout")
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(
+                [item["arguments"] for item in incomplete["tool_interactions"]],
+                [first_arguments, second_arguments],
+            )
+
+            reordered_first = dict(reversed(tuple(first_arguments.items())))
+            reordered_second = dict(reversed(tuple(second_arguments.items())))
+            replayed = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        multiple_check_response(
+                            json.dumps(reordered_first, ensure_ascii=False, indent=2),
+                            json.dumps(reordered_second, ensure_ascii=False, indent=2),
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "multiple-tool replay allocated mechanic ID"
+                ),
+                random_source=ScriptedRandom(()),
+            ).resume_turn(game_id, "turn_multiple_semantic_replay")
+
+            self.assertEqual(replayed.error_code, "request_timeout")
+            after_replay = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(len(after_replay["tool_interactions"]), 2)
+            self.assertEqual(len(after_replay["provider_protocol_errors"]), 0)
+
     def test_replay_mismatch_keeps_original_interaction_and_interrupts(self) -> None:
         """同 ID 异规范参数不能覆盖原结果或再次执行工具。"""
 
@@ -3061,20 +3563,24 @@ class AgenticHarnessTest(unittest.TestCase):
             self.assertEqual(wrong_id_model.requests, [])
             self.assertEqual(session_file.read_bytes(), interrupted_bytes)
 
-            wrong_profile_model = ScriptedGameMasterModel(
+            unavailable_profile_model = ScriptedGameMasterModel(
                 [self._response({"unreachable": True})]
             )
-            wrong_profile_harness = AgenticHarness(
+            unavailable_profile_harness = AgenticHarness(
                 store,
-                wrong_profile_model,
-                model_profile=deepseek_model_profile(model_id="deepseek-v4-pro"),
+                unavailable_profile_model,
+                tool_registry={"lifecycle_test": LifecycleTestTool()},
+                model_profile={
+                    **deepseek_model_profile(model_id="deepseek-v4-pro"),
+                    "enabled_tools": ["lifecycle_test"],
+                },
             )
             with self.assertRaisesRegex(
                 AgenticTurnBlockedError,
                 "冻结的模型运行配置当前不可用",
             ):
-                wrong_profile_harness.resume_turn(game_id, "turn_0001")
-            self.assertEqual(wrong_profile_model.requests, [])
+                unavailable_profile_harness.resume_turn(game_id, "turn_0001")
+            self.assertEqual(unavailable_profile_model.requests, [])
             self.assertEqual(session_file.read_bytes(), interrupted_bytes)
 
             fresh_store = AgenticSessionStore(
@@ -3131,6 +3637,45 @@ class AgenticHarnessTest(unittest.TestCase):
             ):
                 completed_harness.resume_turn(fresh.game_id, "turn_complete")
             self.assertEqual(len(completed_model.requests), model_calls_before_resume)
+
+    def test_resume_rejects_unavailable_frozen_provider_before_model_call(self) -> None:
+        """冻结 provider 不受当前 Harness 支持时不能开始恢复尝试。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [ModelCallError("request_timeout", "private", retryable=True)]
+                ),
+                turn_id_factory=lambda: "turn_0001",
+            ).start_turn(game_id, "我贴近门缝倾听。")
+            session_file = store.load_session(game_id).session_directory / "session.json"
+            tampered = read_json(session_file)
+            tampered["incomplete_turn"]["model_profile"]["provider"] = "not-deepseek"
+            write_json_atomic(session_file, tampered)
+            tampered_bytes = session_file.read_bytes()
+            resumed_model = ScriptedGameMasterModel(
+                [
+                    self._response(
+                        {
+                            "narration": "不可到达。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    )
+                ]
+            )
+
+            with self.assertRaisesRegex(
+                AgenticTurnBlockedError,
+                "冻结的模型运行配置当前不可用",
+            ):
+                AgenticHarness(store, resumed_model).resume_turn(game_id, first.turn_id)
+
+            self.assertEqual(resumed_model.requests, [])
+            self.assertEqual(session_file.read_bytes(), tampered_bytes)
 
     def test_provider_failure_code_is_allowlisted_before_persistence_or_output(self) -> None:
         """provider 失败码不是玩家输出协议，未知值必须收敛为稳定码。"""
@@ -3236,9 +3781,9 @@ class AgenticHarnessTest(unittest.TestCase):
                 result = harness.start_turn(game_id, "我执行这个行动。")
 
                 public = result.public_mechanics[0]
-                self.assertEqual(public.target, target)
-                self.assertEqual(public.roll, roll)
-                self.assertEqual(public.success_level, success_level)
+                self.assertEqual(public.details["target"], target)
+                self.assertEqual(public.details["roll"], roll)
+                self.assertEqual(public.details["success_level"], success_level)
                 self.assertEqual(
                     random_source.calls,
                     [(0, 9)] * (count + 2),

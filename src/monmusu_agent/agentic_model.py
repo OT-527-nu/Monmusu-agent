@@ -9,6 +9,13 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 PROMPT_REVISION = "gm-capability-charter-agentic-mvp-2"
 TOOL_SCHEMA_VERSION = "coc-tools-agentic-mvp-1"
+DEFAULT_COC_TOOL_NAMES = (
+    "make_check",
+    "push_check",
+    "spend_luck",
+    "deal_damage",
+    "make_sanity_check",
+)
 MODEL_PROFILE_FIELDS = (
     "provider",
     "model_id",
@@ -97,6 +104,7 @@ def deepseek_model_profile(
     *,
     model_id: str = DEFAULT_DEEPSEEK_MODEL_ID,
     thinking: bool = False,
+    enabled_tools: Sequence[str] = DEFAULT_COC_TOOL_NAMES,
 ) -> dict[str, Any]:
     """生成当前纵向切片唯一的非秘密 DeepSeek 运行配置。"""
 
@@ -112,9 +120,9 @@ def deepseek_model_profile(
             "max_tokens": 4096,
             "prompt_revision": PROMPT_REVISION,
             "tool_schema_version": TOOL_SCHEMA_VERSION,
-            "enabled_tools": ["make_check"],
+            "enabled_tools": list(enabled_tools),
         },
-        enabled_tools=("make_check",),
+        enabled_tools=tuple(enabled_tools),
     )
 
 
