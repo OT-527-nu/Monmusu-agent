@@ -181,7 +181,27 @@ _CHECK_RESULT_FIELDS = frozenset(
 _PUSHED_CHECK_RESULT_FIELDS = _CHECK_RESULT_FIELDS | frozenset(
     {"pushed_from", "is_pushed"}
 )
+_LUCK_SPEND_RESULT_FIELDS = frozenset(
+    {
+        "mechanic_id",
+        "kind",
+        "actor_id",
+        "check_id",
+        "points_spent",
+        "luck_before",
+        "luck_after",
+        "success_level_before",
+        "success_level_after",
+        "visibility",
+        "committed_at",
+    }
+)
 _DIFFICULTIES = frozenset({"regular", "hard", "extreme"})
+_DECLARED_DIFFICULTY_SUCCESS_LEVEL = {
+    "regular": "regular_success",
+    "hard": "hard_success",
+    "extreme": "extreme_success",
+}
 _SUCCESS_LEVELS = frozenset(
     {
         "critical_success",
@@ -290,6 +310,19 @@ class PreparedPushCheck:
 
     check: PreparedCheck
     pushed_from: str
+    actors: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class PreparedSpendLuck:
+    """冻结 Luck 来源、精确扣点和角色卡事前快照。"""
+
+    check_id: str
+    actor_id: str
+    points: int
+    luck_before: int
+    success_level_before: str
+    success_level_after: str
     actors: list[dict[str, Any]]
 
 
@@ -564,6 +597,76 @@ def normalize_push_check_arguments(arguments_raw: str) -> dict[str, Any]:
     }
 
 
+def _prepare_base_remediation_check(
+    check_id: str,
+    *,
+    actors: object,
+    mechanics: tuple[Mapping[str, Any], ...],
+    current_turn_mechanics: tuple[Mapping[str, Any], ...],
+    eligibility_field: str,
+    not_allowed_code: str,
+    same_turn_message: str,
+    not_allowed_message: str,
+    derived_message: str,
+    actor_message: str,
+) -> tuple[Mapping[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """验证 Push/Luck 共用的基础检定授权边界并冻结角色卡。"""
+
+    original = next(
+        (
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("mechanic_id") == check_id
+        ),
+        None,
+    )
+    if original is None or original.get("kind") != "check":
+        raise CocToolError("invalid_check_id", "check_id 未引用已有检定")
+    if any(
+        mechanic.get("mechanic_id") == check_id
+        for mechanic in current_turn_mechanics
+    ):
+        raise CocToolError(not_allowed_code, same_turn_message)
+    try:
+        validate_check_result(original)
+    except (ValueError, TypeError, KeyError) as error:
+        raise CocToolError(not_allowed_code, not_allowed_message) from error
+    if set(original) != _CHECK_RESULT_FIELDS:
+        raise CocToolError(not_allowed_code, derived_message)
+    if (
+        _meets_difficulty(
+            original["success_level"],
+            original["difficulty"],
+        )
+        or original.get("success_level") == "fumble"
+        or original.get("visibility") != "public"
+        or original.get(eligibility_field) is not True
+        or _remediation_chain_used(check_id, mechanics)
+    ):
+        raise CocToolError(not_allowed_code, not_allowed_message)
+    if not isinstance(actors, list):
+        raise CocToolError("actor_data_unavailable", "冻结角色卡不可用")
+    frozen_actors = json.loads(json.dumps(actors))
+    actor = next(
+        (
+            candidate
+            for candidate in frozen_actors
+            if isinstance(candidate, dict)
+            and candidate.get("actor_id") == original.get("actor_id")
+        ),
+        None,
+    )
+    if actor is None or actor.get("role") != "investigator":
+        raise CocToolError(not_allowed_code, actor_message)
+    prepared_check = prepare_make_check(original, frozen_actors)
+    if (
+        prepared_check.ability_value != original.get("ability_value")
+        or prepared_check.target != original.get("target")
+    ):
+        raise CocToolError(not_allowed_code, "引用检定与冻结角色卡不一致")
+    return original, frozen_actors, actor
+
+
 class PushCheckTool:
     """以不可变基础检定执行一次玩家选择的孤注一掷。"""
 
@@ -582,51 +685,18 @@ class PushCheckTool:
         current_turn_mechanics: tuple[Mapping[str, Any], ...],
     ) -> PreparedPushCheck:
         check_id = arguments["check_id"]
-        original = next(
-            (
-                mechanic
-                for mechanic in mechanics
-                if mechanic.get("mechanic_id") == check_id
-            ),
-            None,
+        original, frozen_actors, _ = _prepare_base_remediation_check(
+            check_id,
+            actors=actors,
+            mechanics=mechanics,
+            current_turn_mechanics=current_turn_mechanics,
+            eligibility_field="push_eligible",
+            not_allowed_code="push_not_allowed",
+            same_turn_message="孤注一掷必须等待下一次玩家输入",
+            not_allowed_message="引用检定不允许孤注一掷",
+            derived_message="pushed 检定不能再次孤注一掷",
+            actor_message="只有选中调查员可以孤注一掷",
         )
-        if original is None or original.get("kind") != "check":
-            raise CocToolError("invalid_check_id", "check_id 未引用已有检定")
-        if any(
-            mechanic.get("mechanic_id") == check_id
-            for mechanic in current_turn_mechanics
-        ):
-            raise CocToolError("push_not_allowed", "孤注一掷必须等待下一次玩家输入")
-        try:
-            validate_check_result(original)
-        except (ValueError, TypeError, KeyError) as error:
-            raise CocToolError("push_not_allowed", "引用检定不允许孤注一掷") from error
-        if set(original) != _CHECK_RESULT_FIELDS:
-            raise CocToolError("push_not_allowed", "pushed 检定不能再次孤注一掷")
-        if (
-            _meets_difficulty(
-                original["success_level"],
-                original["difficulty"],
-            )
-            or original.get("success_level") == "fumble"
-            or original.get("visibility") != "public"
-            or original.get("push_eligible") is not True
-            or _remediation_chain_used(check_id, mechanics)
-        ):
-            raise CocToolError("push_not_allowed", "引用检定不允许孤注一掷")
-        if not isinstance(actors, list):
-            raise CocToolError("actor_data_unavailable", "冻结角色卡不可用")
-        actor = next(
-            (
-                candidate
-                for candidate in actors
-                if isinstance(candidate, dict)
-                and candidate.get("actor_id") == original.get("actor_id")
-            ),
-            None,
-        )
-        if actor is None or actor.get("role") != "investigator":
-            raise CocToolError("push_not_allowed", "只有选中调查员可以孤注一掷")
 
         inherited_arguments = {
             "actor_id": original["actor_id"],
@@ -637,7 +707,7 @@ class PushCheckTool:
             "stakes": arguments["failure_stakes"],
             "visibility": original["visibility"],
         }
-        inherited = prepare_make_check(inherited_arguments, actors)
+        inherited = prepare_make_check(inherited_arguments, frozen_actors)
         if (
             inherited.ability_value != original.get("ability_value")
             or inherited.target != original.get("target")
@@ -651,7 +721,7 @@ class PushCheckTool:
                 remediation_eligible=False,
             ),
             pushed_from=check_id,
-            actors=json.loads(json.dumps(actors)),
+            actors=frozen_actors,
         )
 
     def execute(
@@ -794,6 +864,258 @@ def normalize_spend_luck_arguments(arguments_raw: str) -> dict[str, Any]:
     }
 
 
+class SpendLuckTool:
+    """以不可变基础检定执行一次玩家选择的精确 Luck 消费。"""
+
+    definition = SPEND_LUCK_TOOL
+    mechanic_kind = "luck_spend"
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]:
+        return normalize_spend_luck_arguments(arguments_raw)
+
+    def preflight(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+        current_turn_mechanics: tuple[Mapping[str, Any], ...],
+    ) -> PreparedSpendLuck:
+        check_id = arguments["check_id"]
+        original, frozen_actors, actor = _prepare_base_remediation_check(
+            check_id,
+            actors=actors,
+            mechanics=mechanics,
+            current_turn_mechanics=current_turn_mechanics,
+            eligibility_field="luck_eligible",
+            not_allowed_code="luck_not_allowed",
+            same_turn_message="花费幸运必须等待下一次玩家输入",
+            not_allowed_message="引用检定不允许花费幸运",
+            derived_message="引用检定不允许花费幸运",
+            actor_message="只有选中调查员可以花费幸运",
+        )
+        if original.get("target") == 0:
+            raise CocToolError("luck_not_allowed", "引用检定不允许花费幸运")
+
+        required_points = original["roll"] - original["target"]
+        if arguments["points"] != required_points:
+            raise CocToolError(
+                "invalid_luck_points",
+                "points 必须恰好等于原骰点与目标值之差",
+            )
+        luck = actor.get("luck")
+        luck_before = luck.get("current") if isinstance(luck, dict) else None
+        if (
+            not isinstance(luck_before, int)
+            or isinstance(luck_before, bool)
+            or luck_before < required_points
+        ):
+            raise CocToolError("insufficient_luck", "调查员幸运点数不足")
+        success_level_after = _DECLARED_DIFFICULTY_SUCCESS_LEVEL[
+            original["difficulty"]
+        ]
+        return PreparedSpendLuck(
+            check_id=check_id,
+            actor_id=original["actor_id"],
+            points=required_points,
+            luck_before=luck_before,
+            success_level_before=original["success_level"],
+            success_level_after=success_level_after,
+            actors=frozen_actors,
+        )
+
+    def execute(
+        self,
+        prepared: object,
+        *,
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution:
+        del random_source
+        if not isinstance(prepared, PreparedSpendLuck):
+            raise ValueError("spend_luck 冻结输入无效")
+        updated_actors = json.loads(json.dumps(prepared.actors))
+        actor = next(
+            item
+            for item in updated_actors
+            if item.get("actor_id") == prepared.actor_id
+        )
+        actor["luck"]["current"] = prepared.luck_before - prepared.points
+        return ToolExecution(
+            mechanic={
+                "mechanic_id": mechanic_id,
+                "kind": "luck_spend",
+                "actor_id": prepared.actor_id,
+                "check_id": prepared.check_id,
+                "points_spent": prepared.points,
+                "luck_before": prepared.luck_before,
+                "luck_after": prepared.luck_before - prepared.points,
+                "success_level_before": prepared.success_level_before,
+                "success_level_after": prepared.success_level_after,
+                "visibility": "public",
+                "committed_at": committed_at,
+            },
+            actors=updated_actors,
+        )
+
+    @staticmethod
+    def validate_result(value: object) -> None:
+        if not isinstance(value, dict) or set(value) != _LUCK_SPEND_RESULT_FIELDS:
+            raise ValueError("luck spend mechanic 格式无效")
+        for field in ("mechanic_id", "actor_id", "check_id", "committed_at"):
+            _required_string(value.get(field), field)
+        points = value.get("points_spent")
+        luck_before = value.get("luck_before")
+        luck_after = value.get("luck_after")
+        if (
+            value.get("kind") != "luck_spend"
+            or value.get("visibility") != "public"
+            or not isinstance(points, int)
+            or isinstance(points, bool)
+            or points < 1
+            or not isinstance(luck_before, int)
+            or isinstance(luck_before, bool)
+            or not isinstance(luck_after, int)
+            or isinstance(luck_after, bool)
+            or luck_after != luck_before - points
+            or not 0 <= luck_after < luck_before <= 99
+            or value.get("success_level_before") not in _SUCCESS_LEVELS
+            or value.get("success_level_after")
+            not in {"regular_success", "hard_success", "extreme_success"}
+        ):
+            raise ValueError("luck spend mechanic 格式无效")
+
+    @staticmethod
+    def validate_result_arguments(
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> None:
+        if (
+            arguments.get("check_id") != value.get("check_id")
+            or arguments.get("points") != value.get("points_spent")
+        ):
+            raise ValueError("luck spend mechanic 与规范参数不一致")
+
+    @staticmethod
+    def validate_persistence(
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        SpendLuckTool.validate_result(value)
+        check_id = value["check_id"]
+        sources = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("mechanic_id") == check_id
+        ]
+        luck_derivations = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("kind") == "luck_spend"
+            and mechanic.get("check_id") == check_id
+        ]
+        push_derivations = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("pushed_from") == check_id
+        ]
+        source_index = next(
+            (
+                index
+                for index, mechanic in enumerate(mechanics)
+                if mechanic.get("mechanic_id") == check_id
+            ),
+            None,
+        )
+        luck_index = next(
+            (
+                index
+                for index, mechanic in enumerate(mechanics)
+                if mechanic.get("mechanic_id") == value.get("mechanic_id")
+            ),
+            None,
+        )
+        if (
+            len(sources) != 1
+            or set(sources[0]) != _CHECK_RESULT_FIELDS
+            or len(luck_derivations) != 1
+            or luck_derivations[0].get("mechanic_id") != value.get("mechanic_id")
+            or push_derivations
+            or source_index is None
+            or luck_index is None
+            or source_index >= luck_index
+        ):
+            raise ValueError("luck spend mechanic 补救链无效")
+        original = sources[0]
+        validate_check_result(original)
+        expected_after = _DECLARED_DIFFICULTY_SUCCESS_LEVEL[original["difficulty"]]
+        if (
+            original.get("actor_id") != value.get("actor_id")
+            or _meets_difficulty(
+                original["success_level"],
+                original["difficulty"],
+            )
+            or original.get("success_level") == "fumble"
+            or original.get("visibility") != "public"
+            or original.get("luck_eligible") is not True
+            or original.get("target") == 0
+            or value.get("points_spent") != original["roll"] - original["target"]
+            or value.get("success_level_before") != original.get("success_level")
+            or value.get("success_level_after") != expected_after
+        ):
+            raise ValueError("luck spend mechanic 与基础检定不一致")
+        if not isinstance(actors, list):
+            raise ValueError("luck spend mechanic 与冻结角色卡不一致")
+        actor = next(
+            (
+                candidate
+                for candidate in actors
+                if isinstance(candidate, dict)
+                and candidate.get("actor_id") == value.get("actor_id")
+            ),
+            None,
+        )
+        related = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("kind") == "luck_spend"
+            and mechanic.get("actor_id") == value.get("actor_id")
+        ]
+        if (
+            actor is None
+            or actor.get("role") != "investigator"
+            or any(
+                previous.get("luck_after") != current.get("luck_before")
+                for previous, current in zip(related, related[1:], strict=False)
+            )
+            or actor["luck"]["current"] != related[-1].get("luck_after")
+        ):
+            raise ValueError("luck spend mechanic 与冻结角色卡不一致")
+        prepared_check = prepare_make_check(original, actors)
+        if (
+            prepared_check.ability_value != original.get("ability_value")
+            or prepared_check.target != original.get("target")
+        ):
+            raise ValueError("luck spend mechanic 与冻结角色卡不一致")
+
+    @staticmethod
+    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            key: value[key]
+            for key in (
+                "check_id",
+                "points_spent",
+                "luck_before",
+                "luck_after",
+                "success_level_before",
+                "success_level_after",
+            )
+        }
+
+
 def normalize_deal_damage_arguments(arguments_raw: str) -> dict[str, Any]:
     value = _parse_tool_arguments(
         arguments_raw,
@@ -910,11 +1232,7 @@ class UnimplementedCocTool:
 DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {
     "make_check": MakeCheckTool(),
     "push_check": PushCheckTool(),
-    "spend_luck": UnimplementedCocTool(
-        SPEND_LUCK_TOOL,
-        "luck_spend",
-        normalize_spend_luck_arguments,
-    ),
+    "spend_luck": SpendLuckTool(),
     "deal_damage": UnimplementedCocTool(
         DEAL_DAMAGE_TOOL,
         "damage",

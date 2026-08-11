@@ -10,6 +10,7 @@ from monmusu_agent.agentic_coc import (
     MakeCheckTool,
     PushCheckTool,
     RandomSource,
+    SpendLuckTool,
     ToolExecution,
 )
 from monmusu_agent.agentic_harness import (
@@ -568,49 +569,80 @@ class AgenticHarnessTest(unittest.TestCase):
             "visibility": "public",
         }
 
-    def _assert_push_rejected_after_base(
+    @staticmethod
+    def _final_payload(narration: str = "机械结果已经解释。") -> dict[str, object]:
+        return {
+            "narration": narration,
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+
+    @staticmethod
+    def _actor(session: Mapping[str, Any], actor_id: str) -> Mapping[str, Any]:
+        actors = session["actors"]
+        assert isinstance(actors, list)
+        return next(actor for actor in actors if actor["actor_id"] == actor_id)
+
+    def _base_and_luck_responses(
+        self,
+        *,
+        base_arguments: dict[str, object] | None = None,
+        check_id: str = "mechanic_base",
+        points: int = 3,
+        narration: str = "机械结果已经解释。",
+    ) -> list[ModelResponse]:
+        final = self._final_payload(narration)
+        return [
+            self._tool_response(base_arguments or self._valid_check_arguments()),
+            self._response(final),
+            self._tool_response(
+                {"check_id": check_id, "points": points},
+                name="spend_luck",
+            ),
+            self._response(final),
+        ]
+
+    def _assert_remediation_rejected_after_base(
         self,
         *,
         base_arguments: dict[str, object] | None,
         base_dice: tuple[int, ...],
-        check_id: str,
+        tool_name: str,
+        tool_arguments: dict[str, object],
+        player_input: str,
         expected_code: str,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store, game_id = self._create_session(Path(directory))
-            push_arguments = {
-                "check_id": check_id,
-                "new_approach": "改从门轴侧面拆卸",
-                "failure_stakes": "门轴断裂并夹伤手掌",
-            }
             responses: list[ModelResponse | ModelCallError] = []
             if base_arguments is not None:
                 responses.extend(
                     [
                         self._tool_response(base_arguments),
-                        self._response(
-                            {
-                                "narration": "基础检定已解释。",
-                                "establish": [],
-                                "retire": [],
-                                "session_status": "ongoing",
-                            }
-                        ),
+                        self._response(self._final_payload("基础检定已解释。")),
                     ]
                 )
             responses.extend(
                 [
-                    self._tool_response(push_arguments, name="push_check"),
-                    ModelCallError("request_timeout", "stop after push rejection", retryable=True),
+                    self._tool_response(tool_arguments, name=tool_name),
+                    ModelCallError(
+                        "request_timeout",
+                        "stop after remediation rejection",
+                        retryable=True,
+                    ),
                 ]
             )
-            calls: list[str] = []
+            allocated: list[str] = []
 
             def next_mechanic_id() -> str:
-                calls.append("allocated")
-                if len(calls) == 1 and base_arguments is not None:
-                    return "mechanic_base"
-                return "mechanic_unexpected"
+                value = (
+                    "mechanic_base"
+                    if base_arguments is not None and not allocated
+                    else "mechanic_unexpected"
+                )
+                allocated.append(value)
+                return value
 
             random_source = ScriptedRandom(base_dice)
             harness = AgenticHarness(
@@ -620,16 +652,18 @@ class AgenticHarnessTest(unittest.TestCase):
                 random_source=random_source,
             )
             if base_arguments is not None:
-                first = harness.start_turn(game_id, "我先执行基础检定。")
-                self.assertEqual(first.status, "committed")
-            calls_before_push = list(calls)
-            random_calls_before_push = list(random_source.calls)
+                self.assertEqual(
+                    harness.start_turn(game_id, "我先执行基础检定。").status,
+                    "committed",
+                )
+            allocated_before = list(allocated)
+            random_calls_before = list(random_source.calls)
 
-            result = harness.start_turn(game_id, "我明确选择换一种做法孤注一掷。")
+            result = harness.start_turn(game_id, player_input)
 
             self.assertEqual(result.error_code, "request_timeout")
-            self.assertEqual(calls, calls_before_push)
-            self.assertEqual(random_source.calls, random_calls_before_push)
+            self.assertEqual(allocated, allocated_before)
+            self.assertEqual(random_source.calls, random_calls_before)
             incomplete = store.load_session(game_id).session["incomplete_turn"]
             self.assertEqual(incomplete["mechanics"], [])
             self.assertEqual(
@@ -637,6 +671,44 @@ class AgenticHarnessTest(unittest.TestCase):
                 expected_code,
             )
 
+    def _assert_push_rejected_after_base(
+        self,
+        *,
+        base_arguments: dict[str, object] | None,
+        base_dice: tuple[int, ...],
+        check_id: str,
+        expected_code: str,
+    ) -> None:
+        self._assert_remediation_rejected_after_base(
+            base_arguments=base_arguments,
+            base_dice=base_dice,
+            tool_name="push_check",
+            tool_arguments={
+                "check_id": check_id,
+                "new_approach": "改从门轴侧面拆卸",
+                "failure_stakes": "门轴断裂并夹伤手掌",
+            },
+            player_input="我明确选择换一种做法孤注一掷。",
+            expected_code=expected_code,
+        )
+
+    def _assert_luck_rejected_after_base(
+        self,
+        *,
+        base_arguments: dict[str, object] | None,
+        base_dice: tuple[int, ...],
+        check_id: str,
+        points: int,
+        expected_code: str,
+    ) -> None:
+        self._assert_remediation_rejected_after_base(
+            base_arguments=base_arguments,
+            base_dice=base_dice,
+            tool_name="spend_luck",
+            tool_arguments={"check_id": check_id, "points": points},
+            player_input="我明确选择花费幸运。",
+            expected_code=expected_code,
+        )
 
     def test_non_check_tool_commits_state_then_replays_exactly_once_after_restart(self) -> None:
         """非检定工具的角色变化先提交，重建进程恢复时按调用 ID 幂等重放。"""
@@ -1144,17 +1216,12 @@ class AgenticHarnessTest(unittest.TestCase):
                 expected,
             )
 
-    def test_unimplemented_default_tools_normalize_before_preflight_rejection(
+    def test_later_unimplemented_tools_normalize_before_preflight_rejection(
         self,
     ) -> None:
         """占位目录项也保存规范参数，并按规范参数幂等重放失败。"""
 
         cases = (
-            (
-                "spend_luck",
-                {"check_id": "mechanic_check_0001", "points": 3},
-                {"check_id": "mechanic_check_0001", "points": 3},
-            ),
             (
                 "deal_damage",
                 {
@@ -1226,10 +1293,10 @@ class AgenticHarnessTest(unittest.TestCase):
                 self.assertEqual(interaction["error"]["code"], "tool_not_implemented")
                 self.assertEqual(incomplete["mechanics"], [])
 
-    def test_unimplemented_default_tools_reject_invalid_schema_before_preflight(
+    def test_default_tools_reject_invalid_schema_before_preflight(
         self,
     ) -> None:
-        """占位工具也必须在领域 preflight 前严格拒绝公开 schema 反例。"""
+        """所有工具都必须在领域 preflight 前严格拒绝公开 schema 反例。"""
 
         cases = (
             (
@@ -1239,6 +1306,26 @@ class AgenticHarnessTest(unittest.TestCase):
             (
                 "spend_luck",
                 {"check_id": "mechanic_check_0001", "points": True},
+            ),
+            (
+                "spend_luck",
+                {"check_id": "mechanic_check_0001", "points": 0},
+            ),
+            (
+                "spend_luck",
+                {"check_id": "mechanic_check_0001", "points": -1},
+            ),
+            (
+                "spend_luck",
+                {"check_id": "mechanic_check_0001", "points": 3.0},
+            ),
+            (
+                "spend_luck",
+                {
+                    "check_id": "mechanic_check_0001",
+                    "points": 3,
+                    "visibility": "public",
+                },
             ),
             (
                 "deal_damage",
@@ -1262,7 +1349,10 @@ class AgenticHarnessTest(unittest.TestCase):
             ),
         )
         for tool_name, arguments in cases:
-            with self.subTest(tool_name=tool_name), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(
+                tool_name=tool_name,
+                arguments=arguments,
+            ), tempfile.TemporaryDirectory() as temporary:
                 store, game_id = self._create_session(Path(temporary))
                 random_source = ScriptedRandom(())
                 result = AgenticHarness(
@@ -4124,6 +4214,79 @@ class AgenticHarnessTest(unittest.TestCase):
                     "push_not_allowed",
                 )
 
+    def test_fixed_point_eligibility_snapshots_do_not_authorize_spend_luck(self) -> None:
+        """旧 Luck 快照可读取，但不会授权隐藏、NPC 或 fumble 检定。"""
+
+        cases = (
+            ("hidden failure", "investigator_tracker", "hidden", (1, 7), True, True),
+            ("npc failure", "npc_vespera", "public", (1, 7), True, True),
+            ("fumble", "investigator_tracker", "public", (0, 0), True, False),
+        )
+        for label, actor_id, visibility, dice, old_push, old_luck in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                {
+                                    **self._valid_check_arguments(),
+                                    "actor_id": actor_id,
+                                    "visibility": visibility,
+                                }
+                            ),
+                            self._response(
+                                {
+                                    "narration": "旧运行时已经提交检定。",
+                                    "establish": [],
+                                    "retire": [],
+                                    "session_status": "ongoing",
+                                }
+                            ),
+                        ]
+                    ),
+                    mechanic_id_factory=lambda: "mechanic_base",
+                    random_source=ScriptedRandom(dice),
+                ).start_turn(game_id, "我执行一次旧运行时检定。")
+                session_file = store.session_root / game_id / "session.json"
+                fixed_point_session = read_json(session_file)
+                mechanic = fixed_point_session["turns"][0]["mechanics"][0]
+                mechanic["push_eligible"] = old_push
+                mechanic["luck_eligible"] = old_luck
+                write_json_atomic(session_file, fixed_point_session)
+
+                loaded = store.load_session(game_id).session
+                self.assertIs(
+                    loaded["turns"][0]["mechanics"][0]["luck_eligible"],
+                    old_luck,
+                )
+                random_source = ScriptedRandom(())
+                result = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                {"check_id": "mechanic_base", "points": 1},
+                                name="spend_luck",
+                            ),
+                            ModelCallError("request_timeout", "stop", retryable=True),
+                        ]
+                    ),
+                    mechanic_id_factory=lambda: self.fail(
+                        "legacy-ineligible Luck allocated a mechanic ID"
+                    ),
+                    random_source=random_source,
+                ).start_turn(game_id, "我尝试花费幸运。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(random_source.calls, [])
+                incomplete = store.load_session(game_id).session["incomplete_turn"]
+                self.assertEqual(
+                    incomplete["tool_interactions"][0]["error"]["code"],
+                    "luck_not_allowed",
+                )
+
     def test_player_can_push_committed_failed_check_on_next_turn(self) -> None:
         """Push 继承可信检定参数并以新记录公开提交，不覆盖原失败。"""
 
@@ -4445,12 +4608,7 @@ class AgenticHarnessTest(unittest.TestCase):
             "historical_luck_marker": HistoricalLuckMarkerTool(),
             "push_check": PushCheckTool(),
         }
-        final = {
-            "narration": "机械结果已经解释。",
-            "establish": [],
-            "retire": [],
-            "session_status": "ongoing",
-        }
+        final = self._final_payload()
         with tempfile.TemporaryDirectory() as directory:
             store, game_id = self._create_session(Path(directory))
             model = ScriptedGameMasterModel(
@@ -4780,6 +4938,709 @@ class AgenticHarnessTest(unittest.TestCase):
                             pushed["target"] = 70
                         else:
                             tampered["turns"].reverse()
+                    write_json_atomic(session_file, tampered)
+                    with self.assertRaisesRegex(
+                        AgenticSessionLoadError,
+                        "CommittedTurn 格式无效|机械与冻结角色卡不一致",
+                    ):
+                        store.load_session(game_id)
+                    write_json_atomic(session_file, baseline)
+
+    def test_player_can_spend_exact_luck_on_committed_failed_check(self) -> None:
+        """Luck 精确买到原难度并原子扣点，不覆盖原检定或重掷。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom((3, 7))
+            mechanic_ids = iter(("mechanic_base", "mechanic_luck"))
+            model = ScriptedGameMasterModel(
+                self._base_and_luck_responses(
+                    narration="机械结果已经得到忠实解释。"
+                )
+                + [self._response(self._final_payload("后续行动继续。"))]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                mechanic_id_factory=mechanic_ids.__next__,
+                random_source=random_source,
+                clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+
+            first = harness.start_turn(game_id, "我检查牢门。")
+            original = json.loads(
+                json.dumps(
+                    store.load_session(game_id).session["turns"][0]["mechanics"][0]
+                )
+            )
+            second = harness.start_turn(game_id, "我花费 3 点幸运让这次检定成功。")
+            third = harness.start_turn(game_id, "我依据成功结果继续行动。")
+
+            self.assertEqual(first.status, "committed")
+            self.assertEqual(second.status, "committed")
+            self.assertEqual(third.status, "committed")
+            self.assertEqual(original["roll"], 73)
+            self.assertEqual(original["target"], 70)
+            session = store.load_session(game_id).session
+            self.assertEqual(session["turns"][0]["mechanics"][0], original)
+            luck = session["turns"][1]["mechanics"][0]
+            self.assertEqual(
+                luck,
+                {
+                    "mechanic_id": "mechanic_luck",
+                    "kind": "luck_spend",
+                    "actor_id": "investigator_tracker",
+                    "check_id": "mechanic_base",
+                    "points_spent": 3,
+                    "luck_before": 55,
+                    "luck_after": 52,
+                    "success_level_before": "failure",
+                    "success_level_after": "regular_success",
+                    "visibility": "public",
+                    "committed_at": "2026-07-27T00:00:00Z",
+                },
+            )
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 52)
+            self.assertEqual(
+                second.public_mechanics,
+                (
+                    PublicMechanic(
+                        mechanic_id="mechanic_luck",
+                        kind="luck_spend",
+                        actor_id="investigator_tracker",
+                        details={
+                            "check_id": "mechanic_base",
+                            "points_spent": 3,
+                            "luck_before": 55,
+                            "luck_after": 52,
+                            "success_level_before": "failure",
+                            "success_level_after": "regular_success",
+                        },
+                    ),
+                ),
+            )
+            package = json.loads(model.requests[-1].messages[1]["content"])
+            historical_luck = package["COMMITTED_TURNS"][1]["mechanics"][0]
+            self.assertEqual(historical_luck["check_id"], "mechanic_base")
+            self.assertEqual(historical_luck["success_level_after"], "regular_success")
+            self.assertEqual(
+                package["COMMITTED_TURNS"][0]["mechanics"][0]["roll"],
+                73,
+            )
+            self.assertEqual(random_source.calls, [(0, 9), (0, 9)])
+
+    def test_spend_luck_reaches_declared_difficulty_without_critical(self) -> None:
+        """Luck 只买到声明难度，target 为 1 时也不制造 critical。"""
+
+        cases = (
+            ("spot_hidden", "hard", (8, 3), "regular_success", "hard_success"),
+            ("spot_hidden", "extreme", (7, 1), "hard_success", "extreme_success"),
+            ("locksmith", "regular", (4, 0), "failure", "regular_success"),
+        )
+        for ability, difficulty, dice, before, after in cases:
+            with self.subTest(ability=ability, difficulty=difficulty):
+                with tempfile.TemporaryDirectory() as directory:
+                    store, game_id = self._create_session(Path(directory))
+                    base = self._valid_check_arguments()
+                    base["ability"] = ability
+                    base["difficulty"] = difficulty
+                    random_source = ScriptedRandom(dice)
+                    harness = AgenticHarness(
+                        store,
+                        ScriptedGameMasterModel(
+                            self._base_and_luck_responses(base_arguments=base)
+                        ),
+                        mechanic_id_factory=iter(
+                            ("mechanic_base", "mechanic_luck")
+                        ).__next__,
+                        random_source=random_source,
+                    )
+
+                    self.assertEqual(
+                        harness.start_turn(game_id, "我先尝试检定。").status,
+                        "committed",
+                    )
+                    result = harness.start_turn(game_id, "我花费 3 点幸运。")
+
+                    self.assertEqual(result.status, "committed")
+                    luck = store.load_session(game_id).session["turns"][1][
+                        "mechanics"
+                    ][0]
+                    self.assertEqual(luck["success_level_before"], before)
+                    self.assertEqual(luck["success_level_after"], after)
+                    self.assertNotEqual(luck["success_level_after"], "critical_success")
+                    self.assertEqual(random_source.calls, [(0, 9), (0, 9)])
+
+    def test_spend_luck_preflight_rejects_invalid_base_points_and_balance(self) -> None:
+        """Luck 的来源、适用性、精确支付和余额都在 ID/RNG 前拒绝。"""
+
+        valid = self._valid_check_arguments()
+        cases = (
+            ("unknown", None, (), "missing", 3, "invalid_check_id"),
+            ("success", valid, (0, 7), "mechanic_base", 1, "luck_not_allowed"),
+            ("fumble", valid, (0, 0), "mechanic_base", 30, "luck_not_allowed"),
+            (
+                "npc",
+                {**valid, "actor_id": "npc_vespera"},
+                (1, 7),
+                "mechanic_base",
+                1,
+                "luck_not_allowed",
+            ),
+            (
+                "hidden",
+                {**valid, "visibility": "hidden"},
+                (3, 7),
+                "mechanic_base",
+                3,
+                "luck_not_allowed",
+            ),
+            (
+                "zero target",
+                {**valid, "ability": "locksmith", "difficulty": "extreme"},
+                (2, 0),
+                "mechanic_base",
+                2,
+                "luck_not_allowed",
+            ),
+            ("too few", valid, (3, 7), "mechanic_base", 2, "invalid_luck_points"),
+            ("too many", valid, (3, 7), "mechanic_base", 4, "invalid_luck_points"),
+            (
+                "insufficient balance",
+                {**valid, "ability": "locksmith"},
+                (3, 6),
+                "mechanic_base",
+                62,
+                "insufficient_luck",
+            ),
+        )
+        for label, base, dice, check_id, points, expected_code in cases:
+            with self.subTest(label=label):
+                self._assert_luck_rejected_after_base(
+                    base_arguments=base,
+                    base_dice=dice,
+                    check_id=check_id,
+                    points=points,
+                    expected_code=expected_code,
+                )
+
+    def test_spend_luck_requires_base_check_from_prior_player_turn(self) -> None:
+        """同一未完成回合刚产生的失败不能被 GM 自动花费 Luck。"""
+
+        allocated: list[str] = []
+
+        def next_mechanic_id() -> str:
+            ids = ("mechanic_base", "mechanic_unexpected")
+            value = ids[len(allocated)]
+            allocated.append(value)
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom((3, 7))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            self._valid_check_arguments(),
+                            tool_call_id="call_base",
+                        ),
+                        self._tool_response(
+                            {"check_id": "mechanic_base", "points": 3},
+                            name="spend_luck",
+                            tool_call_id="call_luck",
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            ).start_turn(game_id, "我只声明第一次检查牢门。")
+
+            self.assertEqual(result.error_code, "request_timeout")
+            self.assertEqual(allocated, ["mechanic_base"])
+            self.assertEqual(random_source.calls, [(0, 9), (0, 9)])
+            session = store.load_session(game_id).session
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 55)
+            incomplete = session["incomplete_turn"]
+            self.assertEqual(
+                [mechanic["mechanic_id"] for mechanic in incomplete["mechanics"]],
+                ["mechanic_base"],
+            )
+            self.assertEqual(
+                incomplete["tool_interactions"][1]["error"]["code"],
+                "luck_not_allowed",
+            )
+
+    def test_spend_luck_rejects_non_check_and_repeated_derivation(self) -> None:
+        """Luck mechanic 不是 check_id，且原失败只能花费一次 Luck。"""
+
+        for attempted_check_id, expected_code in (
+            ("mechanic_base", "luck_not_allowed"),
+            ("mechanic_luck", "invalid_check_id"),
+        ):
+            with self.subTest(check_id=attempted_check_id), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                allocated: list[str] = []
+
+                def next_mechanic_id() -> str:
+                    ids = ("mechanic_base", "mechanic_luck", "mechanic_unexpected")
+                    value = ids[len(allocated)]
+                    allocated.append(value)
+                    return value
+
+                random_source = ScriptedRandom((3, 7))
+                harness = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        self._base_and_luck_responses()
+                        + [
+                            self._tool_response(
+                                {"check_id": attempted_check_id, "points": 3},
+                                name="spend_luck",
+                            ),
+                            ModelCallError("request_timeout", "stop", retryable=True),
+                        ]
+                    ),
+                    mechanic_id_factory=next_mechanic_id,
+                    random_source=random_source,
+                )
+
+                harness.start_turn(game_id, "我先检查牢门。")
+                harness.start_turn(game_id, "我花费 3 点幸运。")
+                random_calls_before = list(random_source.calls)
+                result = harness.start_turn(game_id, "我试图再次花费幸运。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(allocated, ["mechanic_base", "mechanic_luck"])
+                self.assertEqual(random_source.calls, random_calls_before)
+                session = store.load_session(game_id).session
+                investigator = self._actor(session, "investigator_tracker")
+                self.assertEqual(investigator["luck"]["current"], 52)
+                incomplete = session["incomplete_turn"]
+                self.assertEqual(incomplete["mechanics"], [])
+                self.assertEqual(
+                    incomplete["tool_interactions"][0]["error"]["code"],
+                    expected_code,
+                )
+
+    def test_player_can_spend_luck_on_two_independent_failed_checks(self) -> None:
+        """不同基础检定各自允许一次 Luck，并保持连续余额。"""
+
+        mechanic_ids = iter(
+            (
+                "mechanic_base_a",
+                "mechanic_luck_a",
+                "mechanic_base_b",
+                "mechanic_luck_b",
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom((3, 7, 4, 7))
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    self._base_and_luck_responses(
+                        check_id="mechanic_base_a",
+                    )
+                    + self._base_and_luck_responses(
+                        check_id="mechanic_base_b",
+                        points=4,
+                    )
+                ),
+                mechanic_id_factory=mechanic_ids.__next__,
+                random_source=random_source,
+            )
+
+            for player_input in (
+                "我先检查第一处痕迹。",
+                "我为第一次检定花费 3 点幸运。",
+                "我再检查第二处痕迹。",
+                "我为第二次检定花费 4 点幸运。",
+            ):
+                self.assertEqual(
+                    harness.start_turn(game_id, player_input).status,
+                    "committed",
+                )
+
+            session = store.load_session(game_id).session
+            luck_records = [
+                mechanic
+                for turn in session["turns"]
+                for mechanic in turn["mechanics"]
+                if mechanic["kind"] == "luck_spend"
+            ]
+            self.assertEqual(
+                [
+                    (record["luck_before"], record["luck_after"])
+                    for record in luck_records
+                ],
+                [(55, 52), (52, 48)],
+            )
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 48)
+            self.assertEqual(random_source.calls, [(0, 9)] * 4)
+
+    def test_spend_luck_rejects_check_with_prior_push_chain(self) -> None:
+        """Push 后整条补救链不能再采用 Luck。"""
+
+        final = self._final_payload()
+        push = {
+            "check_id": "mechanic_base",
+            "new_approach": "改从门轴侧面拆卸",
+            "failure_stakes": "门轴断裂并夹伤手掌",
+        }
+        for attempted_check_id in ("mechanic_base", "mechanic_pushed"):
+            with self.subTest(check_id=attempted_check_id), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                allocated: list[str] = []
+
+                def next_mechanic_id() -> str:
+                    ids = ("mechanic_base", "mechanic_pushed", "mechanic_unexpected")
+                    value = ids[len(allocated)]
+                    allocated.append(value)
+                    return value
+
+                random_source = ScriptedRandom((3, 7, 4, 7))
+                harness = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(self._valid_check_arguments()),
+                            self._response(final),
+                            self._tool_response(push, name="push_check"),
+                            self._response(final),
+                            self._tool_response(
+                                {"check_id": attempted_check_id, "points": 3},
+                                name="spend_luck",
+                            ),
+                            ModelCallError("request_timeout", "stop", retryable=True),
+                        ]
+                    ),
+                    mechanic_id_factory=next_mechanic_id,
+                    random_source=random_source,
+                )
+
+                harness.start_turn(game_id, "我先检查牢门。")
+                harness.start_turn(game_id, "我换一种做法孤注一掷。")
+                random_calls_before = list(random_source.calls)
+                result = harness.start_turn(game_id, "我又尝试花费幸运。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(allocated, ["mechanic_base", "mechanic_pushed"])
+                self.assertEqual(random_source.calls, random_calls_before)
+                session = store.load_session(game_id).session
+                investigator = self._actor(session, "investigator_tracker")
+                self.assertEqual(investigator["luck"]["current"], 55)
+                self.assertEqual(
+                    session["incomplete_turn"]["tool_interactions"][0]["error"]["code"],
+                    "luck_not_allowed",
+                )
+
+    def test_push_rejects_check_with_real_luck_chain_before_id_and_rng(self) -> None:
+        """真实 Luck 提交后，原失败不能再被 Push。"""
+
+        allocated: list[str] = []
+
+        def next_mechanic_id() -> str:
+            ids = ("mechanic_base", "mechanic_luck", "mechanic_unexpected")
+            value = ids[len(allocated)]
+            allocated.append(value)
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom((3, 7))
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    self._base_and_luck_responses()
+                    + [
+                        self._tool_response(
+                            {
+                                "check_id": "mechanic_base",
+                                "new_approach": "改从门轴侧面拆卸",
+                                "failure_stakes": "门轴断裂并夹伤手掌",
+                            },
+                            name="push_check",
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            )
+
+            harness.start_turn(game_id, "我先检查牢门。")
+            harness.start_turn(game_id, "我花费 3 点幸运。")
+            random_calls_before = list(random_source.calls)
+            result = harness.start_turn(game_id, "我又尝试孤注一掷。")
+
+            self.assertEqual(result.error_code, "request_timeout")
+            self.assertEqual(allocated, ["mechanic_base", "mechanic_luck"])
+            self.assertEqual(random_source.calls, random_calls_before)
+            session = store.load_session(game_id).session
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 52)
+            self.assertEqual(
+                session["incomplete_turn"]["tool_interactions"][0]["error"]["code"],
+                "push_not_allowed",
+            )
+
+    def test_spend_luck_rejects_non_check_mechanic_before_id_and_rng(self) -> None:
+        """语义化 check_id 不能引用其他 mechanic kind。"""
+
+        final = self._final_payload("测试机械已经解释。")
+        profile = deepseek_model_profile(enabled_tools=("lifecycle_test", "spend_luck"))
+        registry = {
+            "lifecycle_test": LifecycleTestTool(),
+            "spend_luck": SpendLuckTool(),
+        }
+        allocated: list[str] = []
+
+        def next_mechanic_id() -> str:
+            value = "mechanic_non_check" if not allocated else "mechanic_unexpected"
+            allocated.append(value)
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            random_source = ScriptedRandom(())
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "amount": 1,
+                                "visibility": "public",
+                            },
+                            name="lifecycle_test",
+                        ),
+                        self._response(final),
+                        self._tool_response(
+                            {"check_id": "mechanic_non_check", "points": 1},
+                            name="spend_luck",
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                model_profile=profile,
+                tool_registry=registry,
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            )
+
+            self.assertEqual(
+                harness.start_turn(game_id, "我先使用测试机械。").status,
+                "committed",
+            )
+            result = harness.start_turn(game_id, "我尝试花费幸运改善它。")
+
+            self.assertEqual(result.error_code, "request_timeout")
+            self.assertEqual(allocated, ["mechanic_non_check"])
+            self.assertEqual(random_source.calls, [])
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(
+                incomplete["tool_interactions"][0]["error"]["code"],
+                "invalid_check_id",
+            )
+
+    def test_spend_luck_replays_once_after_interruption_and_restart(self) -> None:
+        """Luck 提交后中断只回放同一机械，不重复扣点。"""
+
+        final = self._final_payload("花费幸运后的结果已经解释。")
+        luck_arguments = {"check_id": "mechanic_base", "points": 3}
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(self._valid_check_arguments()),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: "mechanic_base",
+                random_source=ScriptedRandom((3, 7)),
+            ).start_turn(game_id, "我先检查牢门。")
+            luck_random = ScriptedRandom(())
+            interrupted = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            luck_arguments,
+                            name="spend_luck",
+                            tool_call_id="call_luck",
+                        ),
+                        ModelCallError("request_timeout", "stop after Luck", retryable=True),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_luck",
+                mechanic_id_factory=lambda: "mechanic_luck",
+                random_source=luck_random,
+            ).start_turn(game_id, "我花费 3 点幸运。")
+
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            self.assertEqual(luck_random.calls, [])
+            before_resume = store.load_session(game_id).session
+            original_luck = json.loads(
+                json.dumps(before_resume["incomplete_turn"]["mechanics"][0])
+            )
+            investigator = self._actor(before_resume, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 52)
+            replay_random = ScriptedRandom(())
+            resumed = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            luck_arguments,
+                            name="spend_luck",
+                            tool_call_id="call_luck",
+                        ),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "replayed Luck allocated a new mechanic ID"
+                ),
+                random_source=replay_random,
+            ).resume_turn(game_id, "turn_luck")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(replay_random.calls, [])
+            session = store.load_session(game_id).session
+            self.assertEqual(session["turns"][1]["mechanics"], [original_luck])
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 52)
+            self.assertIsNone(session["incomplete_turn"])
+
+    def test_spend_luck_write_failure_leaves_no_partial_deduction(self) -> None:
+        """Luck 原子写失败时不扣点、不保存机械或发布玩家事件。"""
+
+        final = self._final_payload("基础检定已经解释。")
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(self._valid_check_arguments()),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: "mechanic_base",
+                random_source=ScriptedRandom((3, 7)),
+            ).start_turn(game_id, "我先检查牢门。")
+            writes = 0
+
+            def fail_luck_write(path: Path, value: object) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected Luck write failure")
+                write_json_atomic(path, value)
+
+            published: list[PublicMechanic] = []
+            random_source = ScriptedRandom(())
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {"check_id": "mechanic_base", "points": 3},
+                            name="spend_luck",
+                        )
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_luck_write_failure",
+                mechanic_id_factory=lambda: "mechanic_uncommitted_luck",
+                random_source=random_source,
+                session_writer=fail_luck_write,
+            ).start_turn(
+                game_id,
+                "我花费 3 点幸运。",
+                public_mechanic_sink=published.append,
+            )
+
+            self.assertEqual(result.error_code, "tool_commit_failed")
+            self.assertEqual(result.public_mechanics, ())
+            self.assertEqual(published, [])
+            self.assertEqual(random_source.calls, [])
+            session = store.load_session(game_id).session
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["luck"]["current"], 55)
+            self.assertEqual(len(session["turns"]), 1)
+            incomplete = session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(incomplete["tool_interactions"], [])
+
+    def test_loader_rejects_tampered_luck_schema_balance_and_chain(self) -> None:
+        """装载时拒绝 Luck 字段、算术、余额、来源、顺序和重复派生篡改。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    self._base_and_luck_responses()
+                ),
+                mechanic_id_factory=iter(
+                    ("mechanic_base", "mechanic_luck")
+                ).__next__,
+                random_source=ScriptedRandom((3, 7)),
+            )
+            self.assertEqual(
+                harness.start_turn(game_id, "我先检查牢门。").status,
+                "committed",
+            )
+            self.assertEqual(
+                harness.start_turn(game_id, "我花费 3 点幸运。").status,
+                "committed",
+            )
+            session_file = store.session_root / game_id / "session.json"
+            baseline = read_json(session_file)
+
+            for label in (
+                "extra field",
+                "broken arithmetic",
+                "actor balance",
+                "detached source",
+                "changed source relationship",
+                "reordered chronology",
+                "duplicate derivation",
+            ):
+                with self.subTest(label=label):
+                    tampered = json.loads(json.dumps(baseline))
+                    luck = tampered["turns"][1]["mechanics"][0]
+                    if label == "extra field":
+                        luck["unexpected"] = True
+                    elif label == "broken arithmetic":
+                        luck["luck_after"] = 51
+                    elif label == "actor balance":
+                        investigator = self._actor(
+                            tampered,
+                            "investigator_tracker",
+                        )
+                        investigator["luck"]["current"] = 51
+                    elif label == "detached source":
+                        luck["check_id"] = "mechanic_missing"
+                    elif label == "changed source relationship":
+                        tampered["turns"][0]["mechanics"][0]["roll"] = 74
+                    elif label == "reordered chronology":
+                        tampered["turns"].reverse()
+                    else:
+                        duplicate = json.loads(json.dumps(luck))
+                        duplicate["mechanic_id"] = "mechanic_duplicate_luck"
+                        tampered["turns"][1]["mechanics"].append(duplicate)
                     write_json_atomic(session_file, tampered)
                     with self.assertRaisesRegex(
                         AgenticSessionLoadError,
