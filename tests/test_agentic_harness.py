@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from monmusu_agent.agentic_coc import (
     MakeCheckError,
     MakeCheckTool,
+    PushCheckTool,
     RandomSource,
     ToolExecution,
 )
@@ -97,8 +98,9 @@ class LifecycleTestTool:
         *,
         actors: object,
         mechanics: tuple[Mapping[str, Any], ...],
+        current_turn_mechanics: tuple[Mapping[str, Any], ...],
     ) -> object:
-        del mechanics
+        del mechanics, current_turn_mechanics
         if not isinstance(actors, list):
             raise MakeCheckError("actor_data_unavailable", "测试角色卡不可用")
         frozen_actors = json.loads(json.dumps(actors))
@@ -245,6 +247,141 @@ class LifecycleTestTool:
             "luck_before": value["luck_before"],
             "luck_after": value["luck_after"],
         }
+
+
+class HistoricalLuckMarkerTool:
+    """只为 Push 链测试提交一条既有 Luck 补救记录。"""
+
+    definition = {
+        "type": "function",
+        "function": {
+            "name": "historical_luck_marker",
+            "description": "测试既有 Luck 补救链。",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["check_id"],
+                "properties": {"check_id": {"type": "string"}},
+            },
+        },
+    }
+    mechanic_kind = "luck_spend"
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]:
+        try:
+            value = json.loads(arguments_raw)
+        except json.JSONDecodeError as error:
+            raise MakeCheckError("invalid_arguments", "测试 Luck 参数不是合法 JSON") from error
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"check_id"}
+            or not isinstance(value["check_id"], str)
+            or not value["check_id"]
+        ):
+            raise MakeCheckError("invalid_arguments", "测试 Luck 参数无效")
+        return {"check_id": value["check_id"]}
+
+    def preflight(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+        current_turn_mechanics: tuple[Mapping[str, Any], ...],
+    ) -> object:
+        del current_turn_mechanics
+        source = next(
+            (
+                mechanic
+                for mechanic in mechanics
+                if mechanic.get("mechanic_id") == arguments["check_id"]
+                and mechanic.get("kind") == "check"
+            ),
+            None,
+        )
+        if source is None or not isinstance(actors, list):
+            raise MakeCheckError("invalid_check_id", "测试 Luck 来源无效")
+        return {
+            "check_id": arguments["check_id"],
+            "actor_id": source["actor_id"],
+            "actors": json.loads(json.dumps(actors)),
+        }
+
+    def execute(
+        self,
+        prepared: object,
+        *,
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution:
+        del random_source
+        if not isinstance(prepared, dict):
+            raise ValueError("测试 Luck 冻结输入无效")
+        return ToolExecution(
+            mechanic={
+                "mechanic_id": mechanic_id,
+                "kind": "luck_spend",
+                "actor_id": prepared["actor_id"],
+                "check_id": prepared["check_id"],
+                "visibility": "public",
+                "committed_at": committed_at,
+            },
+            actors=prepared["actors"],
+        )
+
+    @staticmethod
+    def validate_result(value: object) -> None:
+        fields = {
+            "mechanic_id",
+            "kind",
+            "actor_id",
+            "check_id",
+            "visibility",
+            "committed_at",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != fields
+            or value.get("kind") != "luck_spend"
+            or value.get("visibility") != "public"
+            or any(
+                not isinstance(value.get(field), str) or not value[field]
+                for field in ("mechanic_id", "actor_id", "check_id", "committed_at")
+            )
+        ):
+            raise ValueError("测试 Luck mechanic 格式无效")
+
+    @staticmethod
+    def validate_result_arguments(
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> None:
+        if arguments.get("check_id") != value.get("check_id"):
+            raise ValueError("测试 Luck mechanic 与参数不一致")
+
+    @staticmethod
+    def validate_persistence(
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        HistoricalLuckMarkerTool.validate_result(value)
+        if (
+            not isinstance(actors, list)
+            or not any(actor.get("actor_id") == value.get("actor_id") for actor in actors)
+            or not any(
+                mechanic.get("mechanic_id") == value.get("check_id")
+                and mechanic.get("kind") == "check"
+                for mechanic in mechanics
+            )
+        ):
+            raise ValueError("测试 Luck mechanic 持久化无效")
+
+    @staticmethod
+    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"check_id": value["check_id"]}
 
 
 class MutatingFailureTool(LifecycleTestTool):
@@ -430,6 +567,76 @@ class AgenticHarnessTest(unittest.TestCase):
             "stakes": "失败会错过痕迹",
             "visibility": "public",
         }
+
+    def _assert_push_rejected_after_base(
+        self,
+        *,
+        base_arguments: dict[str, object] | None,
+        base_dice: tuple[int, ...],
+        check_id: str,
+        expected_code: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            push_arguments = {
+                "check_id": check_id,
+                "new_approach": "改从门轴侧面拆卸",
+                "failure_stakes": "门轴断裂并夹伤手掌",
+            }
+            responses: list[ModelResponse | ModelCallError] = []
+            if base_arguments is not None:
+                responses.extend(
+                    [
+                        self._tool_response(base_arguments),
+                        self._response(
+                            {
+                                "narration": "基础检定已解释。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                    ]
+                )
+            responses.extend(
+                [
+                    self._tool_response(push_arguments, name="push_check"),
+                    ModelCallError("request_timeout", "stop after push rejection", retryable=True),
+                ]
+            )
+            calls: list[str] = []
+
+            def next_mechanic_id() -> str:
+                calls.append("allocated")
+                if len(calls) == 1 and base_arguments is not None:
+                    return "mechanic_base"
+                return "mechanic_unexpected"
+
+            random_source = ScriptedRandom(base_dice)
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(responses),
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            )
+            if base_arguments is not None:
+                first = harness.start_turn(game_id, "我先执行基础检定。")
+                self.assertEqual(first.status, "committed")
+            calls_before_push = list(calls)
+            random_calls_before_push = list(random_source.calls)
+
+            result = harness.start_turn(game_id, "我明确选择换一种做法孤注一掷。")
+
+            self.assertEqual(result.error_code, "request_timeout")
+            self.assertEqual(calls, calls_before_push)
+            self.assertEqual(random_source.calls, random_calls_before_push)
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(
+                incomplete["tool_interactions"][0]["error"]["code"],
+                expected_code,
+            )
+
 
     def test_non_check_tool_commits_state_then_replays_exactly_once_after_restart(self) -> None:
         """非检定工具的角色变化先提交，重建进程恢复时按调用 ID 幂等重放。"""
@@ -943,19 +1150,6 @@ class AgenticHarnessTest(unittest.TestCase):
         """占位目录项也保存规范参数，并按规范参数幂等重放失败。"""
 
         cases = (
-            (
-                "push_check",
-                {
-                    "check_id": "mechanic_check_0001",
-                    "new_approach": "从铰链侧卸门",
-                    "failure_stakes": "门轴会断裂并夹伤手掌",
-                },
-                {
-                    "check_id": "mechanic_check_0001",
-                    "new_approach": "从铰链侧卸门",
-                    "failure_stakes": "门轴会断裂并夹伤手掌",
-                },
-            ),
             (
                 "spend_luck",
                 {"check_id": "mechanic_check_0001", "points": 3},
@@ -3803,6 +3997,796 @@ class AgenticHarnessTest(unittest.TestCase):
                     random_source.calls,
                     [(0, 9)] * (count + 2),
                 )
+
+    def test_make_check_snapshots_player_remediation_eligibility(self) -> None:
+        """只有公开调查员的普通失败在提交时保留 Push/Luck 资格。"""
+
+        cases = (
+            ("public investigator failure", "investigator_tracker", "regular", "public", (1, 7), True),
+            ("missed hard difficulty", "investigator_tracker", "hard", "public", (0, 7), True),
+            ("investigator fumble", "investigator_tracker", "regular", "public", (0, 0), False),
+            ("investigator success", "investigator_tracker", "regular", "public", (0, 7), False),
+            ("public npc failure", "npc_vespera", "regular", "public", (1, 7), False),
+            ("hidden investigator failure", "investigator_tracker", "regular", "hidden", (1, 7), False),
+        )
+        for label, actor_id, difficulty, visibility, dice, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                model = ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": actor_id,
+                                "ability": "spot_hidden",
+                                "difficulty": difficulty,
+                                "dice_adjustment": {"kind": "none", "count": 0},
+                                "action": "尝试发现牢门上的细小痕迹",
+                                "stakes": "失败会错过眼前的线索",
+                                "visibility": visibility,
+                            }
+                        ),
+                        self._response(
+                            {
+                                "narration": "检定已经得到解释。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                    ]
+                )
+                result = AgenticHarness(
+                    store,
+                    model,
+                    mechanic_id_factory=lambda: "mechanic_eligibility",
+                    random_source=ScriptedRandom(dice),
+                ).start_turn(game_id, "我尝试寻找痕迹。")
+
+                self.assertEqual(result.status, "committed")
+                mechanic = store.load_session(game_id).session["turns"][0]["mechanics"][0]
+                self.assertIs(mechanic["push_eligible"], expected)
+                self.assertIs(mechanic["luck_eligible"], expected)
+
+    def test_fixed_point_eligibility_snapshots_load_without_authorizing_push(self) -> None:
+        """兼容旧运行时快照，但 Push 仍按真实角色、可见性和结果拒绝。"""
+
+        cases = (
+            ("hidden failure", "investigator_tracker", "hidden", (1, 7), True, True),
+            ("npc failure", "npc_vespera", "public", (1, 7), True, True),
+            ("fumble", "investigator_tracker", "public", (0, 0), True, False),
+        )
+        for label, actor_id, visibility, dice, old_push, old_luck in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                {
+                                    **self._valid_check_arguments(),
+                                    "actor_id": actor_id,
+                                    "visibility": visibility,
+                                }
+                            ),
+                            self._response(
+                                {
+                                    "narration": "旧运行时已经提交检定。",
+                                    "establish": [],
+                                    "retire": [],
+                                    "session_status": "ongoing",
+                                }
+                            ),
+                        ]
+                    ),
+                    mechanic_id_factory=lambda: "mechanic_base",
+                    random_source=ScriptedRandom(dice),
+                ).start_turn(game_id, "我执行一次旧运行时检定。")
+                session_file = store.session_root / game_id / "session.json"
+                fixed_point_session = read_json(session_file)
+                mechanic = fixed_point_session["turns"][0]["mechanics"][0]
+                mechanic["push_eligible"] = old_push
+                mechanic["luck_eligible"] = old_luck
+                write_json_atomic(session_file, fixed_point_session)
+
+                loaded = store.load_session(game_id).session
+                self.assertIs(
+                    loaded["turns"][0]["mechanics"][0]["push_eligible"],
+                    old_push,
+                )
+                random_source = ScriptedRandom(())
+                result = AgenticHarness(
+                    store,
+                    ScriptedGameMasterModel(
+                        [
+                            self._tool_response(
+                                {
+                                    "check_id": "mechanic_base",
+                                    "new_approach": "改从门轴侧面拆卸",
+                                    "failure_stakes": "门轴断裂并夹伤手掌",
+                                },
+                                name="push_check",
+                            ),
+                            ModelCallError("request_timeout", "stop", retryable=True),
+                        ]
+                    ),
+                    mechanic_id_factory=lambda: self.fail(
+                        "legacy-ineligible push allocated a mechanic ID"
+                    ),
+                    random_source=random_source,
+                ).start_turn(game_id, "我尝试孤注一掷。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(random_source.calls, [])
+                incomplete = store.load_session(game_id).session["incomplete_turn"]
+                self.assertEqual(
+                    incomplete["tool_interactions"][0]["error"]["code"],
+                    "push_not_allowed",
+                )
+
+    def test_player_can_push_committed_failed_check_on_next_turn(self) -> None:
+        """Push 继承可信检定参数并以新记录公开提交，不覆盖原失败。"""
+
+        base_arguments = {
+            "actor_id": "investigator_tracker",
+            "ability": "spot_hidden",
+            "difficulty": "hard",
+            "dice_adjustment": {"kind": "bonus", "count": 1},
+            "action": "用发卡拨动锈蚀锁芯",
+            "stakes": "失败会制造足以引来守卫的金属声",
+            "visibility": "public",
+        }
+        push_arguments = {
+            "check_id": "mechanic_base",
+            "new_approach": "拆下门轴固定钉，从铰链一侧强行卸门",
+            "failure_stakes": "若仍失败，门轴会断裂并把手夹在石框中",
+        }
+        final = {
+            "narration": "机械结果已经得到忠实解释。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(base_arguments),
+                    self._response(final),
+                    self._tool_response(push_arguments, name="push_check"),
+                    self._response(final),
+                ]
+            )
+            mechanic_ids = iter(("mechanic_base", "mechanic_pushed"))
+            random_source = ScriptedRandom((0, 7, 8, 4, 1, 9))
+            harness = AgenticHarness(
+                store,
+                model,
+                mechanic_id_factory=lambda: next(mechanic_ids),
+                random_source=random_source,
+            )
+
+            first = harness.start_turn(game_id, "我用发卡撬锁。")
+            original = json.loads(
+                json.dumps(
+                    store.load_session(game_id).session["turns"][0]["mechanics"][0]
+                )
+            )
+            second = harness.start_turn(
+                game_id,
+                "我不花幸运。我拆门轴并接受夹伤手掌的风险，孤注一掷。",
+            )
+
+            self.assertEqual(first.status, "committed")
+            self.assertEqual(second.status, "committed")
+            session = store.load_session(game_id).session
+            self.assertEqual(session["turns"][0]["mechanics"][0], original)
+            self.assertEqual(original["success_level"], "regular_success")
+            self.assertIs(original["push_eligible"], True)
+            pushed = session["turns"][1]["mechanics"][0]
+            for field in (
+                "actor_id",
+                "ability",
+                "ability_value",
+                "difficulty",
+                "target",
+                "dice_adjustment",
+                "visibility",
+            ):
+                self.assertEqual(pushed[field], original[field])
+            self.assertEqual(pushed["mechanic_id"], "mechanic_pushed")
+            self.assertEqual(pushed["action"], push_arguments["new_approach"])
+            self.assertEqual(pushed["stakes"], push_arguments["failure_stakes"])
+            self.assertEqual(pushed["pushed_from"], "mechanic_base")
+            self.assertIs(pushed["is_pushed"], True)
+            self.assertIs(pushed["push_eligible"], False)
+            self.assertIs(pushed["luck_eligible"], False)
+            self.assertEqual(second.public_mechanics[0].details["pushed_from"], "mechanic_base")
+            self.assertIs(second.public_mechanics[0].details["is_pushed"], True)
+            self.assertEqual(random_source.calls, [(0, 9)] * 6)
+
+    def test_push_preflight_rejects_invalid_base_before_id_and_rng(self) -> None:
+        """Push 的未知、非失败或非玩家来源都在可信边界前拒绝。"""
+
+        valid = self._valid_check_arguments()
+        cases = (
+            ("unknown check", None, (), "missing_check", "invalid_check_id"),
+            ("successful check", valid, (0, 7), "mechanic_base", "push_not_allowed"),
+            ("fumble check", valid, (0, 0), "mechanic_base", "push_not_allowed"),
+            (
+                "npc check",
+                {**valid, "actor_id": "npc_vespera"},
+                (1, 7),
+                "mechanic_base",
+                "push_not_allowed",
+            ),
+            (
+                "hidden check",
+                {**valid, "visibility": "hidden"},
+                (1, 7),
+                "mechanic_base",
+                "push_not_allowed",
+            ),
+        )
+        for label, base_arguments, base_dice, check_id, expected_code in cases:
+            with self.subTest(label=label):
+                self._assert_push_rejected_after_base(
+                    base_arguments=base_arguments,
+                    base_dice=base_dice,
+                    check_id=check_id,
+                    expected_code=expected_code,
+                )
+
+    def test_push_requires_base_check_from_prior_player_turn(self) -> None:
+        """同一未完成回合刚产生的失败不能被 GM 自动 Push。"""
+
+        push_arguments = {
+            "check_id": "mechanic_base",
+            "new_approach": "改从门轴侧面拆卸",
+            "failure_stakes": "门轴断裂并夹伤手掌",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            allocated: list[str] = []
+
+            def next_mechanic_id() -> str:
+                ids = ("mechanic_base", "mechanic_unexpected")
+                value = ids[len(allocated)]
+                allocated.append(value)
+                return value
+
+            random_source = ScriptedRandom((1, 7, 0, 7))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            self._valid_check_arguments(),
+                            tool_call_id="call_base",
+                        ),
+                        self._tool_response(
+                            push_arguments,
+                            name="push_check",
+                            tool_call_id="call_push",
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                ),
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            ).start_turn(game_id, "我只声明第一次检查牢门。")
+
+            self.assertEqual(result.error_code, "request_timeout")
+            self.assertEqual(allocated, ["mechanic_base"])
+            self.assertEqual(random_source.calls, [(0, 9), (0, 9)])
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(
+                [mechanic["mechanic_id"] for mechanic in incomplete["mechanics"]],
+                ["mechanic_base"],
+            )
+            self.assertEqual(
+                incomplete["tool_interactions"][1]["error"]["code"],
+                "push_not_allowed",
+            )
+
+    def test_push_preflight_rejects_non_check_id_before_id_and_rng(self) -> None:
+        """语义化 check_id 不能引用其他 mechanic kind。"""
+
+        profile = deepseek_model_profile(
+            enabled_tools=("lifecycle_test", "push_check")
+        )
+        registry = {
+            "lifecycle_test": LifecycleTestTool(),
+            "push_check": PushCheckTool(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(
+                        {
+                            "actor_id": "investigator_tracker",
+                            "amount": 1,
+                            "visibility": "public",
+                        },
+                        name="lifecycle_test",
+                    ),
+                    self._response(
+                        {
+                            "narration": "测试机械已提交。",
+                            "establish": [],
+                            "retire": [],
+                            "session_status": "ongoing",
+                        }
+                    ),
+                    self._tool_response(
+                        {
+                            "check_id": "mechanic_non_check",
+                            "new_approach": "换一种做法",
+                            "failure_stakes": "接受更严重风险",
+                        },
+                        name="push_check",
+                    ),
+                    ModelCallError("request_timeout", "stop", retryable=True),
+                ]
+            )
+            allocated: list[str] = []
+
+            def next_mechanic_id() -> str:
+                value = (
+                    "mechanic_non_check"
+                    if not allocated
+                    else "mechanic_unexpected"
+                )
+                allocated.append(value)
+                return value
+
+            random_source = ScriptedRandom(())
+            harness = AgenticHarness(
+                store,
+                model,
+                model_profile=profile,
+                tool_registry=registry,
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            )
+
+            first = harness.start_turn(game_id, "我先使用测试机械。")
+            second = harness.start_turn(game_id, "我尝试推动这条非检定记录。")
+
+            self.assertEqual(first.status, "committed")
+            self.assertEqual(second.error_code, "request_timeout")
+            self.assertEqual(allocated, ["mechanic_non_check"])
+            self.assertEqual(random_source.calls, [])
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(
+                incomplete["tool_interactions"][0]["error"]["code"],
+                "invalid_check_id",
+            )
+            self.assertEqual(incomplete["mechanics"], [])
+
+    def test_push_chain_allows_only_one_derivation_before_id_and_rng(self) -> None:
+        """基础检定不能重复 Push，pushed 派生结果也不能再次 Push。"""
+
+        for attempted_check_id in ("mechanic_base", "mechanic_pushed"):
+            with self.subTest(check_id=attempted_check_id), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                push_arguments = {
+                    "check_id": "mechanic_base",
+                    "new_approach": "改从门轴侧面拆卸",
+                    "failure_stakes": "门轴断裂并夹伤手掌",
+                }
+                model = ScriptedGameMasterModel(
+                    [
+                        self._tool_response(self._valid_check_arguments()),
+                        self._response(
+                            {
+                                "narration": "基础检定失败。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                        self._tool_response(push_arguments, name="push_check"),
+                        self._response(
+                            {
+                                "narration": "孤注一掷已经结算。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                        self._tool_response(
+                            {**push_arguments, "check_id": attempted_check_id},
+                            name="push_check",
+                        ),
+                        ModelCallError("request_timeout", "stop", retryable=True),
+                    ]
+                )
+                allocated: list[str] = []
+
+                def next_mechanic_id() -> str:
+                    ids = ("mechanic_base", "mechanic_pushed", "mechanic_unexpected")
+                    value = ids[len(allocated)]
+                    allocated.append(value)
+                    return value
+
+                random_source = ScriptedRandom((1, 7, 0, 7))
+                harness = AgenticHarness(
+                    store,
+                    model,
+                    mechanic_id_factory=next_mechanic_id,
+                    random_source=random_source,
+                )
+
+                harness.start_turn(game_id, "我先检查牢门。")
+                harness.start_turn(game_id, "我换一种做法孤注一掷。")
+                before_random_calls = list(random_source.calls)
+                result = harness.start_turn(game_id, "我试图再次孤注一掷。")
+
+                self.assertEqual(result.error_code, "request_timeout")
+                self.assertEqual(allocated, ["mechanic_base", "mechanic_pushed"])
+                self.assertEqual(random_source.calls, before_random_calls)
+                incomplete = store.load_session(game_id).session["incomplete_turn"]
+                self.assertEqual(
+                    incomplete["tool_interactions"][0]["error"]["code"],
+                    "push_not_allowed",
+                )
+                self.assertEqual(incomplete["mechanics"], [])
+
+    def test_push_rejects_check_with_prior_luck_chain_before_id_and_rng(self) -> None:
+        """一旦补救链包含 Luck 记录，原失败不能再被 Push。"""
+
+        profile = deepseek_model_profile(
+            enabled_tools=("make_check", "historical_luck_marker", "push_check")
+        )
+        registry = {
+            "make_check": MakeCheckTool(),
+            "historical_luck_marker": HistoricalLuckMarkerTool(),
+            "push_check": PushCheckTool(),
+        }
+        final = {
+            "narration": "机械结果已经解释。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(self._valid_check_arguments()),
+                    self._response(final),
+                    self._tool_response(
+                        {"check_id": "mechanic_base"},
+                        name="historical_luck_marker",
+                    ),
+                    self._response(final),
+                    self._tool_response(
+                        {
+                            "check_id": "mechanic_base",
+                            "new_approach": "改从门轴侧面拆卸",
+                            "failure_stakes": "门轴断裂并夹伤手掌",
+                        },
+                        name="push_check",
+                    ),
+                    ModelCallError("request_timeout", "stop", retryable=True),
+                ]
+            )
+            allocated: list[str] = []
+
+            def next_mechanic_id() -> str:
+                ids = ("mechanic_base", "mechanic_luck", "mechanic_unexpected")
+                value = ids[len(allocated)]
+                allocated.append(value)
+                return value
+
+            random_source = ScriptedRandom((1, 7))
+            harness = AgenticHarness(
+                store,
+                model,
+                model_profile=profile,
+                tool_registry=registry,
+                mechanic_id_factory=next_mechanic_id,
+                random_source=random_source,
+            )
+
+            harness.start_turn(game_id, "我先检查牢门。")
+            harness.start_turn(game_id, "我选择使用一次测试 Luck 补救。")
+            before_random_calls = list(random_source.calls)
+            result = harness.start_turn(game_id, "我又尝试对原失败孤注一掷。")
+
+            self.assertEqual(result.error_code, "request_timeout")
+            self.assertEqual(allocated, ["mechanic_base", "mechanic_luck"])
+            self.assertEqual(random_source.calls, before_random_calls)
+            incomplete = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(
+                incomplete["tool_interactions"][0]["error"]["code"],
+                "push_not_allowed",
+            )
+            self.assertEqual(incomplete["mechanics"], [])
+
+    def test_pushed_check_keeps_deterministic_coc_outcome_levels(self) -> None:
+        """Push 的成功、失败和 fumble 都由第二次独立骰点决定。"""
+
+        outcomes = (
+            ("success", (0, 7), "regular_success"),
+            ("failure", (1, 7), "failure"),
+            ("fumble", (0, 0), "fumble"),
+        )
+        for label, pushed_dice, expected_level in outcomes:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store, game_id = self._create_session(Path(directory))
+                model = ScriptedGameMasterModel(
+                    [
+                        self._tool_response(self._valid_check_arguments()),
+                        self._response(
+                            {
+                                "narration": "第一次检定失败。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                        self._tool_response(
+                            {
+                                "check_id": "mechanic_base",
+                                "new_approach": "改从门轴侧面拆卸",
+                                "failure_stakes": "门轴断裂并夹伤手掌",
+                            },
+                            name="push_check",
+                        ),
+                        self._response(
+                            {
+                                "narration": "第二次检定结果已经解释。",
+                                "establish": [],
+                                "retire": [],
+                                "session_status": "ongoing",
+                            }
+                        ),
+                    ]
+                )
+                mechanic_ids = iter(("mechanic_base", "mechanic_pushed"))
+                harness = AgenticHarness(
+                    store,
+                    model,
+                    mechanic_id_factory=lambda: next(mechanic_ids),
+                    random_source=ScriptedRandom((1, 7, *pushed_dice)),
+                )
+
+                harness.start_turn(game_id, "我尝试检查牢门。")
+                result = harness.start_turn(game_id, "我换一种做法孤注一掷。")
+
+                self.assertEqual(result.status, "committed")
+                pushed = store.load_session(game_id).session["turns"][1]["mechanics"][0]
+                self.assertEqual(pushed["success_level"], expected_level)
+                self.assertIs(pushed["push_eligible"], False)
+                self.assertIs(pushed["luck_eligible"], False)
+
+    def test_pushed_check_replays_once_after_interruption_and_restart(self) -> None:
+        """Push 提交后中断，重启恢复只重放原结果且不产生新派生记录。"""
+
+        push_arguments = {
+            "check_id": "mechanic_base",
+            "new_approach": "改从门轴侧面拆卸",
+            "failure_stakes": "门轴断裂并夹伤手掌",
+        }
+        final = {
+            "narration": "孤注一掷结果已经忠实承接。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(self._valid_check_arguments()),
+                        self._response(final),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_base",
+                mechanic_id_factory=lambda: "mechanic_base",
+                random_source=ScriptedRandom((1, 7)),
+            ).start_turn(game_id, "我先检查牢门。")
+
+            pushed_random = ScriptedRandom((0, 7))
+            interrupted = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            push_arguments,
+                            name="push_check",
+                            tool_call_id="call_push",
+                        ),
+                        ModelCallError("request_timeout", "stop after push", retryable=True),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_push",
+                mechanic_id_factory=lambda: "mechanic_pushed",
+                random_source=pushed_random,
+            ).start_turn(game_id, "我换一种做法孤注一掷。")
+
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            self.assertEqual(interrupted.public_mechanics[0].mechanic_id, "mechanic_pushed")
+            before_resume = store.load_session(game_id).session["incomplete_turn"]
+            self.assertEqual(len(before_resume["mechanics"]), 1)
+            original_pushed = json.loads(json.dumps(before_resume["mechanics"][0]))
+            replay_random = ScriptedRandom(())
+            resumed = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            push_arguments,
+                            name="push_check",
+                            tool_call_id="call_push",
+                        ),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "replayed push allocated a new mechanic ID"
+                ),
+                random_source=replay_random,
+            ).resume_turn(game_id, "turn_push")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(replay_random.calls, [])
+            session = store.load_session(game_id).session
+            self.assertEqual(len(session["turns"]), 2)
+            self.assertEqual(session["turns"][1]["mechanics"], [original_pushed])
+            self.assertIsNone(session["incomplete_turn"])
+
+    def test_pushed_check_write_failure_leaves_no_partial_derivation(self) -> None:
+        """Push 原子写失败时不报告或保存未提交的派生检定。"""
+
+        final = {
+            "narration": "基础检定已经解释。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(self._valid_check_arguments()),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: "mechanic_base",
+                random_source=ScriptedRandom((1, 7)),
+            ).start_turn(game_id, "我先检查牢门。")
+            writes = 0
+
+            def fail_push_write(path: Path, value: object) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected push write failure")
+                write_json_atomic(path, value)
+
+            pushed_random = ScriptedRandom((0, 7))
+            published: list[PublicMechanic] = []
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "check_id": "mechanic_base",
+                                "new_approach": "改从门轴侧面拆卸",
+                                "failure_stakes": "门轴断裂并夹伤手掌",
+                            },
+                            name="push_check",
+                        )
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_push_write_failure",
+                mechanic_id_factory=lambda: "mechanic_uncommitted_push",
+                random_source=pushed_random,
+                session_writer=fail_push_write,
+            ).start_turn(
+                game_id,
+                "我换一种做法孤注一掷。",
+                public_mechanic_sink=published.append,
+            )
+
+            self.assertEqual(result.error_code, "tool_commit_failed")
+            self.assertEqual(result.public_mechanics, ())
+            self.assertEqual(published, [])
+            self.assertEqual(pushed_random.calls, [(0, 9), (0, 9)])
+            session = store.load_session(game_id).session
+            self.assertEqual(len(session["turns"]), 1)
+            self.assertEqual(
+                session["turns"][0]["mechanics"][0]["mechanic_id"],
+                "mechanic_base",
+            )
+            incomplete = session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(incomplete["tool_interactions"], [])
+
+    def test_loader_rejects_tampered_pushed_schema_and_inheritance(self) -> None:
+        """装载时拒绝 pushed 字段伪造、断链和继承参数改写。"""
+
+        base = {
+            "actor_id": "investigator_tracker",
+            "ability": "spot_hidden",
+            "difficulty": "hard",
+            "dice_adjustment": {"kind": "none", "count": 0},
+            "action": "检查牢门",
+            "stakes": "失败会错过痕迹",
+            "visibility": "public",
+        }
+        push = {
+            "check_id": "mechanic_base",
+            "new_approach": "改从门轴侧面拆卸",
+            "failure_stakes": "门轴断裂并夹伤手掌",
+        }
+        final = {
+            "narration": "机械结果已经解释。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            harness = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(base),
+                        self._response(final),
+                        self._tool_response(push, name="push_check"),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=iter(("mechanic_base", "mechanic_pushed")).__next__,
+                random_source=ScriptedRandom((0, 7, 1, 4)),
+            )
+            self.assertEqual(harness.start_turn(game_id, "我检查牢门。").status, "committed")
+            self.assertEqual(
+                harness.start_turn(game_id, "我换一种做法孤注一掷。").status,
+                "committed",
+            )
+            session_file = store.session_root / game_id / "session.json"
+            baseline = read_json(session_file)
+
+            for label in (
+                "extra field",
+                "false marker",
+                "detached source",
+                "changed inheritance",
+                "reordered chronology",
+            ):
+                with self.subTest(label=label):
+                    tampered = json.loads(json.dumps(baseline))
+                    pushed = tampered["turns"][1]["mechanics"][0]
+                    if label == "extra field":
+                        pushed["unexpected"] = True
+                    elif label == "false marker":
+                        pushed["is_pushed"] = False
+                    elif label == "detached source":
+                        pushed["pushed_from"] = "mechanic_missing"
+                    else:
+                        if label == "changed inheritance":
+                            pushed["difficulty"] = "regular"
+                            pushed["target"] = 70
+                        else:
+                            tampered["turns"].reverse()
+                    write_json_atomic(session_file, tampered)
+                    with self.assertRaisesRegex(
+                        AgenticSessionLoadError,
+                        "CommittedTurn 格式无效|机械与冻结角色卡不一致",
+                    ):
+                        store.load_session(game_id)
+                    write_json_atomic(session_file, baseline)
 
     def test_invalid_make_check_is_persisted_before_same_gm_continues(self) -> None:
         """可关联的工具错误不掷骰，并以完整交互反馈同一个 GM。"""

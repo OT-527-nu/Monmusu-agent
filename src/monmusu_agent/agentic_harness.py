@@ -1195,15 +1195,20 @@ class AgenticHarness:
         else:
             try:
                 arguments = tool.normalize(arguments_raw)
-                prior_mechanics = tuple(
+                committed_mechanics = tuple(
                     item
                     for turn in working["turns"]
                     for item in turn["mechanics"]
-                ) + tuple(incomplete["mechanics"])
+                )
+                current_turn_mechanics = tuple(incomplete["mechanics"])
+                prior_mechanics = committed_mechanics + current_turn_mechanics
                 prepared = tool.preflight(
                     copy.deepcopy(arguments),
                     actors=copy.deepcopy(working["actors"]),
                     mechanics=copy.deepcopy(prior_mechanics),
+                    current_turn_mechanics=copy.deepcopy(
+                        current_turn_mechanics
+                    ),
                 )
                 mechanic_id = self._new_identifier(
                     self.mechanic_id_factory(),
