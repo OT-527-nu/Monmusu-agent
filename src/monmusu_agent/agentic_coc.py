@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
 
@@ -196,6 +197,26 @@ _LUCK_SPEND_RESULT_FIELDS = frozenset(
         "committed_at",
     }
 )
+_DAMAGE_RESULT_FIELDS = frozenset(
+    {
+        "mechanic_id",
+        "kind",
+        "actor_id",
+        "cause",
+        "damage_expression",
+        "rolls",
+        "raw_damage",
+        "armor_applied",
+        "damage_taken",
+        "hp_before",
+        "hp_after",
+        "major_wound",
+        "unconscious",
+        "dead",
+        "visibility",
+        "committed_at",
+    }
+)
 _DIFFICULTIES = frozenset({"regular", "hard", "extreme"})
 _DECLARED_DIFFICULTY_SUCCESS_LEVEL = {
     "regular": "regular_success",
@@ -212,6 +233,13 @@ _SUCCESS_LEVELS = frozenset(
         "fumble",
     }
 )
+_DICE_EXPRESSION_PATTERN = re.compile(
+    r"(?:(?P<fixed>0|[1-9]\d*)|"
+    r"(?P<count>[1-9]\d*)d(?P<sides>[1-9]\d*)"
+    r"(?P<modifier>[+-](?:0|[1-9]\d*))?)"
+)
+
+
 class RandomSource(Protocol):
     """声明 COC d10 所需的最小可注入随机边界。"""
 
@@ -261,6 +289,8 @@ class CocTool(Protocol):
         self,
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None: ...
 
     def validate_persistence(
@@ -323,6 +353,48 @@ class PreparedSpendLuck:
     luck_before: int
     success_level_before: str
     success_level_after: str
+    actors: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class PreparedDiceExpression:
+    """保存已经通过共同边界校验的固定值或 NdM 表达式。"""
+
+    expression: str
+    count: int
+    sides: int
+    modifier: int
+
+
+@dataclass(frozen=True)
+class DamageActorSnapshot:
+    """保存伤害工具从一张冻结角色卡读取的可信数值。"""
+
+    role: str
+    hp_current: int
+    hp_max: int
+    armor: int
+
+
+@dataclass(frozen=True)
+class DamageOutcome:
+    """保存一次伤害公式产生的全部派生结果。"""
+
+    armor_applied: int
+    damage_taken: int
+    hp_after: int
+    major_wound: bool
+    unconscious: bool
+    dead: bool
+
+
+@dataclass(frozen=True)
+class PreparedDamage:
+    """冻结伤害表达式、角色数值与提交前参数。"""
+
+    arguments: Mapping[str, Any]
+    dice: PreparedDiceExpression
+    actor: DamageActorSnapshot
     actors: list[dict[str, Any]]
 
 
@@ -514,7 +586,10 @@ class MakeCheckTool:
     def validate_result_arguments(
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None:
+        del actors
         if any(
             arguments.get(field) != value.get(field)
             for field in _ARGUMENT_FIELDS
@@ -757,7 +832,10 @@ class PushCheckTool:
     def validate_result_arguments(
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None:
+        del actors
         if (
             arguments.get("check_id") != value.get("pushed_from")
             or arguments.get("new_approach") != value.get("action")
@@ -990,7 +1068,10 @@ class SpendLuckTool:
     def validate_result_arguments(
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None:
+        del actors
         if (
             arguments.get("check_id") != value.get("check_id")
             or arguments.get("points") != value.get("points_spent")
@@ -1165,6 +1246,403 @@ def normalize_make_sanity_check_arguments(arguments_raw: str) -> dict[str, Any]:
     } | {"visibility": visibility}
 
 
+def _parse_dice_expression(expression: str) -> PreparedDiceExpression:
+    """解析 damage/SAN 共用的严格固定值或 NdM 表达式。"""
+
+    match = _DICE_EXPRESSION_PATTERN.fullmatch(expression)
+    if match is None:
+        raise CocToolError("invalid_dice_expression", "骰子表达式格式无效")
+    fixed = match.group("fixed")
+    if fixed is not None:
+        value = int(fixed)
+        if value > 100:
+            raise CocToolError("invalid_dice_expression", "骰子表达式范围必须在 0..100")
+        return PreparedDiceExpression(
+            expression=expression,
+            count=0,
+            sides=0,
+            modifier=value,
+        )
+
+    count = int(match.group("count"))
+    sides = int(match.group("sides"))
+    modifier = int(match.group("modifier") or 0)
+    minimum = count + modifier
+    maximum = count * sides + modifier
+    if (
+        count > 20
+        or sides > 100
+        or not 0 <= minimum <= 100
+        or not 0 <= maximum <= 100
+    ):
+        raise CocToolError("invalid_dice_expression", "骰子表达式范围必须在 0..100")
+    return PreparedDiceExpression(
+        expression=expression,
+        count=count,
+        sides=sides,
+        modifier=modifier,
+    )
+
+
+def _read_damage_actor_snapshot(
+    actors: object,
+    actor_id: str,
+) -> DamageActorSnapshot:
+    if not isinstance(actors, list):
+        raise TypeError("冻结角色卡不可用")
+    actor = next(
+        (
+            candidate
+            for candidate in actors
+            if isinstance(candidate, dict)
+            and candidate.get("actor_id") == actor_id
+        ),
+        None,
+    )
+    if actor is None:
+        raise LookupError("未找到伤害目标角色")
+    role = actor.get("role")
+    hp = actor.get("hp")
+    armor = actor.get("armor")
+    hp_current = hp.get("current") if isinstance(hp, dict) else None
+    hp_max = hp.get("max") if isinstance(hp, dict) else None
+    if (
+        role not in {"investigator", "npc"}
+        or not isinstance(hp_current, int)
+        or isinstance(hp_current, bool)
+        or not isinstance(hp_max, int)
+        or isinstance(hp_max, bool)
+        or not 0 <= hp_current <= hp_max <= 100
+        or hp_max < 1
+        or not isinstance(armor, int)
+        or isinstance(armor, bool)
+        or not 0 <= armor <= 100
+    ):
+        raise ValueError("冻结角色伤害数值不可用")
+    assert isinstance(role, str)
+    return DamageActorSnapshot(
+        role=role,
+        hp_current=hp_current,
+        hp_max=hp_max,
+        armor=armor,
+    )
+
+
+def _resolve_dice_expression(
+    prepared: PreparedDiceExpression,
+    random_source: RandomSource,
+) -> tuple[list[int], int]:
+    if prepared.count == 0:
+        return [], prepared.modifier
+    rolls = [
+        random_source.randint(1, prepared.sides)
+        for _ in range(prepared.count)
+    ]
+    return rolls, sum(rolls) + prepared.modifier
+
+
+def _calculate_damage_outcome(
+    *,
+    raw_damage: int,
+    armor_applies: bool,
+    hp_before: int,
+    hp_max: int,
+    armor: int,
+) -> DamageOutcome:
+    armor_applied = min(raw_damage, armor) if armor_applies else 0
+    damage_taken = raw_damage - armor_applied
+    hp_after = max(0, hp_before - damage_taken)
+    dead = damage_taken >= hp_max
+    return DamageOutcome(
+        armor_applied=armor_applied,
+        damage_taken=damage_taken,
+        hp_after=hp_after,
+        major_wound=damage_taken >= (hp_max + 1) // 2,
+        unconscious=hp_after == 0 and not dead,
+        dead=dead,
+    )
+
+
+class DealDamageTool:
+    """从冻结角色卡结算受限伤害表达式与 HP 变化。"""
+
+    definition = DEAL_DAMAGE_TOOL
+    mechanic_kind = "damage"
+
+    def normalize(self, arguments_raw: str) -> dict[str, Any]:
+        return normalize_deal_damage_arguments(arguments_raw)
+
+    def preflight(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+        current_turn_mechanics: tuple[Mapping[str, Any], ...],
+    ) -> PreparedDamage:
+        del mechanics, current_turn_mechanics
+        if not isinstance(actors, list):
+            raise CocToolError("actor_data_unavailable", "冻结角色卡不可用")
+        frozen_actors = json.loads(json.dumps(actors))
+        try:
+            actor = _read_damage_actor_snapshot(
+                frozen_actors,
+                arguments["actor_id"],
+            )
+        except LookupError as error:
+            raise CocToolError("unknown_actor", "未找到伤害目标角色") from error
+        except (TypeError, ValueError) as error:
+            raise CocToolError(
+                "actor_data_unavailable",
+                "冻结角色伤害数值不可用",
+            ) from error
+        if actor.role == "investigator" and arguments["visibility"] != "public":
+            raise CocToolError("invalid_visibility", "调查员 HP 变化必须公开")
+        return PreparedDamage(
+            arguments=dict(arguments),
+            dice=_parse_dice_expression(arguments["damage_expression"]),
+            actor=actor,
+            actors=frozen_actors,
+        )
+
+    def execute(
+        self,
+        prepared: object,
+        *,
+        mechanic_id: str,
+        random_source: RandomSource,
+        committed_at: str,
+    ) -> ToolExecution:
+        if not isinstance(prepared, PreparedDamage):
+            raise ValueError("deal_damage 冻结输入无效")
+        rolls, raw_damage = _resolve_dice_expression(
+            prepared.dice,
+            random_source,
+        )
+        outcome = _calculate_damage_outcome(
+            raw_damage=raw_damage,
+            armor_applies=prepared.arguments["armor_applies"],
+            hp_before=prepared.actor.hp_current,
+            hp_max=prepared.actor.hp_max,
+            armor=prepared.actor.armor,
+        )
+        updated_actors = json.loads(json.dumps(prepared.actors))
+        actor = next(
+            candidate
+            for candidate in updated_actors
+            if candidate.get("actor_id") == prepared.arguments["actor_id"]
+        )
+        actor["hp"]["current"] = outcome.hp_after
+        return ToolExecution(
+            mechanic={
+                "mechanic_id": mechanic_id,
+                "kind": "damage",
+                "actor_id": prepared.arguments["actor_id"],
+                "cause": prepared.arguments["cause"],
+                "damage_expression": prepared.dice.expression,
+                "rolls": rolls,
+                "raw_damage": raw_damage,
+                "armor_applied": outcome.armor_applied,
+                "damage_taken": outcome.damage_taken,
+                "hp_before": prepared.actor.hp_current,
+                "hp_after": outcome.hp_after,
+                "major_wound": outcome.major_wound,
+                "unconscious": outcome.unconscious,
+                "dead": outcome.dead,
+                "visibility": prepared.arguments["visibility"],
+                "committed_at": committed_at,
+            },
+            actors=updated_actors,
+        )
+
+    @staticmethod
+    def validate_result(value: object) -> None:
+        if not isinstance(value, dict) or set(value) != _DAMAGE_RESULT_FIELDS:
+            raise ValueError("damage mechanic 格式无效")
+        for field in (
+            "mechanic_id",
+            "actor_id",
+            "cause",
+            "damage_expression",
+            "committed_at",
+        ):
+            _required_string(value.get(field), field)
+        try:
+            expression = _parse_dice_expression(value["damage_expression"])
+        except CocToolError as error:
+            raise ValueError("damage mechanic 格式无效") from error
+        rolls = value.get("rolls")
+        if (
+            not isinstance(rolls, list)
+            or len(rolls) != expression.count
+            or any(
+                not isinstance(roll, int)
+                or isinstance(roll, bool)
+                or not 1 <= roll <= expression.sides
+                for roll in rolls
+            )
+        ):
+            raise ValueError("damage mechanic 格式无效")
+        raw_damage = value.get("raw_damage")
+        armor_applied = value.get("armor_applied")
+        damage_taken = value.get("damage_taken")
+        hp_before = value.get("hp_before")
+        hp_after = value.get("hp_after")
+        numeric_fields = (
+            raw_damage,
+            armor_applied,
+            damage_taken,
+            hp_before,
+            hp_after,
+        )
+        if (
+            value.get("kind") != "damage"
+            or value.get("visibility") not in {"public", "hidden"}
+            or any(
+                not isinstance(number, int) or isinstance(number, bool)
+                for number in numeric_fields
+            )
+            or any(
+                not isinstance(value.get(field), bool)
+                for field in ("major_wound", "unconscious", "dead")
+            )
+            or value.get("unconscious") is True
+            and value.get("dead") is True
+        ):
+            raise ValueError("damage mechanic 格式无效")
+        assert isinstance(raw_damage, int)
+        assert isinstance(armor_applied, int)
+        assert isinstance(damage_taken, int)
+        assert isinstance(hp_before, int)
+        assert isinstance(hp_after, int)
+        if (
+            raw_damage != sum(rolls) + expression.modifier
+            or not 0 <= armor_applied <= raw_damage <= 100
+            or damage_taken != raw_damage - armor_applied
+            or not 0 <= hp_after <= hp_before <= 100
+            or hp_after != max(0, hp_before - damage_taken)
+        ):
+            raise ValueError("damage mechanic 格式无效")
+
+    @staticmethod
+    def validate_result_arguments(
+        arguments: Mapping[str, Any],
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+    ) -> None:
+        try:
+            actor = _read_damage_actor_snapshot(
+                actors,
+                value["actor_id"],
+            )
+        except (LookupError, TypeError, ValueError) as error:
+            raise ValueError("damage mechanic 与规范参数不一致") from error
+        expected_outcome = _calculate_damage_outcome(
+            raw_damage=value["raw_damage"],
+            armor_applies=arguments["armor_applies"],
+            hp_before=value["hp_before"],
+            hp_max=actor.hp_max,
+            armor=actor.armor,
+        )
+        actual_outcome = DamageOutcome(
+            armor_applied=value["armor_applied"],
+            damage_taken=value["damage_taken"],
+            hp_after=value["hp_after"],
+            major_wound=value["major_wound"],
+            unconscious=value["unconscious"],
+            dead=value["dead"],
+        )
+        if (
+            arguments.get("actor_id") != value.get("actor_id")
+            or arguments.get("cause") != value.get("cause")
+            or arguments.get("damage_expression") != value.get("damage_expression")
+            or arguments.get("visibility") != value.get("visibility")
+            or actual_outcome != expected_outcome
+        ):
+            raise ValueError("damage mechanic 与规范参数不一致")
+
+    @staticmethod
+    def validate_persistence(
+        value: Mapping[str, Any],
+        *,
+        actors: object,
+        mechanics: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        DealDamageTool.validate_result(value)
+        try:
+            actor = _read_damage_actor_snapshot(
+                actors,
+                value["actor_id"],
+            )
+        except (LookupError, TypeError, ValueError) as error:
+            raise ValueError("damage mechanic 与冻结角色卡不一致") from error
+        related = [
+            mechanic
+            for mechanic in mechanics
+            if mechanic.get("kind") == "damage"
+            and mechanic.get("actor_id") == value.get("actor_id")
+        ]
+        actual_outcome = DamageOutcome(
+            armor_applied=value["armor_applied"],
+            damage_taken=value["damage_taken"],
+            hp_after=value["hp_after"],
+            major_wound=value["major_wound"],
+            unconscious=value["unconscious"],
+            dead=value["dead"],
+        )
+        allowed_outcomes = {
+            _calculate_damage_outcome(
+                raw_damage=value["raw_damage"],
+                armor_applies=armor_applies,
+                hp_before=value["hp_before"],
+                hp_max=actor.hp_max,
+                armor=actor.armor,
+            )
+            for armor_applies in (False, True)
+        }
+        if (
+            actor.role == "investigator"
+            and value.get("visibility") != "public"
+            or len(
+                [
+                    mechanic
+                    for mechanic in related
+                    if mechanic.get("mechanic_id") == value.get("mechanic_id")
+                ]
+            )
+            != 1
+            or any(
+                previous.get("hp_after") != current.get("hp_before")
+                for previous, current in zip(related, related[1:], strict=False)
+            )
+            or not related
+            or actor.hp_current != related[-1].get("hp_after")
+            or value["hp_before"] > actor.hp_max
+            or actual_outcome not in allowed_outcomes
+        ):
+            raise ValueError("damage mechanic 与冻结角色卡不一致")
+
+    @staticmethod
+    def public_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            key: value[key]
+            for key in (
+                "cause",
+                "damage_expression",
+                "rolls",
+                "raw_damage",
+                "armor_applied",
+                "damage_taken",
+                "hp_before",
+                "hp_after",
+                "major_wound",
+                "unconscious",
+                "dead",
+            )
+        }
+
+
 @dataclass(frozen=True)
 class UnimplementedCocTool:
     """为后续票保留规范目录项，但不提前实现具体 COC 规则。"""
@@ -1210,8 +1688,10 @@ class UnimplementedCocTool:
         self,
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None:
-        del arguments, value
+        del arguments, value, actors
         raise ValueError(f"工具 {self.name} 尚未实现")
 
     def validate_persistence(
@@ -1233,11 +1713,7 @@ DEFAULT_COC_TOOLS: Mapping[str, CocTool] = {
     "make_check": MakeCheckTool(),
     "push_check": PushCheckTool(),
     "spend_luck": SpendLuckTool(),
-    "deal_damage": UnimplementedCocTool(
-        DEAL_DAMAGE_TOOL,
-        "damage",
-        normalize_deal_damage_arguments,
-    ),
+    "deal_damage": DealDamageTool(),
     "make_sanity_check": UnimplementedCocTool(
         MAKE_SANITY_CHECK_TOOL,
         "sanity_check",

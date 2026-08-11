@@ -1237,6 +1237,7 @@ class AgenticHarness:
                 tool.validate_result_arguments(
                     copy.deepcopy(arguments),
                     copy.deepcopy(execution_mechanic),
+                    actors=copy.deepcopy(execution_actors),
                 )
                 self._validate_tool_execution(
                     execution_mechanic,

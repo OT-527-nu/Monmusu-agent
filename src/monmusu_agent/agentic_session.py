@@ -781,7 +781,11 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("会话状态与回合历史不一致")
         incomplete_turn = session.get("incomplete_turn")
         if incomplete_turn is not None:
-            self._validate_incomplete_turn(incomplete_turn, set(turns_by_id))
+            self._validate_incomplete_turn(
+                incomplete_turn,
+                set(turns_by_id),
+                actors=session.get("actors"),
+            )
 
     @classmethod
     def _validate_fact_record(
@@ -908,6 +912,8 @@ class AgenticSessionStore:
         self,
         incomplete: Mapping[str, Any],
         committed_turn_ids: set[str],
+        *,
+        actors: object,
     ) -> None:
         cls = type(self)
         if set(incomplete) != _INCOMPLETE_TURN_FIELDS:
@@ -981,7 +987,10 @@ class AgenticSessionStore:
         interactions_by_id: dict[str, Mapping[str, Any]] = {}
         successful_mechanic_ids: list[str] = []
         for interaction in interactions:
-            tool_call_id, result = self._validate_tool_interaction(interaction)
+            tool_call_id, result = self._validate_tool_interaction(
+                interaction,
+                actors=actors,
+            )
             if tool_call_id in interactions_by_id:
                 raise AgenticSessionLoadError("IncompleteTurn 格式无效")
             assert isinstance(interaction, dict)
@@ -1069,6 +1078,8 @@ class AgenticSessionStore:
     def _validate_tool_interaction(
         self,
         interaction: object,
+        *,
+        actors: object,
     ) -> tuple[str, Mapping[str, Any] | None]:
         cls = type(self)
         if (
@@ -1131,6 +1142,7 @@ class AgenticSessionStore:
                 tool.validate_result_arguments(
                     copy.deepcopy(arguments),
                     copy.deepcopy(result),
+                    actors=copy.deepcopy(actors),
                 )
             except (ValueError, TypeError, KeyError) as validation_error:
                 raise AgenticSessionLoadError(

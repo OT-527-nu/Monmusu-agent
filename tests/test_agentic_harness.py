@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,6 +20,7 @@ from monmusu_agent.agentic_harness import (
     AgenticTurnBlockedError,
     AgenticTurnInputError,
     PublicMechanic,
+    TurnResult,
 )
 from monmusu_agent.agentic_model import (
     ModelCallError,
@@ -28,6 +30,7 @@ from monmusu_agent.agentic_model import (
 )
 from monmusu_agent.agentic_session import (
     AgenticSessionLoadError,
+    AgenticSessionSources,
     AgenticSessionStore,
     NewSessionRequest,
 )
@@ -44,6 +47,17 @@ class ScriptedRandom:
     def randint(self, minimum: int, maximum: int) -> int:
         self.calls.append((minimum, maximum))
         return next(self.values)
+
+
+@dataclass(frozen=True)
+class DamageCaseRun:
+    """保存普通单次伤害 seam 用例需要观察的结果。"""
+
+    store: AgenticSessionStore
+    game_id: str
+    result: TurnResult
+    session: Mapping[str, Any]
+    random_source: ScriptedRandom
 
 
 def _lifecycle_tool_definition(name: str) -> dict[str, Any]:
@@ -196,7 +210,10 @@ class LifecycleTestTool:
         cls,
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None:
+        del actors
         if (
             arguments.get("actor_id") != value.get("actor_id")
             or arguments.get("amount") != value.get(cls.result_amount_field)
@@ -357,7 +374,10 @@ class HistoricalLuckMarkerTool:
     def validate_result_arguments(
         arguments: Mapping[str, Any],
         value: Mapping[str, Any],
+        *,
+        actors: object,
     ) -> None:
+        del actors
         if arguments.get("check_id") != value.get("check_id"):
             raise ValueError("测试 Luck mechanic 与参数不一致")
 
@@ -463,7 +483,12 @@ class AgenticHarnessTest(unittest.TestCase):
     def _lifecycle_registry() -> dict[str, Any]:
         return {"make_check": MakeCheckTool(), "lifecycle_test": LifecycleTestTool()}
 
-    def _create_session(self, root: Path) -> tuple[AgenticSessionStore, str]:
+    def _create_session(
+        self,
+        root: Path,
+        *,
+        investigator_id: str = "investigator_tracker",
+    ) -> tuple[AgenticSessionStore, str]:
         store = AgenticSessionStore(
             session_root=root / "sessions",
             game_id_factory=lambda: "game_test_0001",
@@ -471,7 +496,7 @@ class AgenticHarnessTest(unittest.TestCase):
         )
         created = store.create_session(
             NewSessionRequest(
-                investigator_id="investigator_tracker",
+                investigator_id=investigator_id,
                 display_name="林雁",
                 honorific="林女士",
                 pronouns="她",
@@ -479,6 +504,37 @@ class AgenticHarnessTest(unittest.TestCase):
                 appearance="短发，穿旧防水外套",
                 background_hook="来梦中寻找失踪的弟弟",
                 keepsake="一枚裂了边的铜怀表",
+            )
+        )
+        return store, created.game_id
+
+    def _create_session_with_actor_armor(
+        self,
+        root: Path,
+        *,
+        actor_id: str,
+        armor: int,
+    ) -> tuple[AgenticSessionStore, str]:
+        defaults = AgenticSessionSources()
+        templates = read_json(defaults.actor_templates)
+        actor = next(
+            candidate
+            for candidate in templates["actors"]
+            if candidate["actor_id"] == actor_id
+        )
+        actor["armor"] = armor
+        actor_templates = root / "actor_templates.json"
+        write_json_atomic(actor_templates, templates)
+        store = AgenticSessionStore(
+            session_root=root / "sessions",
+            sources=AgenticSessionSources(actor_templates=actor_templates),
+            game_id_factory=lambda: "game_damage_armor",
+            clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+        )
+        created = store.create_session(
+            NewSessionRequest(
+                investigator_id="investigator_tracker",
+                display_name="林雁",
             )
         )
         return store, created.game_id
@@ -583,6 +639,40 @@ class AgenticHarnessTest(unittest.TestCase):
         actors = session["actors"]
         assert isinstance(actors, list)
         return next(actor for actor in actors if actor["actor_id"] == actor_id)
+
+    def _run_damage_case(
+        self,
+        root: Path,
+        *,
+        arguments: Mapping[str, object],
+        dice: tuple[int, ...],
+        mechanic_id: str,
+        investigator_id: str = "investigator_tracker",
+    ) -> DamageCaseRun:
+        store, game_id = self._create_session(
+            root,
+            investigator_id=investigator_id,
+        )
+        random_source = ScriptedRandom(dice)
+        result = AgenticHarness(
+            store,
+            ScriptedGameMasterModel(
+                [
+                    self._tool_response(dict(arguments), name="deal_damage"),
+                    self._response(self._final_payload()),
+                ]
+            ),
+            mechanic_id_factory=lambda: mechanic_id,
+            random_source=random_source,
+        ).start_turn(game_id, "结算已经成立的伤害。")
+        self.assertEqual(result.status, "committed")
+        return DamageCaseRun(
+            store=store,
+            game_id=game_id,
+            result=result,
+            session=store.load_session(game_id).session,
+            random_source=random_source,
+        )
 
     def _base_and_luck_responses(
         self,
@@ -1216,29 +1306,12 @@ class AgenticHarnessTest(unittest.TestCase):
                 expected,
             )
 
-    def test_later_unimplemented_tools_normalize_before_preflight_rejection(
+    def test_unimplemented_sanity_tool_normalizes_before_preflight_rejection(
         self,
     ) -> None:
-        """占位目录项也保存规范参数，并按规范参数幂等重放失败。"""
+        """SAN 占位目录项保存规范参数，并按规范参数幂等重放失败。"""
 
         cases = (
-            (
-                "deal_damage",
-                {
-                    "actor_id": "investigator_tracker",
-                    "damage_expression": "1d6+1",
-                    "cause": "从湿滑石阶跌落",
-                    "armor_applies": True,
-                    "visibility": "public",
-                },
-                {
-                    "actor_id": "investigator_tracker",
-                    "damage_expression": "1d6+1",
-                    "cause": "从湿滑石阶跌落",
-                    "armor_applies": True,
-                    "visibility": "public",
-                },
-            ),
             (
                 "make_sanity_check",
                 {
@@ -5648,6 +5721,665 @@ class AgenticHarnessTest(unittest.TestCase):
                     ):
                         store.load_session(game_id)
                     write_json_atomic(session_file, baseline)
+
+    def test_public_investigator_damage_commits_hp_and_thresholds(self) -> None:
+        """公开伤害按固定骰值原子更新 HP，并把可信结果续给同一 GM。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            arguments = {
+                "actor_id": "investigator_tracker",
+                "damage_expression": "1d6+1",
+                "cause": "从湿滑石阶跌落并撞上骨钉",
+                "armor_applies": True,
+                "visibility": "public",
+            }
+            random_source = ScriptedRandom((4,))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(arguments, name="deal_damage"),
+                    self._response(self._final_payload("我仍有 10 HP。")),
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                mechanic_id_factory=lambda: "mechanic_damage",
+                random_source=random_source,
+                clock=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+
+            result = harness.start_turn(game_id, "我踩滑后撞上了突出的骨钉。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(result.narration, "我仍有 10 HP。")
+            expected_details = {
+                "cause": "从湿滑石阶跌落并撞上骨钉",
+                "damage_expression": "1d6+1",
+                "rolls": [4],
+                "raw_damage": 5,
+                "armor_applied": 0,
+                "damage_taken": 5,
+                "hp_before": 10,
+                "hp_after": 5,
+                "major_wound": True,
+                "unconscious": False,
+                "dead": False,
+            }
+            self.assertEqual(
+                result.public_mechanics,
+                (
+                    PublicMechanic(
+                        mechanic_id="mechanic_damage",
+                        kind="damage",
+                        actor_id="investigator_tracker",
+                        details=expected_details,
+                    ),
+                ),
+            )
+            session = store.load_session(game_id).session
+            self.assertEqual(
+                session["turns"][0]["mechanics"][0],
+                {
+                    "mechanic_id": "mechanic_damage",
+                    "kind": "damage",
+                    "actor_id": "investigator_tracker",
+                    **expected_details,
+                    "visibility": "public",
+                    "committed_at": "2026-07-27T00:00:00Z",
+                },
+            )
+            investigator = self._actor(session, "investigator_tracker")
+            self.assertEqual(investigator["hp"], {"current": 5, "max": 10})
+            tool_result = json.loads(model.requests[1].messages[-1]["content"])
+            self.assertEqual(tool_result["result"]["damage_taken"], 5)
+            self.assertEqual(tool_result["result"]["hp_after"], 5)
+            self.assertEqual(random_source.calls, [(1, 6)])
+
+    def test_damage_preflight_rejects_invalid_inputs_before_id_rng_and_hp(self) -> None:
+        """伤害 schema、角色、可见性与表达式边界都在执行前拒绝。"""
+
+        valid = {
+            "actor_id": "investigator_tracker",
+            "damage_expression": "1d6+1",
+            "cause": "从湿滑石阶跌落",
+            "armor_applies": True,
+            "visibility": "public",
+        }
+        cases = (
+            ("unknown actor", {**valid, "actor_id": "actor_missing"}, "unknown_actor"),
+            ("submitted hp result", {**valid, "hp_after": 0}, "invalid_arguments"),
+            ("integer armor flag", {**valid, "armor_applies": 1}, "invalid_arguments"),
+            ("empty cause", {**valid, "cause": ""}, "invalid_arguments"),
+            ("non-string expression", {**valid, "damage_expression": 6}, "invalid_arguments"),
+            ("unknown visibility", {**valid, "visibility": "secret"}, "invalid_arguments"),
+            ("hidden investigator", {**valid, "visibility": "hidden"}, "invalid_visibility"),
+            ("uppercase dice", {**valid, "damage_expression": "1D6"}, "invalid_dice_expression"),
+            ("leading whitespace", {**valid, "damage_expression": " 1d6"}, "invalid_arguments"),
+            ("leading zero", {**valid, "damage_expression": "01"}, "invalid_dice_expression"),
+            ("negative fixed", {**valid, "damage_expression": "-1"}, "invalid_dice_expression"),
+            ("zero dice", {**valid, "damage_expression": "0d6"}, "invalid_dice_expression"),
+            ("zero sides", {**valid, "damage_expression": "1d0"}, "invalid_dice_expression"),
+            ("too many dice", {**valid, "damage_expression": "21d1"}, "invalid_dice_expression"),
+            ("too many sides", {**valid, "damage_expression": "1d101"}, "invalid_dice_expression"),
+            ("negative theoretical minimum", {**valid, "damage_expression": "1d6-2"}, "invalid_dice_expression"),
+            ("high theoretical maximum", {**valid, "damage_expression": "1d100+1"}, "invalid_dice_expression"),
+            ("high fixed value", {**valid, "damage_expression": "101"}, "invalid_dice_expression"),
+        )
+        for label, arguments, expected_code in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    store, game_id = self._create_session(Path(directory))
+                    allocated: list[str] = []
+                    random_source = ScriptedRandom(())
+                    harness = AgenticHarness(
+                        store,
+                        ScriptedGameMasterModel(
+                            [
+                                self._tool_response(arguments, name="deal_damage"),
+                                ModelCallError(
+                                    "request_timeout",
+                                    "stop after damage rejection",
+                                    retryable=True,
+                                ),
+                            ]
+                        ),
+                        mechanic_id_factory=lambda: allocated.append("allocated") or "unexpected",
+                        random_source=random_source,
+                    )
+
+                    result = harness.start_turn(game_id, "虚构中已经发生伤害。")
+
+                    self.assertEqual(result.error_code, "request_timeout")
+                    self.assertEqual(allocated, [])
+                    self.assertEqual(random_source.calls, [])
+                    session = store.load_session(game_id).session
+                    self.assertEqual(
+                        self._actor(session, "investigator_tracker")["hp"]["current"],
+                        10,
+                    )
+                    incomplete = session["incomplete_turn"]
+                    self.assertEqual(incomplete["mechanics"], [])
+                    self.assertEqual(
+                        incomplete["tool_interactions"][0]["error"]["code"],
+                        expected_code,
+                    )
+
+    def test_npc_damage_respects_frozen_armor_and_hidden_projection(self) -> None:
+        """NPC 伤害按事前护甲参数结算，隐藏结果不产生玩家投影。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, game_id = self._create_session_with_actor_armor(
+                root,
+                actor_id="npc_aranis",
+                armor=3,
+            )
+            arguments = {
+                "actor_id": "npc_aranis",
+                "damage_expression": "2d6+1",
+                "cause": "倒塌的石梁擦中肩背",
+                "armor_applies": True,
+                "visibility": "hidden",
+            }
+            unarmored_arguments = {
+                "actor_id": "npc_aranis",
+                "damage_expression": "2",
+                "cause": "护甲未覆盖的手掌被划伤",
+                "armor_applies": False,
+                "visibility": "public",
+            }
+            absorbed_arguments = {
+                "actor_id": "npc_aranis",
+                "damage_expression": "2",
+                "cause": "轻微撞击被护甲完全挡住",
+                "armor_applies": True,
+                "visibility": "public",
+            }
+            random_source = ScriptedRandom((2, 4))
+            model = ScriptedGameMasterModel(
+                [
+                    self._tool_response(arguments, name="deal_damage"),
+                    self._response(self._final_payload("GM 忠实承接了隐藏伤害。")),
+                    self._tool_response(
+                        unarmored_arguments,
+                        name="deal_damage",
+                        tool_call_id="call_public_damage",
+                    ),
+                    self._response(self._final_payload("公开伤害已经解释。")),
+                    self._tool_response(
+                        absorbed_arguments,
+                        name="deal_damage",
+                        tool_call_id="call_absorbed_damage",
+                    ),
+                    self._response(self._final_payload("护甲挡住了伤害。")),
+                ]
+            )
+            harness = AgenticHarness(
+                store,
+                model,
+                mechanic_id_factory=iter(
+                    (
+                        "mechanic_hidden_damage",
+                        "mechanic_public_damage",
+                        "mechanic_absorbed_damage",
+                    )
+                ).__next__,
+                random_source=random_source,
+            )
+
+            result = harness.start_turn(game_id, "石梁已经在她身后坍塌。")
+
+            self.assertEqual(result.status, "committed")
+            self.assertEqual(result.public_mechanics, ())
+            session = store.load_session(game_id).session
+            damage = session["turns"][0]["mechanics"][0]
+            self.assertEqual(damage["rolls"], [2, 4])
+            self.assertEqual(damage["raw_damage"], 7)
+            self.assertEqual(damage["armor_applied"], 3)
+            self.assertEqual(damage["damage_taken"], 4)
+            self.assertEqual(damage["hp_before"], 9)
+            self.assertEqual(damage["hp_after"], 5)
+            self.assertFalse(damage["major_wound"])
+            self.assertFalse(damage["unconscious"])
+            self.assertFalse(damage["dead"])
+            self.assertEqual(damage["visibility"], "hidden")
+            self.assertEqual(
+                self._actor(session, "npc_aranis")["hp"],
+                {"current": 5, "max": 12},
+            )
+            tool_result = json.loads(model.requests[1].messages[-1]["content"])
+            self.assertEqual(tool_result["result"], damage)
+
+            second = harness.start_turn(
+                game_id,
+                "随后她未被护甲覆盖的手掌遭到划伤。",
+            )
+
+            self.assertEqual(second.status, "committed")
+            self.assertEqual(len(second.public_mechanics), 1)
+            session = store.load_session(game_id).session
+            public_damage = session["turns"][1]["mechanics"][0]
+            self.assertEqual(public_damage["raw_damage"], 2)
+            self.assertEqual(public_damage["armor_applied"], 0)
+            self.assertEqual(public_damage["damage_taken"], 2)
+            self.assertEqual(public_damage["hp_before"], 5)
+            self.assertEqual(public_damage["hp_after"], 3)
+            self.assertEqual(
+                self._actor(session, "npc_aranis")["hp"],
+                {"current": 3, "max": 12},
+            )
+
+            third = harness.start_turn(
+                game_id,
+                "又一次轻微撞击被她的护甲完全挡住。",
+            )
+
+            self.assertEqual(third.status, "committed")
+            self.assertEqual(len(third.public_mechanics), 1)
+            session = store.load_session(game_id).session
+            absorbed = session["turns"][2]["mechanics"][0]
+            self.assertEqual(absorbed["raw_damage"], 2)
+            self.assertEqual(absorbed["armor_applied"], 2)
+            self.assertEqual(absorbed["damage_taken"], 0)
+            self.assertEqual(absorbed["hp_before"], 3)
+            self.assertEqual(absorbed["hp_after"], 3)
+            self.assertEqual(
+                self._actor(session, "npc_aranis")["hp"],
+                {"current": 3, "max": 12},
+            )
+            self.assertEqual(random_source.calls, [(1, 6), (1, 6)])
+
+    def test_damage_zero_and_zero_hp_threshold_boundaries(self) -> None:
+        """零伤害仍提交；零 HP 时昏迷与死亡按 max HP 边界互斥。"""
+
+        cases = (
+            ("zero", "investigator_tracker", "0", 10, False, False, False),
+            ("unconscious", "npc_aranis", "9", 0, True, True, False),
+            ("dead", "investigator_tracker", "10", 0, True, False, True),
+        )
+        for label, actor_id, expression, hp_after, major, unconscious, dead in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    run = self._run_damage_case(
+                        Path(directory),
+                        arguments={
+                            "actor_id": actor_id,
+                            "damage_expression": expression,
+                            "cause": "固定伤害边界",
+                            "armor_applies": False,
+                            "visibility": "public",
+                        },
+                        dice=(),
+                        mechanic_id=f"mechanic_{label}",
+                    )
+                    damage = run.session["turns"][0]["mechanics"][0]
+                    self.assertEqual(damage["rolls"], [])
+                    self.assertEqual(damage["raw_damage"], int(expression))
+                    self.assertEqual(damage["armor_applied"], 0)
+                    self.assertEqual(damage["damage_taken"], int(expression))
+                    self.assertEqual(damage["hp_after"], hp_after)
+                    self.assertIs(damage["major_wound"], major)
+                    self.assertIs(damage["unconscious"], unconscious)
+                    self.assertIs(damage["dead"], dead)
+                    self.assertEqual(
+                        self._actor(run.session, actor_id)["hp"]["current"],
+                        hp_after,
+                    )
+                    self.assertEqual(len(run.result.public_mechanics), 1)
+                    self.assertEqual(run.random_source.calls, [])
+
+    def test_damage_expression_accepts_inclusive_dice_and_range_boundaries(self) -> None:
+        """共享表达式接受 N=20、M=100 与理论最小值为零的边界。"""
+
+        cases = (
+            ("20d5", (1,) * 20, 20, [(1, 5)] * 20),
+            ("1d100", (100,), 100, [(1, 100)]),
+            ("2d6-2", (1, 1), 0, [(1, 6), (1, 6)]),
+        )
+        for expression, dice, raw_damage, expected_calls in cases:
+            with self.subTest(expression=expression):
+                with tempfile.TemporaryDirectory() as directory:
+                    run = self._run_damage_case(
+                        Path(directory),
+                        arguments={
+                            "actor_id": "investigator_tracker",
+                            "damage_expression": expression,
+                            "cause": "表达式合法边界",
+                            "armor_applies": False,
+                            "visibility": "public",
+                        },
+                        dice=dice,
+                        mechanic_id="mechanic_damage_boundary",
+                    )
+                    damage = run.session["turns"][0][
+                        "mechanics"
+                    ][0]
+                    self.assertEqual(damage["raw_damage"], raw_damage)
+                    self.assertEqual(run.random_source.calls, expected_calls)
+
+    def test_major_wound_uses_ceiling_for_odd_max_hp(self) -> None:
+        """max HP 为 11 时，5 点不重伤而 6 点达到重伤阈值。"""
+
+        for damage_taken, expected_major in ((5, False), (6, True)):
+            with self.subTest(damage_taken=damage_taken):
+                with tempfile.TemporaryDirectory() as directory:
+                    run = self._run_damage_case(
+                        Path(directory),
+                        arguments={
+                            "actor_id": "investigator_mediator",
+                            "damage_expression": str(damage_taken),
+                            "cause": "奇数 HP 重伤边界",
+                            "armor_applies": False,
+                            "visibility": "public",
+                        },
+                        dice=(),
+                        mechanic_id=f"mechanic_odd_hp_{damage_taken}",
+                        investigator_id="investigator_mediator",
+                    )
+                    damage = run.session["turns"][0]["mechanics"][0]
+                    self.assertEqual(damage["hp_before"], 11)
+                    self.assertIs(damage["major_wound"], expected_major)
+
+    def test_damage_replays_once_after_interruption_and_restart(self) -> None:
+        """伤害提交后多次恢复只回放同一机械，不重复掷骰或扣 HP。"""
+
+        arguments = {
+            "actor_id": "investigator_tracker",
+            "damage_expression": "1d6+1",
+            "cause": "石阶跌落",
+            "armor_applies": False,
+            "visibility": "public",
+        }
+        final = self._final_payload("伤害结果已经解释。")
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            first_random = ScriptedRandom((4,))
+            interrupted = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            name="deal_damage",
+                            tool_call_id="call_damage",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after damage",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_damage",
+                mechanic_id_factory=lambda: "mechanic_damage",
+                random_source=first_random,
+            ).start_turn(game_id, "我从石阶跌落。")
+
+            self.assertEqual(interrupted.error_code, "request_timeout")
+            self.assertEqual(first_random.calls, [(1, 6)])
+            before_resume = store.load_session(game_id).session
+            original_damage = json.loads(
+                json.dumps(before_resume["incomplete_turn"]["mechanics"][0])
+            )
+            self.assertEqual(
+                self._actor(before_resume, "investigator_tracker")["hp"]["current"],
+                5,
+            )
+            first_replay_random = ScriptedRandom(())
+            first_resume = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            name="deal_damage",
+                            tool_call_id="call_damage",
+                        ),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after first resume",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "first replay allocated a new mechanic ID"
+                ),
+                random_source=first_replay_random,
+            ).resume_turn(game_id, "turn_damage")
+
+            self.assertEqual(first_resume.error_code, "request_timeout")
+            self.assertEqual(first_replay_random.calls, [])
+            after_first_resume = store.load_session(game_id).session
+            self.assertEqual(
+                after_first_resume["incomplete_turn"]["mechanics"],
+                [original_damage],
+            )
+            self.assertEqual(
+                self._actor(
+                    after_first_resume,
+                    "investigator_tracker",
+                )["hp"]["current"],
+                5,
+            )
+            second_replay_random = ScriptedRandom(())
+            resumed = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            arguments,
+                            name="deal_damage",
+                            tool_call_id="call_damage",
+                        ),
+                        self._response(final),
+                    ]
+                ),
+                mechanic_id_factory=lambda: self.fail(
+                    "second replay allocated a new mechanic ID"
+                ),
+                random_source=second_replay_random,
+            ).resume_turn(game_id, "turn_damage")
+
+            self.assertEqual(resumed.status, "committed")
+            self.assertEqual(second_replay_random.calls, [])
+            session = store.load_session(game_id).session
+            self.assertEqual(session["turns"][0]["mechanics"], [original_damage])
+            self.assertEqual(
+                self._actor(session, "investigator_tracker")["hp"]["current"],
+                5,
+            )
+            self.assertIsNone(session["incomplete_turn"])
+
+    def test_damage_write_failure_leaves_no_partial_hp_or_mechanic(self) -> None:
+        """伤害原子写失败时不扣 HP、不保存机械或发布玩家事件。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, game_id = self._create_session(Path(directory))
+            writes = 0
+
+            def fail_damage_write(path: Path, value: object) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected damage write failure")
+                write_json_atomic(path, value)
+
+            published: list[PublicMechanic] = []
+            random_source = ScriptedRandom((4,))
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(
+                            {
+                                "actor_id": "investigator_tracker",
+                                "damage_expression": "1d6+1",
+                                "cause": "石阶跌落",
+                                "armor_applies": False,
+                                "visibility": "public",
+                            },
+                            name="deal_damage",
+                        )
+                    ]
+                ),
+                turn_id_factory=lambda: "turn_damage_write_failure",
+                mechanic_id_factory=lambda: "mechanic_uncommitted_damage",
+                random_source=random_source,
+                session_writer=fail_damage_write,
+            ).start_turn(
+                game_id,
+                "我从石阶跌落。",
+                public_mechanic_sink=published.append,
+            )
+
+            self.assertEqual(result.error_code, "tool_commit_failed")
+            self.assertEqual(result.public_mechanics, ())
+            self.assertEqual(published, [])
+            self.assertEqual(random_source.calls, [(1, 6)])
+            session = store.load_session(game_id).session
+            self.assertEqual(
+                self._actor(session, "investigator_tracker")["hp"]["current"],
+                10,
+            )
+            incomplete = session["incomplete_turn"]
+            self.assertEqual(incomplete["mechanics"], [])
+            self.assertEqual(incomplete["tool_interactions"], [])
+
+    def test_loader_rejects_tampered_damage_schema_math_actor_and_visibility(self) -> None:
+        """装载时拒绝伤害 schema、算术、角色余额、阈值和公开性篡改。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run_damage_case(
+                Path(directory),
+                arguments={
+                    "actor_id": "investigator_tracker",
+                    "damage_expression": "1d6+1",
+                    "cause": "石阶跌落",
+                    "armor_applies": False,
+                    "visibility": "public",
+                },
+                dice=(4,),
+                mechanic_id="mechanic_damage",
+            )
+            session_file = run.store.session_root / run.game_id / "session.json"
+            baseline = read_json(session_file)
+
+            for label in (
+                "extra field",
+                "invalid roll",
+                "broken raw damage",
+                "forged armor",
+                "broken hp arithmetic",
+                "actor hp balance",
+                "wrong threshold",
+                "hidden investigator",
+                "boolean numeric",
+            ):
+                with self.subTest(label=label):
+                    tampered = json.loads(json.dumps(baseline))
+                    damage = tampered["turns"][0]["mechanics"][0]
+                    if label == "extra field":
+                        damage["unexpected"] = True
+                    elif label == "invalid roll":
+                        damage["rolls"] = [7]
+                    elif label == "broken raw damage":
+                        damage["raw_damage"] = 6
+                    elif label == "forged armor":
+                        damage["armor_applied"] = 1
+                        damage["damage_taken"] = 4
+                        damage["hp_after"] = 6
+                        damage["major_wound"] = False
+                        self._actor(
+                            tampered,
+                            "investigator_tracker",
+                        )["hp"]["current"] = 6
+                    elif label == "broken hp arithmetic":
+                        damage["hp_after"] = 4
+                    elif label == "actor hp balance":
+                        self._actor(
+                            tampered,
+                            "investigator_tracker",
+                        )["hp"]["current"] = 4
+                    elif label == "wrong threshold":
+                        damage["major_wound"] = False
+                    elif label == "hidden investigator":
+                        damage["visibility"] = "hidden"
+                    else:
+                        damage["raw_damage"] = True
+                    write_json_atomic(session_file, tampered)
+                    with self.assertRaisesRegex(
+                        AgenticSessionLoadError,
+                        "CommittedTurn 格式无效|机械与冻结角色卡不一致",
+                    ):
+                        run.store.load_session(run.game_id)
+                    write_json_atomic(session_file, baseline)
+
+    def test_incomplete_damage_binds_armor_applicability_to_frozen_actor(self) -> None:
+        """未完成回合不能把适用护甲的调用改成未减伤结果。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, game_id = self._create_session_with_actor_armor(
+                root,
+                actor_id="npc_aranis",
+                armor=3,
+            )
+            arguments = {
+                "actor_id": "npc_aranis",
+                "damage_expression": "2d6+1",
+                "cause": "倒塌的石梁擦中肩背",
+                "armor_applies": True,
+                "visibility": "hidden",
+            }
+            result = AgenticHarness(
+                store,
+                ScriptedGameMasterModel(
+                    [
+                        self._tool_response(arguments, name="deal_damage"),
+                        ModelCallError(
+                            "request_timeout",
+                            "stop after committed damage",
+                            retryable=True,
+                        ),
+                    ]
+                ),
+                mechanic_id_factory=lambda: "mechanic_damage",
+                random_source=ScriptedRandom((2, 4)),
+            ).start_turn(game_id, "石梁已经在她身后坍塌。")
+            self.assertEqual(result.error_code, "request_timeout")
+            session_file = store.session_root / game_id / "session.json"
+            tampered = read_json(session_file)
+            incomplete = tampered["incomplete_turn"]
+            damage = incomplete["mechanics"][0]
+            damage["armor_applied"] = 0
+            damage["damage_taken"] = 7
+            damage["hp_after"] = 2
+            damage["major_wound"] = True
+            interaction = incomplete["tool_interactions"][0]
+            interaction["result"] = json.loads(json.dumps(damage))
+            actor = self._actor(tampered, "npc_aranis")
+            actor["hp"]["current"] = 2
+            tool_message = next(
+                message
+                for message in incomplete["deepseek_messages"]
+                if message.get("role") == "tool"
+            )
+            envelope = json.loads(tool_message["content"])
+            envelope["result"] = json.loads(json.dumps(damage))
+            tool_message["content"] = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            write_json_atomic(session_file, tampered)
+
+            with self.assertRaisesRegex(
+                AgenticSessionLoadError,
+                "ToolInteraction 格式无效",
+            ):
+                store.load_session(game_id)
 
     def test_invalid_make_check_is_persisted_before_same_gm_continues(self) -> None:
         """可关联的工具错误不掷骰，并以完整交互反馈同一个 GM。"""
