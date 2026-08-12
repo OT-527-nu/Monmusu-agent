@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -10,7 +11,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import patch
 
 import httpx
@@ -68,7 +69,8 @@ class ScriptedCompletions:
         self.requests.append(copy.deepcopy(kwargs))
         if not self.responses:
             raise AssertionError("mocked SDK 没有剩余响应")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        return response(copy.deepcopy(kwargs)) if callable(response) else response
 
 
 class FixedRandom:
@@ -166,6 +168,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
             "not-a-real-key",
             client=client,
             monotonic=times.__next__,
+            request_evidence_sink=(evidence := []).append,
         )
         request = ModelRequest(
             messages=(
@@ -237,6 +240,18 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
                 usage=usage,
                 latency_ms=125,
             ),
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(
+            evidence[0]["messages_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    completions.requests[0]["messages"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
         )
 
     def test_complete_enables_thinking_and_preserves_reasoning_envelope(
@@ -959,6 +974,510 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
         self.assertIn("DEEPSEEK_API_KEY", missing_key.reason)
         self.assertEqual(missing_key.records, ())
 
+    def test_increment_three_runner_requires_explicit_enable_and_key(self) -> None:
+        from monmusu_agent.agentic_contract import (
+            run_increment_three_evaluation,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            disabled = run_increment_three_evaluation(
+                enabled=False,
+                api_key="not-a-real-key",
+                session_root=Path(directory) / "disabled",
+                client=ForbiddenClient(),
+            )
+            missing_key = run_increment_three_evaluation(
+                enabled=True,
+                api_key=None,
+                session_root=Path(directory) / "missing-key",
+                client=ForbiddenClient(),
+            )
+
+        self.assertEqual(disabled.status, "skipped")
+        self.assertIn("not explicitly enabled", disabled.reason)
+        self.assertEqual(disabled.records, ())
+        self.assertEqual(missing_key.status, "skipped")
+        self.assertIn("DEEPSEEK_API_KEY", missing_key.reason)
+        self.assertEqual(missing_key.records, ())
+
+    def test_increment_three_runner_records_scenarios_without_human_pass(
+        self,
+    ) -> None:
+        from monmusu_agent.agentic_contract import (
+            run_increment_three_evaluation,
+        )
+
+        reasoning_canary = "TICKET_18_REASONING_MUST_NOT_ESCAPE"
+        hidden_canary = "隐藏事实：断桥下的东西正在跟随"
+
+        def sdk_response(
+            message: dict[str, Any],
+            finish_reason: str,
+            *,
+            usage: dict[str, int] | None = None,
+        ) -> object:
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=Dumpable(message),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                usage=Dumpable(usage) if usage is not None else None,
+            )
+
+        def final_message(
+            narration: str,
+            *,
+            establish: list[dict[str, str]] | None = None,
+            retire: list[dict[str, str]] | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": narration,
+                        "establish": establish or [],
+                        "retire": retire or [],
+                        "session_status": "ongoing",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": reasoning_canary,
+                "tool_calls": [],
+            }
+
+        def take_key_response(kwargs: Mapping[str, Any]) -> object:
+            context_message = next(
+                message
+                for message in kwargs["messages"]
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+                and "COMMITTED_TURNS" in message["content"]
+            )
+            package = json.loads(context_message["content"])
+            key_fact = next(
+                fact
+                for fact in package["ACTIVE_FACTS"]
+                if fact["text"]
+                == "一把已经看见且能够直接够到的铜钥匙放在仓库桌上。"
+            )
+            return sdk_response(
+                final_message(
+                    "你拿起触手可及的铜钥匙并收好。",
+                    establish=[
+                        {
+                            "visibility": "public",
+                            "text": "调查员已经拿到仓库桌上的铜钥匙。",
+                        }
+                    ],
+                    retire=[
+                        {
+                            "fact_id": key_fact["fact_id"],
+                            "reason": "铜钥匙已经由调查员拿走，不再放在仓库桌上。",
+                        }
+                    ],
+                ),
+                "stop",
+            )
+
+        def tool_message(
+            name: str,
+            arguments: Mapping[str, object],
+            call_id: str,
+        ) -> dict[str, Any]:
+            return {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": reasoning_canary,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    }
+                ],
+            }
+
+        completions = ScriptedCompletions(
+            [
+                take_key_response,
+                sdk_response(
+                    tool_message(
+                        "make_check",
+                        {
+                            "actor_id": "investigator_tracker",
+                            "ability": "dexterity",
+                            "difficulty": "regular",
+                            "dice_adjustment": {"kind": "none", "count": 0},
+                            "action": "助跑跳过被海浪冲刷的断桥",
+                            "stakes": "失败会跌落受伤并引来注意",
+                            "visibility": "public",
+                        },
+                        "call_ticket18_jump",
+                    ),
+                    "tool_calls",
+                    usage={"prompt_tokens": 300, "completion_tokens": 60},
+                ),
+                sdk_response(
+                    final_message(
+                        "你落在断桥对面，浪花在身后砸碎。",
+                        establish=[
+                            {"visibility": "hidden", "text": hidden_canary}
+                        ],
+                    ),
+                    "stop",
+                ),
+                sdk_response(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "narration": "这次答复故意缺少 session_status。",
+                                "establish": [],
+                                "retire": [],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "reasoning_content": reasoning_canary,
+                        "tool_calls": [],
+                    },
+                    "stop",
+                ),
+                sdk_response(
+                    final_message(
+                        "门仍未打开，逼近的脚步更清晰；拆门轴会冒着卡死门的风险。"
+                    ),
+                    "stop",
+                ),
+                sdk_response(
+                    tool_message(
+                        "push_check",
+                        {
+                            "check_id": "mechanic_ticket18_scenario3_base",
+                            "new_approach": "改从铰链侧拆卸门轴",
+                            "failure_stakes": "失败会卡死门轴并让逼近者听见断裂声",
+                        },
+                        "call_ticket18_push",
+                    ),
+                    "tool_calls",
+                ),
+                sdk_response(
+                    final_message("门轴被卸下，原来的失败骰和幸运余额都没有改变。"),
+                    "stop",
+                ),
+            ]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        api_key = "sk-ticket-18-test-secret"
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_increment_three_evaluation(
+                enabled=True,
+                api_key=api_key,
+                session_root=Path(directory) / "sessions",
+                client=client,
+            )
+
+        self.assertEqual(result.status, "pending_human")
+        self.assertIn("human", result.reason.lower())
+        self.assertEqual(len(result.records), 2)
+        scenario_two, scenario_three = result.records
+        self.assertEqual(
+            [record["scenario_version"] for record in result.records],
+            [
+                "ticket-18-focused-scenario-2-v1",
+                "ticket-18-focused-scenario-3-v1",
+            ],
+        )
+        expected_tools = [
+            "make_check",
+            "push_check",
+            "spend_luck",
+            "deal_damage",
+            "make_sanity_check",
+        ]
+        self.assertEqual(
+            scenario_two["player_inputs"],
+            [
+                "我拿起桌上的铜钥匙收好。",
+                "趁下一股浪还没打来，我助跑跳过断桥，去对面的门楼。",
+            ],
+        )
+        self.assertEqual(
+            scenario_three["player_inputs"],
+            [
+                "先别替我花幸运，也不要自动重掷。告诉我门没开以后现在发生了什么；如果换一种办法孤注一掷，我要承担什么更严重的风险？",
+                "我不花幸运。我拆门轴，从铰链这边强行卸门；我接受你刚才说的更严重后果，孤注一掷。",
+            ],
+        )
+        for record in result.records:
+            self.assertTrue(record["automated_passed"])
+            self.assertFalse(record["passed"])
+            self.assertEqual(record["human_judgment"]["status"], "pending_user")
+            self.assertEqual(
+                record["fixture"]["version"],
+                {
+                    "ticket-18-focused-scenario-2-v1": "ticket-18-scenario-2-fixture-v2",
+                    "ticket-18-focused-scenario-3-v1": "ticket-18-scenario-3-fixture-v2",
+                }[record["scenario_version"]],
+            )
+            self.assertIn("python", record["dependency_versions"])
+            self.assertEqual(
+                record["attempt_limits"],
+                {
+                    "max_round_trips": 8,
+                    "request_timeout_seconds": 60,
+                    "attempt_timeout_seconds": 180,
+                    "max_structure_repairs": 1,
+                },
+            )
+            self.assertEqual(record["quality_scores"], {
+                "fictional_causality": None,
+                "improvisation": None,
+                "cross_turn_continuity": None,
+                "npc_performance": None,
+                "pacing": None,
+                "atmosphere": None,
+            })
+            for request in record["requests"]:
+                self.assertEqual(
+                    request["function_tools"],
+                    [] if request["structure_repair_request"] else expected_tools,
+                )
+                self.assertEqual(
+                    request["response_format"],
+                    {"type": "json_object"},
+                )
+                self.assertFalse(request["stream"])
+                self.assertEqual(request["timeout"], 60.0)
+                self.assertEqual(
+                    request["messages_sha256"],
+                    request["model_request_messages_sha256"],
+                )
+
+        self.assertEqual(len(scenario_two["requests"]), 3)
+        self.assertEqual(len(scenario_three["requests"]), 4)
+        self.assertEqual(
+            [
+                request["structure_repair_request"]
+                for request in scenario_three["requests"]
+            ],
+            [False, True, False, False],
+        )
+        self.assertEqual(
+            [
+                request["structure_repairs"]
+                for request in scenario_three["requests"]
+            ],
+            [0, 1, 0, 0],
+        )
+
+        self.assertEqual(
+            [call["tool_name"] for call in scenario_two["tool_calls"]],
+            ["make_check"],
+        )
+        self.assertEqual(
+            [call["tool_name"] for call in scenario_three["tool_calls"]],
+            ["push_check"],
+        )
+        self.assertEqual(
+            scenario_three["mechanics"][0]["details"]["pushed_from"],
+            "mechanic_ticket18_scenario3_base",
+        )
+        fixture_narrations = {
+            "ticket-18-focused-scenario-2-v1": (
+                "调查员已经离开石牢，来到无人看守的仓库。桌上放着一把"
+                "触手可及的铜钥匙；仓库外的断桥正被海浪间歇冲刷。"
+            ),
+            "ticket-18-focused-scenario-3-v1": (
+                "撬棍滑开，门仍未打开；先前远去的脚步已经转向并逼近，"
+                "成为再次失败时的更严重风险。"
+            ),
+        }
+        for record in result.records:
+            first_request = record["requests"][0]
+            second_request = next(
+                request
+                for request in record["requests"][1:]
+                if not request["structure_repair_request"]
+            )
+            tool_result_request = record["requests"][-1]
+            first_projection = first_request["message_projection"]
+            second_projection = second_request["message_projection"]
+            tool_result_projection = tool_result_request["message_projection"]
+            self.assertEqual(
+                first_projection["current_player_input_sha256"],
+                hashlib.sha256(
+                    record["player_inputs"][0].encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                second_projection["current_player_input_sha256"],
+                hashlib.sha256(
+                    record["player_inputs"][1].encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                tool_result_projection["current_player_input_sha256"],
+                second_projection["current_player_input_sha256"],
+            )
+            first_turns = first_projection["context"]["committed_turns"]
+            later_turns = second_projection["context"]["committed_turns"]
+            self.assertGreaterEqual(len(first_turns), 1)
+            self.assertEqual(len(later_turns), len(first_turns) + 1)
+            self.assertEqual(
+                tool_result_projection["context"],
+                second_projection["context"],
+            )
+            expected_mechanic_id = record["mechanics"][0]["mechanic_id"]
+            projected_tool_result = next(
+                message
+                for message in tool_result_projection["messages"]
+                if message["role"] == "tool"
+                and message["result_mechanic_id"] == expected_mechanic_id
+            )
+            self.assertRegex(projected_tool_result["result_sha256"], r"^[0-9a-f]{64}$")
+            fixture_turn = first_turns[-1]
+            fixture_fact_ids = {
+                change["fact_id"]
+                for change in record["fixture"]["public_fact_changes"]
+                if change["kind"] == "established"
+            }
+            retired_fact_ids = {
+                change["fact_id"]
+                for change in record["fixture"]["public_fact_changes"]
+                if change["kind"] == "retired"
+            }
+            self.assertTrue(fixture_fact_ids)
+            self.assertEqual(
+                set(fixture_turn["established_fact_ids"]),
+                fixture_fact_ids,
+            )
+            self.assertEqual(
+                set(fixture_turn["retired_fact_ids"]),
+                retired_fact_ids,
+            )
+            self.assertEqual(
+                fixture_turn["narration_sha256"],
+                hashlib.sha256(
+                    fixture_narrations[record["scenario_version"]].encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                {
+                    item["fact_id"]: item["text_sha256"]
+                    for item in fixture_turn["established_facts"]
+                },
+                {
+                    change["fact_id"]: hashlib.sha256(
+                        change["text"].encode("utf-8")
+                    ).hexdigest()
+                    for change in record["fixture"]["public_fact_changes"]
+                    if change["kind"] == "established"
+                },
+            )
+            for mechanic in fixture_turn["mechanics"]:
+                self.assertRegex(mechanic["result_sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(
+                fixture_fact_ids
+                <= set(first_projection["context"]["active_fact_ids"])
+            )
+            self.assertTrue(
+                retired_fact_ids.isdisjoint(
+                    first_projection["context"]["active_fact_ids"]
+                )
+            )
+        scenario_two_fixture_turn = scenario_two["requests"][0][
+            "message_projection"
+        ]["context"]["committed_turns"][-1]
+        key_fact_id = next(
+            item["fact_id"]
+            for item in scenario_two_fixture_turn["established_facts"]
+            if item["text_sha256"]
+            == hashlib.sha256(
+                "一把已经看见且能够直接够到的铜钥匙放在仓库桌上。".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+        )
+        self.assertNotIn(
+            key_fact_id,
+            scenario_two["requests"][1]["message_projection"]["context"][
+                "active_fact_ids"
+            ],
+        )
+        scenario_two_fixture_texts = {
+            change["text"]
+            for change in scenario_two["fixture"]["public_fact_changes"]
+            if change["kind"] == "established"
+        }
+        self.assertEqual(
+            scenario_two_fixture_texts,
+            {
+                "调查员已经在无人看守的仓库内。",
+                "一把已经看见且能够直接够到的铜钥匙放在仓库桌上。",
+                "仓库外是一段被海浪间歇冲刷的断桥。",
+                "从断桥跌落会受伤并引来注意。",
+            },
+        )
+        scenario_three_fixture_texts = {
+            change["text"]
+            for change in scenario_three["fixture"]["public_fact_changes"]
+            if change["kind"] == "established"
+        }
+        self.assertEqual(
+            scenario_three_fixture_texts,
+            {
+                "牢门仍未打开。",
+                "逼近的脚步已经更清晰，并构成孤注一掷失败时的更严重风险。",
+            },
+        )
+        self.assertEqual(
+            scenario_three["fixture"]["mechanics"][0]["mechanic_id"],
+            "mechanic_ticket18_scenario3_base",
+        )
+        self.assertEqual(
+            scenario_three["fixture"]["mechanics"][0]["details"],
+            {
+                "ability": "locksmith",
+                "ability_value": 55,
+                "difficulty": "regular",
+                "target": 55,
+                "dice_adjustment": {"kind": "none", "count": 0},
+                "roll": 60,
+                "success_level": "failure",
+                "action": "撬开牢门上的生锈锁扣",
+                "stakes": "失败会耽搁时间，让逼近的脚步更清晰",
+            },
+        )
+        self.assertEqual(
+            scenario_three["resource_changes"]["luck"],
+            {"before": 50, "after": 50},
+        )
+        self.assertEqual(
+            scenario_two["hard_gates"]["investigator_ownership"]["status"],
+            "pending_human",
+        )
+        rendered = json.dumps(result.records, ensure_ascii=False)
+        for forbidden in (
+            api_key,
+            reasoning_canary,
+            hidden_canary,
+            "Authorization",
+            "Bearer",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
     def test_runner_records_both_paths_in_redacted_evaluation_format(
         self,
     ) -> None:
@@ -1188,6 +1707,38 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("SKIP", output.getvalue())
         self.assertIn("DEEPSEEK_API_KEY", output.getvalue())
+
+    def test_increment_three_main_preserves_pending_human_boundary(self) -> None:
+        from monmusu_agent.agentic_contract import ContractRunResult, main
+
+        output = io.StringIO()
+        pending = ContractRunResult(
+            status="pending_human",
+            reason="automated gates passed; human judgment is pending",
+            records=(),
+        )
+        with (
+            patch("monmusu_agent.agentic_contract.load_dotenv"),
+            patch(
+                "monmusu_agent.agentic_contract.run_increment_three_evaluation",
+                return_value=pending,
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "MONMUSU_RUN_INCREMENT3_EVALUATION": "1",
+                    "DEEPSEEK_API_KEY": "sk-main-test-secret",
+                },
+                clear=True,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn('"status": "pending_human"', output.getvalue())
+        self.assertIn("human judgment is pending", output.getvalue())
+        self.assertNotIn("sk-main-test-secret", output.getvalue())
 
     def test_recovery_runner_proves_both_thinking_profiles_without_private_material(
         self,

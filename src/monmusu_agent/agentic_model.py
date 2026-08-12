@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from dataclasses import dataclass
 from time import monotonic as _monotonic
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -347,6 +349,7 @@ def _sdk_request_evidence(request: Mapping[str, Any]) -> dict[str, Any]:
             function_tools.append(name if isinstance(name, str) else "unsupported")
     return {
         "model_id": request.get("model"),
+        "messages_sha256": _canonical_json_sha256(request.get("messages")),
         "function_tools": function_tools,
         "response_format": copy.deepcopy(request.get("response_format")),
         "stream": request.get("stream"),
@@ -361,6 +364,16 @@ def _sdk_request_evidence(request: Mapping[str, Any]) -> dict[str, Any]:
             else None
         ),
     }
+
+
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _normalized_sdk_tool_calls(raw_tool_calls: object) -> object:

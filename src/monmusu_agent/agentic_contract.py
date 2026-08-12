@@ -13,13 +13,14 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from dotenv import load_dotenv
 
 from monmusu_agent.agentic_harness import AgenticHarness, TurnResult
 from monmusu_agent.agentic_model import (
+    DEFAULT_COC_TOOL_NAMES,
     DeepSeekGameMasterModel,
     GameMasterModel,
     ModelCallError,
@@ -39,7 +40,7 @@ from monmusu_agent.config import PROJECT_ROOT
 class ContractRunResult:
     """区分未启用、协议通过与协议失败，不把 skip 记作通过。"""
 
-    status: Literal["skipped", "passed", "failed"]
+    status: Literal["skipped", "passed", "failed", "pending_human"]
     reason: str
     records: tuple[Mapping[str, Any], ...]
 
@@ -96,7 +97,6 @@ _RECOVERY_SCENARIOS = (
     ),
 )
 
-
 class _EvaluationRecordingModel:
     """只记录 Evaluation 所需的脱敏 provider 契约字段。"""
 
@@ -122,7 +122,11 @@ class _EvaluationRecordingModel:
             "usage": None,
             "latency_ms": None,
             "local_error_category": None,
-            "structure_repairs": 0,
+            "structure_repairs": _structure_repair_count(request.messages),
+            "structure_repair_request": not request.tools,
+            "model_request_messages_sha256": _canonical_json_sha256(
+                request.messages
+            ),
             "tool_calls": [],
         }
         if self.phase is not None:
@@ -173,6 +177,30 @@ class _InterruptAfterToolModel:
                 retryable=True,
             )
         return self.delegate.complete(request)
+
+
+class _FixtureModel:
+    """用公开 Harness seam 建立可追溯的场景前置事实。"""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = iter(responses)
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        del request
+        return next(self.responses)
+
+
+class _FixtureRandom:
+    """为真实场景固定必要骰序，不把规则期望交给 provider。"""
+
+    def __init__(self, values: tuple[int, ...]) -> None:
+        self.values = iter(values)
+
+    def randint(self, minimum: int, maximum: int) -> int:
+        value = next(self.values)
+        if not minimum <= value <= maximum:
+            raise ValueError("fixture random value outside requested range")
+        return value
 
 
 def run_deepseek_contract(
@@ -246,6 +274,846 @@ def run_deepseek_contract(
         ),
         records=tuple(records),
     )
+
+
+def run_increment_three_evaluation(
+    *,
+    enabled: bool,
+    api_key: str | None,
+    session_root: Path,
+    client: Any | None = None,
+) -> ContractRunResult:
+    """运行 Ticket 18 场景二、三，并保留人工判断边界。"""
+
+    if not enabled:
+        return ContractRunResult(
+            status="skipped",
+            reason="Increment 3 evaluation was not explicitly enabled",
+            records=(),
+        )
+    if api_key is None or not api_key.strip():
+        return ContractRunResult(
+            status="skipped",
+            reason="DEEPSEEK_API_KEY is not set",
+            records=(),
+        )
+
+    profile = deepseek_model_profile(
+        model_id="deepseek-v4-flash",
+        thinking=False,
+        enabled_tools=DEFAULT_COC_TOOL_NAMES,
+    )
+    records: list[Mapping[str, Any]] = []
+    records.append(
+        _run_increment3_scenario_two(
+            api_key=api_key,
+            client=client,
+            profile=profile,
+            session_root=session_root / "scenario-two",
+        )
+    )
+    records.append(
+        _run_increment3_scenario_three(
+            api_key=api_key,
+            client=client,
+            profile=profile,
+            session_root=session_root / "scenario-three",
+        )
+    )
+    automated_passed = all(record["automated_passed"] is True for record in records)
+    return ContractRunResult(
+        status="pending_human" if automated_passed else "failed",
+        reason=(
+            "Increment 3 automated gates passed; human GM judgment is pending"
+            if automated_passed
+            else "Increment 3 automated gates failed; human GM judgment is pending"
+        ),
+        records=tuple(records),
+    )
+
+
+def _run_increment3_scenario_two(
+    *,
+    api_key: str,
+    client: Any | None,
+    profile: Mapping[str, Any],
+    session_root: Path,
+) -> dict[str, Any]:
+    """场景二先用确定性回合建立仓库、钥匙和断桥的公开正典。"""
+
+    store = AgenticSessionStore(session_root=session_root)
+    created = store.create_session(
+        NewSessionRequest(
+            investigator_id="investigator_tracker",
+            display_name="场景二调查员",
+        )
+    )
+    locked_door_fact_id = _active_fact_id(
+        created.session,
+        "石牢的牢门仍然锁着。",
+    )
+    fixture = AgenticHarness(
+        store,
+        _FixtureModel(
+            [
+                _fixture_final_response(
+                    "调查员已经离开石牢，来到无人看守的仓库。桌上放着一把触手可及的铜钥匙；仓库外的断桥正被海浪间歇冲刷。",
+                    establish=(
+                        {
+                            "visibility": "public",
+                            "text": "调查员已经在无人看守的仓库内。",
+                        },
+                        {
+                            "visibility": "public",
+                            "text": "一把已经看见且能够直接够到的铜钥匙放在仓库桌上。",
+                        },
+                        {
+                            "visibility": "public",
+                            "text": "仓库外是一段被海浪间歇冲刷的断桥。",
+                        },
+                        {
+                            "visibility": "public",
+                            "text": "从断桥跌落会受伤并引来注意。",
+                        },
+                    ),
+                    retire=(
+                        {
+                            "fact_id": locked_door_fact_id,
+                            "reason": "调查员已经离开石牢并进入仓库，牢门不再构成当前阻挡。",
+                        },
+                    ),
+                )
+            ]
+        ),
+        model_profile=profile,
+    )
+    fixture_result = fixture.start_turn(
+        created.game_id,
+        "我检查仓库和通往外侧平台的路。",
+    )
+
+    sdk_requests: list[Mapping[str, Any]] = []
+    model = _EvaluationRecordingModel(
+        DeepSeekGameMasterModel(
+            api_key,
+            client=client,
+            request_evidence_sink=sdk_requests.append,
+        ),
+        sdk_requests,
+        phase="scenario-two",
+    )
+    harness = AgenticHarness(
+        store,
+        model,
+        model_profile=profile,
+        mechanic_id_factory=iter(("mechanic_ticket18_scenario2_jump",)).__next__,
+        random_source=_FixtureRandom((0, 1)),
+    )
+    player_inputs = (
+        "我拿起桌上的铜钥匙收好。",
+        "趁下一股浪还没打来，我助跑跳过断桥，去对面的门楼。",
+    )
+    results = tuple(
+        harness.start_turn(created.game_id, player_input)
+        for player_input in player_inputs
+    )
+    final_session = store.load_session(created.game_id).session
+    return _increment3_evaluation_record(
+        scenario_version="ticket-18-focused-scenario-2-v1",
+        fixture_version="ticket-18-scenario-2-fixture-v2",
+        created=created,
+        fixture_result=fixture_result,
+        results=results,
+        requests=model.requests,
+        profile=profile,
+        player_inputs=player_inputs,
+        final_session=final_session,
+        api_key=api_key,
+        expected_tool_path=("final", "make_check", "final"),
+        attempt_limits=harness.attempt_limits,
+    )
+
+
+def _run_increment3_scenario_three(
+    *,
+    api_key: str,
+    client: Any | None,
+    profile: Mapping[str, Any],
+    session_root: Path,
+) -> dict[str, Any]:
+    """场景三用确定性失败检定启动玩家明确选择的 Push 链。"""
+
+    store = AgenticSessionStore(session_root=session_root)
+    created = store.create_session(
+        NewSessionRequest(
+            investigator_id="investigator_mender",
+            display_name="场景三调查员",
+        )
+    )
+    departing_boatman_fact_id = _active_fact_id(
+        created.session,
+        "唯一还在看守的船工已经提灯离开，脚步与灯光正在远去。",
+    )
+    unattended_fact_id = _active_fact_id(
+        created.session,
+        "石牢附近暂时无人看守。",
+    )
+    base_arguments = {
+        "actor_id": "investigator_mender",
+        "ability": "locksmith",
+        "difficulty": "regular",
+        "dice_adjustment": {"kind": "none", "count": 0},
+        "action": "撬开牢门上的生锈锁扣",
+        "stakes": "失败会耽搁时间，让逼近的脚步更清晰",
+        "visibility": "public",
+    }
+    fixture = AgenticHarness(
+        store,
+        _FixtureModel(
+            [
+                _fixture_tool_response(
+                    "make_check",
+                    base_arguments,
+                    "call_ticket18_scenario3_base",
+                ),
+                _fixture_final_response(
+                    "撬棍滑开，门仍未打开；先前远去的脚步已经转向并逼近，成为再次失败时的更严重风险。",
+                    establish=(
+                        {
+                            "visibility": "public",
+                            "text": "牢门仍未打开。",
+                        },
+                        {
+                            "visibility": "public",
+                            "text": "逼近的脚步已经更清晰，并构成孤注一掷失败时的更严重风险。",
+                        },
+                    ),
+                    retire=(
+                        {
+                            "fact_id": departing_boatman_fact_id,
+                            "reason": "先前远去的脚步已经转向，正朝石牢逼近。",
+                        },
+                        {
+                            "fact_id": unattended_fact_id,
+                            "reason": "逼近的脚步意味着石牢附近已不再无人看守。",
+                        },
+                    ),
+                ),
+            ]
+        ),
+        model_profile=profile,
+        mechanic_id_factory=iter(("mechanic_ticket18_scenario3_base",)).__next__,
+        random_source=_FixtureRandom((0, 6)),
+    )
+    fixture_result = fixture.start_turn(
+        created.game_id,
+        "我用撬棍撬开牢门上的生锈锁扣。",
+    )
+
+    sdk_requests: list[Mapping[str, Any]] = []
+    model = _EvaluationRecordingModel(
+        DeepSeekGameMasterModel(
+            api_key,
+            client=client,
+            request_evidence_sink=sdk_requests.append,
+        ),
+        sdk_requests,
+        phase="scenario-three",
+    )
+    harness = AgenticHarness(
+        store,
+        model,
+        model_profile=profile,
+        mechanic_id_factory=iter(("mechanic_ticket18_scenario3_push",)).__next__,
+        random_source=_FixtureRandom((0, 1)),
+    )
+    player_inputs = (
+        "先别替我花幸运，也不要自动重掷。告诉我门没开以后现在发生了什么；如果换一种办法孤注一掷，我要承担什么更严重的风险？",
+        "我不花幸运。我拆门轴，从铰链这边强行卸门；我接受你刚才说的更严重后果，孤注一掷。",
+    )
+    results = tuple(
+        harness.start_turn(created.game_id, player_input)
+        for player_input in player_inputs
+    )
+    final_session = store.load_session(created.game_id).session
+    return _increment3_evaluation_record(
+        scenario_version="ticket-18-focused-scenario-3-v1",
+        fixture_version="ticket-18-scenario-3-fixture-v2",
+        created=created,
+        fixture_result=fixture_result,
+        results=results,
+        requests=model.requests,
+        profile=profile,
+        player_inputs=player_inputs,
+        final_session=final_session,
+        api_key=api_key,
+        expected_tool_path=("final", "push_check", "final"),
+        attempt_limits=harness.attempt_limits,
+    )
+
+
+def _fixture_final_response(
+    narration: str,
+    *,
+    establish: tuple[Mapping[str, str], ...] = (),
+    retire: tuple[Mapping[str, str], ...] = (),
+) -> ModelResponse:
+    return ModelResponse(
+        assistant_message={
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "narration": narration,
+                    "establish": list(establish),
+                    "retire": list(retire),
+                    "session_status": "ongoing",
+                },
+                ensure_ascii=False,
+            ),
+            "reasoning_content": None,
+            "tool_calls": [],
+        },
+        finish_reason="stop",
+        usage=None,
+        latency_ms=0,
+    )
+
+
+def _active_fact_id(session: Mapping[str, Any], text: str) -> str:
+    """按权威开场事实原文定位场景夹具需要结束的当前事实。"""
+
+    matches = [
+        fact["fact_id"]
+        for fact in session.get("facts", [])
+        if isinstance(fact, Mapping)
+        and fact.get("status") == "active"
+        and fact.get("text") == text
+        and isinstance(fact.get("fact_id"), str)
+    ]
+    if len(matches) != 1:
+        raise ValueError("focused scenario fixture fact is missing or ambiguous")
+    return matches[0]
+
+
+def _fixture_tool_response(
+    name: str,
+    arguments: Mapping[str, Any],
+    call_id: str,
+) -> ModelResponse:
+    return ModelResponse(
+        assistant_message={
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(
+                            dict(arguments),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                }
+            ],
+        },
+        finish_reason="tool_calls",
+        usage=None,
+        latency_ms=0,
+    )
+
+
+def _increment3_evaluation_record(
+    *,
+    scenario_version: str,
+    fixture_version: str,
+    created: CreatedSession,
+    fixture_result: TurnResult,
+    results: tuple[TurnResult, ...],
+    requests: list[dict[str, Any]],
+    profile: Mapping[str, Any],
+    player_inputs: tuple[str, ...],
+    final_session: Mapping[str, Any],
+    api_key: str,
+    expected_tool_path: tuple[str, ...],
+    attempt_limits: Mapping[str, int],
+) -> dict[str, Any]:
+    public_mechanics = [
+        _public_mechanic(item)
+        for result in results
+        for item in result.public_mechanics
+    ]
+    public_fact_changes = [
+        {
+            "kind": item.kind,
+            "fact_id": item.fact_id,
+            "text": item.text,
+        }
+        for result in results
+        for item in result.public_fact_changes
+    ]
+    fixture_mechanics = [
+        _public_mechanic(item) for item in fixture_result.public_mechanics
+    ]
+    player_visible_outputs = [
+        {
+            "status": result.status,
+            "turn_id": result.turn_id,
+            "narration": result.narration,
+            "public_mechanics": [
+                _public_mechanic(item) for item in result.public_mechanics
+            ],
+            "public_fact_changes": [
+                {
+                    "kind": item.kind,
+                    "fact_id": item.fact_id,
+                    "text": item.text,
+                }
+                for item in result.public_fact_changes
+            ],
+            "error_code": result.error_code,
+            "error_message": result.error_message,
+        }
+        for result in results
+    ]
+    initial_resources = _actor_resource_projection(created.session)
+    final_resources = _actor_resource_projection(final_session)
+    investigator_id = _investigator_actor_id(created.session)
+    investigator_before = initial_resources.get(investigator_id, {})
+    investigator_after = final_resources.get(investigator_id, {})
+    resource_changes = {
+        "luck": {
+            "before": investigator_before.get("luck", {}).get("current"),
+            "after": investigator_after.get("luck", {}).get("current"),
+        }
+    }
+    record: dict[str, Any] = {
+        "run_id": f"increment3_{uuid4().hex}",
+        "scenario_version": scenario_version,
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+        "evaluator": "agentic-increment3-runner",
+        "git_revision": _git_revision(),
+        "prompt_version": profile["prompt_revision"],
+        "module_revision": created.session["setup"]["module_reference_revision"],
+        "character_revision": created.session["setup"]["character_reference_revision"],
+        "dependency_versions": _dependency_versions(),
+        "model_id": profile["model_id"],
+        "thinking": profile["thinking"],
+        "provider_parameters": {
+            "response_format": profile["response_format"],
+            "stream": profile["stream"],
+            "temperature": profile["temperature"],
+            "top_p": profile["top_p"],
+            "max_tokens": profile["max_tokens"],
+        },
+        "attempt_limits": copy.deepcopy(dict(attempt_limits)),
+        "tool_schema_version": profile["tool_schema_version"],
+        "fixture": {
+            "kind": "deterministic_harness",
+            "version": fixture_version,
+            "status": fixture_result.status,
+            "mechanics": fixture_mechanics,
+            "public_fact_changes": [
+                {
+                    "kind": item.kind,
+                    "fact_id": item.fact_id,
+                    "text": item.text,
+                }
+                for item in fixture_result.public_fact_changes
+            ],
+        },
+        "player_inputs": list(player_inputs),
+        "player_visible_outputs": player_visible_outputs,
+        "player_input": player_inputs[-1],
+        "player_visible_output": player_visible_outputs[-1],
+        "tool_calls": [
+            copy.deepcopy(tool_call)
+            for request in requests
+            for tool_call in request["tool_calls"]
+        ],
+        "mechanics": public_mechanics,
+        "fact_changes": public_fact_changes,
+        "resource_changes": resource_changes,
+        "requests": copy.deepcopy(requests),
+        "hard_gates": _increment3_hard_gates(
+            requests,
+            profile,
+            results,
+            expected_tool_path,
+            resource_changes,
+            public_mechanics,
+            fixture_result,
+            player_inputs,
+            attempt_limits,
+            final_session,
+        ),
+        "quality_scores": _pending_quality_scores(),
+        "human_judgment": {
+            "status": "pending_user",
+            "quality_scores": _pending_quality_scores(),
+            "notes": None,
+        },
+        "rationale": (
+            "Deterministic fixture and automated protocol/mechanics gates are "
+            "recorded separately; human GM behavior judgment remains pending."
+        ),
+        "passed": False,
+    }
+    gates = record["hard_gates"]
+    record["automated_passed"] = all(
+        gate["status"] == "passed"
+        for gate in gates.values()
+        if gate["status"] != "pending_human"
+    )
+    rendered = json.dumps(record, ensure_ascii=False)
+    if api_key in rendered or "reasoning_content" in rendered:
+        record["automated_passed"] = False
+        record["hard_gates"]["hidden_content_control"] = {
+            "status": "failed",
+            "evidence": "secret or reasoning material appeared in the record",
+        }
+    return record
+
+
+def _increment3_hard_gates(
+    requests: list[dict[str, Any]],
+    profile: Mapping[str, Any],
+    results: tuple[TurnResult, ...],
+    expected_tool_path: tuple[str, ...],
+    resource_changes: Mapping[str, Any],
+    public_mechanics: Sequence[Mapping[str, Any]],
+    fixture_result: TurnResult,
+    player_inputs: tuple[str, ...],
+    attempt_limits: Mapping[str, int],
+    final_session: Mapping[str, Any],
+) -> dict[str, dict[str, str]]:
+    configured = (
+        profile["model_id"] == "deepseek-v4-flash"
+        and profile["thinking"] is False
+        and profile["stream"] is False
+        and profile["response_format"] == "json_object"
+        and profile["enabled_tools"] == list(DEFAULT_COC_TOOL_NAMES)
+        and attempt_limits
+        == {
+            "max_round_trips": 8,
+            "request_timeout_seconds": 60,
+            "attempt_timeout_seconds": 180,
+            "max_structure_repairs": 1,
+        }
+        and all(
+            request["function_tools"]
+            == (
+                []
+                if request["structure_repair_request"]
+                else list(DEFAULT_COC_TOOL_NAMES)
+            )
+            and request["response_format"] == {"type": "json_object"}
+            and request["stream"] is False
+            and request["thinking"] == "disabled"
+            and request["timeout"] == 60.0
+            and request["messages_sha256"]
+            == request["model_request_messages_sha256"]
+            for request in requests
+        )
+    )
+    observed_path = tuple(
+        "final" if not request["tool_calls"] else request["tool_calls"][0]["tool_name"]
+        for request in requests
+        if not request["structure_repair_request"]
+    )
+    repairs_by_player_input: dict[str, int] = {}
+    for request in requests:
+        if not request["structure_repair_request"]:
+            continue
+        input_hash = request["message_projection"].get(
+            "current_player_input_sha256"
+        )
+        if isinstance(input_hash, str):
+            repairs_by_player_input[input_hash] = (
+                repairs_by_player_input.get(input_hash, 0) + 1
+            )
+    protocol = (
+        configured
+        and observed_path == expected_tool_path
+        and all(len(request["tool_calls"]) <= 1 for request in requests)
+        and all(count <= 1 for count in repairs_by_player_input.values())
+        and all(result.status == "committed" for result in results)
+    )
+    expected_push_source = next(
+        (
+            item.mechanic_id
+            for item in fixture_result.public_mechanics
+            if item.kind == "check"
+        ),
+        None,
+    )
+    mechanics = (
+        expected_tool_path == ("final", "make_check", "final")
+        and len(public_mechanics) == 1
+        and public_mechanics[0]["kind"] == "check"
+    ) or (
+        expected_tool_path == ("final", "push_check", "final")
+        and len(public_mechanics) == 1
+        and public_mechanics[0]["kind"] == "check"
+        and expected_push_source is not None
+        and public_mechanics[0]["details"].get("pushed_from")
+        == expected_push_source
+    )
+    hidden = all(
+        "reasoning_content" not in json.dumps(request, ensure_ascii=False)
+        for request in requests
+    )
+    player_choice = (
+        expected_tool_path == ("final", "push_check", "final")
+        and observed_path == expected_tool_path
+        and resource_changes["luck"]["before"]
+        == resource_changes["luck"]["after"]
+    )
+    context_continuity = _increment3_context_continuity(
+        requests=requests,
+        fixture_result=fixture_result,
+        results=results,
+        player_inputs=player_inputs,
+        final_session=final_session,
+    )
+    return {
+        "protocol_legality": {
+            "status": "passed" if protocol else "failed",
+            "evidence": (
+                "provider profile, tool order and final responses matched the scenario"
+                if protocol
+                else (
+                    f"observed provider path {observed_path!r} or committed turn "
+                    "status did not match the scenario"
+                )
+            ),
+        },
+        "mechanical_truth": {
+            "status": "passed" if mechanics else "failed",
+            "evidence": (
+                "public mechanic kind and source matched the expected committed mechanic"
+                if mechanics
+                else "public mechanic kind, count or source did not match the scenario"
+            ),
+        },
+        "hidden_content_control": {
+            "status": "passed" if hidden else "failed",
+            "evidence": "recorded requests contain no reasoning body",
+        },
+        "investigator_ownership": {
+            "status": "passed" if player_choice else "pending_human",
+            "evidence": "Push was requested only after the player selected a different approach"
+            if player_choice
+            else (
+                "scenario-two ownership remains part of human review"
+                if expected_tool_path == ("final", "make_check", "final")
+                else "automated tool path did not isolate the player's Push choice"
+            ),
+        },
+        "canon_continuity": {
+            "status": "passed" if context_continuity else "failed",
+            "evidence": (
+                (
+                    "redacted context fingerprints matched the fixture, prior turn, "
+                    "current input and committed tool result"
+                )
+                if context_continuity
+                else (
+                    "redacted context, input or committed result fingerprints did "
+                    "not match the persisted scenario"
+                )
+            ),
+        },
+        "open_action_validity": {
+            "status": "pending_human",
+            "evidence": "human reviewer must judge causal fit of the open action",
+        },
+    }
+
+
+def _increment3_context_continuity(
+    *,
+    requests: Sequence[Mapping[str, Any]],
+    fixture_result: TurnResult,
+    results: tuple[TurnResult, ...],
+    player_inputs: tuple[str, ...],
+    final_session: Mapping[str, Any],
+) -> bool:
+    """用脱敏指纹证明跨回合上下文，而不复制隐藏正文。"""
+
+    if len(results) != 2 or len(player_inputs) != 2:
+        return False
+    raw_projections = [request.get("message_projection") for request in requests]
+    if not all(isinstance(item, Mapping) for item in raw_projections) or any(
+        request.get("messages_sha256")
+        != request.get("model_request_messages_sha256")
+        for request in requests
+    ):
+        return False
+    projections = [
+        item for item in raw_projections if isinstance(item, Mapping)
+    ]
+    input_hashes = tuple(_text_sha256(item) for item in player_inputs)
+    observed_input_hashes = tuple(
+        projection.get("current_player_input_sha256") for projection in projections
+    )
+    if (
+        not projections
+        or any(item not in input_hashes for item in observed_input_hashes)
+        or input_hashes[0] not in observed_input_hashes
+        or input_hashes[1] not in observed_input_hashes
+        or list(observed_input_hashes) != sorted(
+            observed_input_hashes,
+            key=input_hashes.index,
+        )
+    ):
+        return False
+
+    fixture_turn_id = fixture_result.turn_id
+    prior_turn_id = results[0].turn_id
+    if not isinstance(fixture_turn_id, str) or not isinstance(prior_turn_id, str):
+        return False
+    raw_contexts = [projection.get("context") for projection in projections]
+    if not all(isinstance(item, Mapping) for item in raw_contexts):
+        return False
+    contexts = [item for item in raw_contexts if isinstance(item, Mapping)]
+    persisted_turns = {
+        turn["turn_id"]: turn
+        for turn in final_session.get("turns", [])
+        if isinstance(turn, Mapping) and isinstance(turn.get("turn_id"), str)
+    }
+    facts_by_id = {
+        fact["fact_id"]: fact
+        for fact in final_session.get("facts", [])
+        if isinstance(fact, Mapping) and isinstance(fact.get("fact_id"), str)
+    }
+    fixture_turn = persisted_turns.get(fixture_turn_id)
+    prior_turn = persisted_turns.get(prior_turn_id)
+    if fixture_turn is None or prior_turn is None:
+        return False
+    expected_fixture = _committed_turn_projection(fixture_turn, facts_by_id)
+    expected_prior = _committed_turn_projection(prior_turn, facts_by_id)
+    fixture_established_ids = {
+        item.fact_id
+        for item in fixture_result.public_fact_changes
+        if item.kind == "established"
+    }
+    fixture_retired_ids = {
+        item.fact_id
+        for item in fixture_result.public_fact_changes
+        if item.kind == "retired"
+    }
+    fixture_mechanic_ids = {
+        item.mechanic_id for item in fixture_result.public_mechanics
+    }
+    for projection, context in zip(projections, contexts, strict=True):
+        first_player_turn = (
+            projection.get("current_player_input_sha256") == input_hashes[0]
+        )
+        projected_turns = _projected_turns_by_id(context)
+        if not _projected_fixture_matches(
+                context,
+                fixture_turn_id=fixture_turn_id,
+                established_fact_ids=fixture_established_ids,
+                retired_fact_ids=fixture_retired_ids,
+                mechanic_ids=fixture_mechanic_ids,
+                require_initial_active_state=first_player_turn,
+            ) or projected_turns.get(fixture_turn_id) != expected_fixture:
+            return False
+        projected_prior = projected_turns.get(prior_turn_id)
+        if first_player_turn and projected_prior is not None:
+            return False
+        if not first_player_turn and projected_prior != expected_prior:
+            return False
+
+    final_messages = projections[-1].get("messages")
+    final_turn = persisted_turns.get(results[-1].turn_id)
+    if final_turn is None:
+        return False
+    expected_results = {
+        item["mechanic_id"]: _canonical_json_sha256(item)
+        for item in final_turn.get("mechanics", [])
+        if isinstance(item, Mapping) and isinstance(item.get("mechanic_id"), str)
+    }
+    projected_results = {
+        item.get("result_mechanic_id"): item.get("result_sha256")
+        for item in final_messages
+        if isinstance(item, Mapping) and item.get("role") == "tool"
+    } if isinstance(final_messages, list) else {}
+    return bool(expected_results) and all(
+        projected_results.get(mechanic_id) == result_sha256
+        for mechanic_id, result_sha256 in expected_results.items()
+    )
+
+
+def _projected_fixture_matches(
+    context: Mapping[str, Any],
+    *,
+    fixture_turn_id: str,
+    established_fact_ids: set[str],
+    retired_fact_ids: set[str],
+    mechanic_ids: set[str],
+    require_initial_active_state: bool,
+) -> bool:
+    turn = _projected_turns_by_id(context).get(fixture_turn_id)
+    active_fact_ids = context.get("active_fact_ids")
+    if turn is None or not isinstance(active_fact_ids, list):
+        return False
+    history_matches = (
+        set(turn.get("established_fact_ids", [])) == established_fact_ids
+        and set(turn.get("retired_fact_ids", [])) == retired_fact_ids
+        and set(turn.get("mechanic_ids", [])) == mechanic_ids
+    )
+    return history_matches and (
+        not require_initial_active_state
+        or (
+            established_fact_ids <= set(active_fact_ids)
+            and retired_fact_ids.isdisjoint(active_fact_ids)
+        )
+    )
+
+
+def _projected_turns_by_id(
+    context: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    turns = context.get("committed_turns")
+    if not isinstance(turns, list):
+        return {}
+    return {
+        item["turn_id"]: item
+        for item in turns
+        if isinstance(item, Mapping) and isinstance(item.get("turn_id"), str)
+    }
+
+
+def _pending_quality_scores() -> dict[str, None]:
+    return {
+        "fictional_causality": None,
+        "improvisation": None,
+        "cross_turn_continuity": None,
+        "npc_performance": None,
+        "pacing": None,
+        "atmosphere": None,
+    }
+
+
+def _investigator_actor_id(session: Mapping[str, Any]) -> str:
+    actors = session.get("actors")
+    if not isinstance(actors, list):
+        raise ValueError("evaluation session actors are unavailable")
+    matches = [
+        actor["actor_id"]
+        for actor in actors
+        if isinstance(actor, Mapping)
+        and actor.get("role") == "investigator"
+        and isinstance(actor.get("actor_id"), str)
+    ]
+    if len(matches) != 1:
+        raise ValueError("evaluation session must contain one investigator")
+    return matches[0]
 
 
 def run_deepseek_recovery_contract(
@@ -1041,6 +1909,7 @@ def _sdk_evidence_for_call(
     if len(sdk_requests) != previous_count + 1:
         return {
             "model_id": None,
+            "messages_sha256": None,
             "function_tools": [],
             "response_format": None,
             "stream": None,
@@ -1065,11 +1934,21 @@ def _reasoning_projection(message: Mapping[str, Any]) -> dict[str, Any]:
 def _message_projection(
     messages: tuple[Mapping[str, Any], ...],
 ) -> dict[str, Any]:
-    """记录消息角色和协议 ID，不复制上下文、事实或 reasoning 正文。"""
+    """记录协议 ID 和上下文指纹，不复制事实、叙事或 reasoning 正文。"""
 
     projection: list[dict[str, Any]] = []
+    context: dict[str, Any] | None = None
+    current_player_input_sha256: str | None = None
     for message in messages:
         item: dict[str, Any] = {"role": message.get("role")}
+        content = message.get("content")
+        if message.get("role") == "user" and isinstance(content, str):
+            package = _context_package_projection(content)
+            if package is not None:
+                context = package
+            player_input = _projected_player_input(content)
+            if player_input is not None:
+                current_player_input_sha256 = _text_sha256(player_input)
         if message.get("role") == "assistant":
             tool_calls = message.get("tool_calls")
             item["tool_call_ids"] = (
@@ -1086,8 +1965,167 @@ def _message_projection(
         elif message.get("role") == "tool":
             item["tool_call_id"] = message.get("tool_call_id")
             item["name"] = message.get("name")
+            item.update(_tool_result_projection(content))
         projection.append(item)
-    return {"messages": projection}
+    return {
+        "messages": projection,
+        "context": context,
+        "current_player_input_sha256": current_player_input_sha256,
+    }
+
+
+def _context_package_projection(content: str) -> dict[str, Any] | None:
+    try:
+        package = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(package, Mapping):
+        return None
+    turns = package.get("COMMITTED_TURNS")
+    active_facts = package.get("ACTIVE_FACTS")
+    if not isinstance(turns, list) or not isinstance(active_facts, list):
+        return None
+    projected_turns: list[dict[str, Any]] = []
+    for turn in turns:
+        if not isinstance(turn, Mapping) or not isinstance(turn.get("turn_id"), str):
+            continue
+        projected_turns.append(_committed_turn_projection(turn))
+    return {
+        "committed_turns": projected_turns,
+        "active_fact_ids": [
+            fact["fact_id"]
+            for fact in active_facts
+            if isinstance(fact, Mapping)
+            and isinstance(fact.get("fact_id"), str)
+        ],
+    }
+
+
+def _projected_player_input(content: str) -> str | None:
+    prefix = "<PLAYER_INPUT>\n"
+    suffix = "\n</PLAYER_INPUT>"
+    if not content.startswith(prefix) or not content.endswith(suffix):
+        return None
+    return content[len(prefix) : -len(suffix)]
+
+
+def _tool_result_projection(content: object) -> dict[str, Any]:
+    if not isinstance(content, str):
+        return {
+            "result_mechanic_id": None,
+            "result_sha256": None,
+        }
+    try:
+        envelope = json.loads(content)
+    except json.JSONDecodeError:
+        return {
+            "result_mechanic_id": None,
+            "result_sha256": None,
+        }
+    if not isinstance(envelope, Mapping):
+        return {
+            "result_mechanic_id": None,
+            "result_sha256": None,
+        }
+    result = envelope.get("result")
+    identifier = result.get("mechanic_id") if isinstance(result, Mapping) else None
+    if not isinstance(identifier, str) or not isinstance(result, Mapping):
+        return {
+            "result_mechanic_id": None,
+            "result_sha256": None,
+        }
+    return {
+        "result_mechanic_id": identifier,
+        "result_sha256": _canonical_json_sha256(result),
+    }
+
+
+def _committed_turn_projection(
+    turn: Mapping[str, Any],
+    facts_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    mechanics = turn.get("mechanics")
+    projected_mechanics = [
+        {
+            "mechanic_id": mechanic["mechanic_id"],
+            "result_sha256": _canonical_json_sha256(mechanic),
+        }
+        for mechanic in mechanics
+        if isinstance(mechanic, Mapping)
+        and isinstance(mechanic.get("mechanic_id"), str)
+    ] if isinstance(mechanics, list) else []
+    established_facts = turn.get("established_facts")
+    if not isinstance(established_facts, list) and facts_by_id is not None:
+        established_facts = [
+            facts_by_id[fact_id]
+            for fact_id in turn.get("established_fact_ids", [])
+            if isinstance(fact_id, str) and fact_id in facts_by_id
+        ]
+    projected_facts = [
+        {
+            "fact_id": fact["fact_id"],
+            "text_sha256": _text_sha256(fact["text"]),
+        }
+        for fact in established_facts
+        if isinstance(fact, Mapping)
+        and isinstance(fact.get("fact_id"), str)
+        and isinstance(fact.get("text"), str)
+    ] if isinstance(established_facts, list) else []
+    retirements = turn.get("retirements")
+    projected_retirements = [
+        {
+            "fact_id": retirement["fact_id"],
+            "reason_sha256": _text_sha256(retirement["reason"]),
+        }
+        for retirement in retirements
+        if isinstance(retirement, Mapping)
+        and isinstance(retirement.get("fact_id"), str)
+        and isinstance(retirement.get("reason"), str)
+    ] if isinstance(retirements, list) else []
+    return {
+        "turn_id": turn["turn_id"],
+        "player_input_sha256": (
+            _text_sha256(turn["player_input"])
+            if isinstance(turn.get("player_input"), str)
+            else None
+        ),
+        "narration_sha256": (
+            _text_sha256(turn["narration"])
+            if isinstance(turn.get("narration"), str)
+            else None
+        ),
+        "mechanic_ids": [item["mechanic_id"] for item in projected_mechanics],
+        "mechanics": projected_mechanics,
+        "established_fact_ids": [item["fact_id"] for item in projected_facts],
+        "established_facts": projected_facts,
+        "retired_fact_ids": [item["fact_id"] for item in projected_retirements],
+        "retirements": projected_retirements,
+    }
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _structure_repair_count(messages: Sequence[Mapping[str, Any]]) -> int:
+    return sum(
+        1
+        for message in messages
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        and "本地校验提示：" in message["content"]
+    )
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return _text_sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def _tool_result_ids(
@@ -1121,9 +2159,9 @@ def _sanitized_tool_calls(
         )
         function = tool_call.get("function")
         name = (
-            "make_check"
+            function.get("name")
             if isinstance(function, Mapping)
-            and function.get("name") == "make_check"
+            and function.get("name") in DEFAULT_COC_TOOL_NAMES
             else "unsupported"
         )
         sanitized.append(
@@ -1212,8 +2250,12 @@ def main() -> int:
     recovery_enabled = (
         os.environ.get("MONMUSU_RUN_DEEPSEEK_RECOVERY_CONTRACT") == "1"
     )
+    increment3_enabled = (
+        os.environ.get("MONMUSU_RUN_INCREMENT3_EVALUATION") == "1"
+    )
     enabled = (
         recovery_enabled
+        or increment3_enabled
         or os.environ.get("MONMUSU_RUN_DEEPSEEK_CONTRACT") == "1"
     )
     api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -1221,7 +2263,13 @@ def main() -> int:
         with tempfile.TemporaryDirectory(
             prefix="monmusu-agent-deepseek-contract-"
         ) as directory:
-            if recovery_enabled:
+            if increment3_enabled:
+                result = run_increment_three_evaluation(
+                    enabled=enabled,
+                    api_key=api_key,
+                    session_root=Path(directory) / "sessions",
+                )
+            elif recovery_enabled:
                 result = run_deepseek_recovery_contract(
                     enabled=enabled,
                     api_key=api_key,

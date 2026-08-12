@@ -1349,6 +1349,285 @@ class AgenticHarnessTest(unittest.TestCase):
                 expected,
             )
 
+    def test_increment_three_profile_carries_five_tools_across_six_templates(
+        self,
+    ) -> None:
+        """完整 profile 串起五工具，并在独立会话覆盖六张生产模板。"""
+
+        expected_tools = [
+            "make_check",
+            "push_check",
+            "spend_luck",
+            "deal_damage",
+            "make_sanity_check",
+        ]
+        expected_rosters = {
+            investigator_id: {
+                investigator_id,
+                "npc_vespera",
+                "npc_saphra",
+                "npc_aranis",
+            }
+            for investigator_id in (
+                "investigator_tracker",
+                "investigator_mediator",
+                "investigator_mender",
+            )
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stores: dict[str, tuple[AgenticSessionStore, str]] = {}
+            for investigator_id, expected_roster in expected_rosters.items():
+                session_root = root / investigator_id
+                store, game_id = self._create_session(
+                    session_root,
+                    investigator_id=investigator_id,
+                )
+                stores[investigator_id] = (store, game_id)
+                session = store.load_session(game_id).session
+                actor_ids = {
+                    actor["actor_id"]
+                    for actor in session["actors"]
+                }
+                self.assertEqual(actor_ids, expected_roster)
+                self.assertEqual(len(session["actors"]), 4)
+                self.assertTrue(
+                    expected_roster.isdisjoint(
+                        set(expected_rosters) - {investigator_id}
+                    )
+                )
+
+            base_push = {
+                **self._valid_check_arguments(),
+                "action": "检查门锁上最薄弱的受力点",
+                "stakes": "失败会错过拆卸门轴的时机",
+            }
+            base_luck = {
+                **self._valid_check_arguments(),
+                "difficulty": "hard",
+                "action": "在脚步逼近前辨认门轴裂纹",
+                "stakes": "失败会误判裂纹并浪费时间",
+            }
+            session_cases: dict[str, dict[str, Any]] = {
+                "investigator_tracker": {
+                    "responses": [
+                        self._tool_response(
+                            base_push,
+                            tool_call_id="call_increment3_base_push",
+                        ),
+                        self._response(self._final_payload("原检定失败仍然有效。")),
+                        self._tool_response(
+                            {
+                                "check_id": "mechanic_increment3_base_push",
+                                "new_approach": "改从铰链侧拆卸门轴",
+                                "failure_stakes": "失败会卡死门轴并让逼近者听见金属断裂声",
+                            },
+                            name="push_check",
+                            tool_call_id="call_increment3_push",
+                        ),
+                        self._response(self._final_payload("Push 结果已经解释。")),
+                        self._tool_response(
+                            base_luck,
+                            tool_call_id="call_increment3_base_luck",
+                        ),
+                        self._response(self._final_payload("第二次基础检定失败。")),
+                        self._tool_response(
+                            {
+                                "check_id": "mechanic_increment3_base_luck",
+                                "points": 3,
+                            },
+                            name="spend_luck",
+                            tool_call_id="call_increment3_luck",
+                        ),
+                        self._response(self._final_payload("Luck 结果已经解释。")),
+                    ],
+                    "inputs": (
+                        "我检查门锁的受力点。",
+                        "我接受更严重风险，改拆门轴孤注一掷。",
+                        "我辨认门轴裂纹。",
+                        "我明确花费 3 点幸运。",
+                    ),
+                    "mechanic_ids": (
+                        "mechanic_increment3_base_push",
+                        "mechanic_increment3_push",
+                        "mechanic_increment3_base_luck",
+                        "mechanic_increment3_luck",
+                    ),
+                    "dice": (1, 7, 7, 2, 8, 3),
+                    "public_counts": [1, 1, 1, 1],
+                },
+                "investigator_mediator": {
+                    "responses": [
+                        self._tool_response(
+                            {
+                                "actor_id": "npc_vespera",
+                                "damage_expression": "2",
+                                "cause": "断桥碎石擦伤她的肩膀",
+                                "armor_applies": False,
+                                "visibility": "hidden",
+                            },
+                            name="deal_damage",
+                            tool_call_id="call_increment3_damage",
+                        ),
+                        self._response(self._final_payload("隐藏伤害由 GM 承接。")),
+                        self._tool_response(
+                            {
+                                "actor_id": "npc_saphra",
+                                "source": "她认出了桥下倒影的真实轮廓",
+                                "success_loss": "0",
+                                "failure_loss": "2",
+                                "visibility": "hidden",
+                            },
+                            name="make_sanity_check",
+                            tool_call_id="call_increment3_sanity",
+                        ),
+                        self._response(self._final_payload("隐藏 SAN 结果由 GM 承接。")),
+                    ],
+                    "inputs": (
+                        "碎石已经擦伤维斯佩拉。",
+                        "萨芙拉认出了倒影。",
+                    ),
+                    "mechanic_ids": (
+                        "mechanic_increment3_damage",
+                        "mechanic_increment3_sanity",
+                    ),
+                    "dice": (1, 7),
+                    "public_counts": [0, 0],
+                },
+                "investigator_mender": {
+                    "responses": [
+                        self._tool_response(
+                            {
+                                "actor_id": "npc_aranis",
+                                "ability": "spot_hidden",
+                                "difficulty": "regular",
+                                "dice_adjustment": {"kind": "none", "count": 0},
+                                "action": "秘密判断门外是否有人埋伏",
+                                "stakes": "失败会错过埋伏者留下的动静",
+                                "visibility": "hidden",
+                            },
+                            tool_call_id="call_increment3_hidden_check",
+                        ),
+                        self._response(self._final_payload("隐藏检定由 GM 承接。")),
+                    ],
+                    "inputs": ("阿兰妮丝秘密判断门外动静。",),
+                    "mechanic_ids": ("mechanic_increment3_hidden_check",),
+                    "dice": (1, 7),
+                    "public_counts": [0],
+                },
+            }
+            sessions: dict[str, Mapping[str, Any]] = {}
+            random_sources: dict[str, ScriptedRandom] = {}
+            for investigator_id, case in session_cases.items():
+                store, game_id = stores[investigator_id]
+                model = ScriptedGameMasterModel(case["responses"])
+                random_source = ScriptedRandom(case["dice"])
+                harness = AgenticHarness(
+                    store,
+                    model,
+                    turn_id_factory=iter(
+                        f"turn_increment3_{investigator_id}_{index}"
+                        for index in range(1, len(case["inputs"]) + 1)
+                    ).__next__,
+                    mechanic_id_factory=iter(case["mechanic_ids"]).__next__,
+                    random_source=random_source,
+                )
+                results = [
+                    harness.start_turn(game_id, player_input)
+                    for player_input in case["inputs"]
+                ]
+                self.assertEqual(
+                    [item.status for item in results],
+                    ["committed"] * len(case["inputs"]),
+                )
+                self.assertEqual(
+                    [len(item.public_mechanics) for item in results],
+                    case["public_counts"],
+                )
+                for request in model.requests:
+                    self.assertEqual(
+                        request.model_profile["enabled_tools"],
+                        expected_tools,
+                    )
+                    self.assertEqual(
+                        request.model_profile["tool_schema_version"],
+                        "coc-tools-agentic-mvp-1",
+                    )
+                    self.assertEqual(
+                        request.model_profile["response_format"],
+                        "json_object",
+                    )
+                    self.assertFalse(request.model_profile["stream"])
+                    self.assertEqual(
+                        [tool["function"]["name"] for tool in request.tools],
+                        expected_tools,
+                    )
+                sessions[investigator_id] = store.load_session(game_id).session
+                random_sources[investigator_id] = random_source
+
+            mechanics_by_investigator = {
+                investigator_id: [
+                    turn["mechanics"][0]
+                    for turn in session["turns"]
+                ]
+                for investigator_id, session in sessions.items()
+            }
+            self.assertEqual(
+                {
+                    investigator_id: [item["kind"] for item in mechanics]
+                    for investigator_id, mechanics in mechanics_by_investigator.items()
+                },
+                {
+                    "investigator_tracker": [
+                        "check",
+                        "check",
+                        "check",
+                        "luck_spend",
+                    ],
+                    "investigator_mediator": ["damage", "sanity_check"],
+                    "investigator_mender": ["check"],
+                },
+            )
+            tracker_mechanics = mechanics_by_investigator["investigator_tracker"]
+            self.assertEqual(
+                tracker_mechanics[1]["pushed_from"],
+                "mechanic_increment3_base_push",
+            )
+            self.assertEqual(
+                tracker_mechanics[3]["check_id"],
+                "mechanic_increment3_base_luck",
+            )
+            self.assertEqual(
+                self._actor(
+                    sessions["investigator_tracker"],
+                    "investigator_tracker",
+                )["luck"]["current"],
+                52,
+            )
+            self.assertEqual(
+                self._actor(
+                    sessions["investigator_mediator"],
+                    "npc_vespera",
+                )["hp"]["current"],
+                9,
+            )
+            self.assertEqual(
+                self._actor(
+                    sessions["investigator_mediator"],
+                    "npc_saphra",
+                )["san"],
+                {"current": 56, "max": 60, "session_loss": 2},
+            )
+            self.assertEqual(
+                {key: value.calls for key, value in random_sources.items()},
+                {
+                    "investigator_tracker": [(0, 9)] * 6,
+                    "investigator_mediator": [(0, 9)] * 2,
+                    "investigator_mender": [(0, 9)] * 2,
+                },
+            )
+
     def test_default_tools_reject_invalid_schema_before_preflight(
         self,
     ) -> None:
