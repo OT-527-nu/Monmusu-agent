@@ -326,7 +326,7 @@ def run_increment_three_evaluation(
         reason=(
             "Increment 3 automated gates passed; human GM judgment is pending"
             if automated_passed
-            else "Increment 3 automated gates failed; human GM judgment is pending"
+            else "Increment 3 automated gates failed"
         ),
         records=tuple(records),
     )

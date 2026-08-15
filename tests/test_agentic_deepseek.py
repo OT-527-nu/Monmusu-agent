@@ -1000,6 +1000,39 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
         self.assertIn("DEEPSEEK_API_KEY", missing_key.reason)
         self.assertEqual(missing_key.records, ())
 
+    def test_increment_three_runner_reports_automated_failure(
+        self,
+    ) -> None:
+        from monmusu_agent.agentic_contract import (
+            run_increment_three_evaluation,
+        )
+
+        failed_record = {"automated_passed": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch(
+                    "monmusu_agent.agentic_contract._run_increment3_scenario_two",
+                    return_value=failed_record,
+                ),
+                patch(
+                    "monmusu_agent.agentic_contract._run_increment3_scenario_three",
+                    return_value=failed_record,
+                ),
+            ):
+                result = run_increment_three_evaluation(
+                    enabled=True,
+                    api_key="test-only",
+                    session_root=Path(directory),
+                    client=ForbiddenClient(),
+                )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.reason,
+            "Increment 3 automated gates failed",
+        )
+
     def test_increment_three_runner_records_scenarios_without_human_pass(
         self,
     ) -> None:

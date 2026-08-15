@@ -42,6 +42,9 @@ MISSION.md
 RESOURCES.md
 NOTES.md
 
+# Scene explorations (private prototypes, not shipped)
+explorations/
+
 # Editor and OS files
 .vscode/
 .idea/
