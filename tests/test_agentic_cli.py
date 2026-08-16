@@ -246,7 +246,7 @@ class AgenticCliTest(unittest.TestCase):
                             )
                         ]
                     ),
-                    turn_id_factory=lambda: turn_id,
+                    turn_id_factory=lambda turn_id=turn_id: turn_id,
                     clock=lambda: datetime(
                         2026,
                         8,
@@ -531,8 +531,8 @@ class AgenticCliTest(unittest.TestCase):
                 inputs = iter(scripted_inputs)
                 output: list[str] = []
 
-                def read_line(prompt: str) -> str:
-                    value = next(inputs)
+                def read_line(prompt: str, _inputs=inputs) -> str:
+                    value = next(_inputs)
                     if isinstance(value, BaseException):
                         raise value
                     assert isinstance(value, str)

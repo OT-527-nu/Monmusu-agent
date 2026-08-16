@@ -4903,7 +4903,7 @@ class AgenticHarnessTest(unittest.TestCase):
                 )
                 allocated: list[str] = []
 
-                def next_mechanic_id() -> str:
+                def next_mechanic_id(allocated: list[str] = allocated) -> str:
                     ids = ("mechanic_base", "mechanic_pushed", "mechanic_unexpected")
                     value = ids[len(allocated)]
                     allocated.append(value)
@@ -5043,7 +5043,7 @@ class AgenticHarnessTest(unittest.TestCase):
                 harness = AgenticHarness(
                     store,
                     model,
-                    mechanic_id_factory=lambda: next(mechanic_ids),
+                    mechanic_id_factory=lambda mechanic_ids=mechanic_ids: next(mechanic_ids),
                     random_source=ScriptedRandom((1, 7, *pushed_dice)),
                 )
 
@@ -5521,7 +5521,7 @@ class AgenticHarnessTest(unittest.TestCase):
                 store, game_id = self._create_session(Path(directory))
                 allocated: list[str] = []
 
-                def next_mechanic_id() -> str:
+                def next_mechanic_id(allocated: list[str] = allocated) -> str:
                     ids = ("mechanic_base", "mechanic_luck", "mechanic_unexpected")
                     value = ids[len(allocated)]
                     allocated.append(value)
@@ -5634,7 +5634,7 @@ class AgenticHarnessTest(unittest.TestCase):
                 store, game_id = self._create_session(Path(directory))
                 allocated: list[str] = []
 
-                def next_mechanic_id() -> str:
+                def next_mechanic_id(allocated: list[str] = allocated) -> str:
                     ids = ("mechanic_base", "mechanic_pushed", "mechanic_unexpected")
                     value = ids[len(allocated)]
                     allocated.append(value)
@@ -6106,7 +6106,7 @@ class AgenticHarnessTest(unittest.TestCase):
                                 ),
                             ]
                         ),
-                        mechanic_id_factory=lambda: allocated.append("allocated") or "unexpected",
+                        mechanic_id_factory=lambda allocated=allocated: allocated.append("allocated") or "unexpected",
                         random_source=random_source,
                     )
 
