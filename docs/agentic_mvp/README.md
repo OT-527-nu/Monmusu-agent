@@ -4,7 +4,7 @@
 
 本目录定义 Monmusu Agent 下一版 MVP 的目标产品、目标架构与验收方式，落实 [ADR-005](../adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-044](../adr/0044-real-llm-vertical-slice-leads-migration.md)。它是新实现的设计权威，但不是当前源码已经完成的能力清单。
 
-截至 2026-08-08，默认入口仍运行旧的模组 JSON、`request_check`、`apply_effect`、效果白名单、关系阶段与六格威胁时钟。独立的 opt-in Agentic 入口已经完成 Increment 1 和 Increment 2：除 Increment 1 的不可变 `SessionSetup`、自然语言事实账本、GM 最终答复原子提交、`make_check`、non-thinking DeepSeek adapter、连续 CLI 和真实两回合开放行动证据外，现已具备 `IncompleteTurn` 持久化、显式 CLI 恢复门、同 ID 工具结果幂等重放、结构修正、执行尝试时限/往返保险丝、thinking `reasoning_content` 受限回放，以及 non-thinking/thinking 真实恢复合同证据。其余 COC 工具和完整短篇仍未实现；默认入口切换与旧路径退役也尚未发生。具体差异与迁移门见[迁移清单](migration.md)。
+截至 2026-08-16，默认入口仍运行旧的模组 JSON、`request_check`、`apply_effect`、效果白名单、关系阶段与六格威胁时钟。独立的 opt-in Agentic 入口已经完成 Increment 1 至 Increment 3：不可变 `SessionSetup`、自然语言事实账本、GM 最终答复原子提交、六张生产角色卡、统一 `CocTool` 生命周期、统一 `PublicMechanic` 投影、`make_check` / `push_check` / `spend_luck` / `deal_damage` / `make_sanity_check` 五工具、non-thinking/thinking DeepSeek adapter、连续 CLI、`IncompleteTurn` 持久化、显式 CLI 恢复门、同 ID 工具结果幂等重放、结构修正、执行尝试时限/往返保险丝，以及 `reasoning_content` 受限回放均已交付；Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。已有完整会话的继续入口、完整短篇六场景与开放试玩、模型评估矩阵、默认入口切换与旧路径退役仍未交付。具体差异与迁移门见[迁移清单](migration.md)。
 
 ## 产品核心
 

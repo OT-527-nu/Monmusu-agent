@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义新版 MVP 的规范性目标契约。截至 2026-08-10，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、`make_check`、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放和真实恢复合同证据。Ticket 12 已建立动态工具注册目录和共同生命周期，但统一 preflight、统一 `PublicMechanic` 投影及按未完成回合冻结 profile 恢复仍是 Increment 3 的目标差距；其余四个 COC 工具、完整短篇和默认入口切换也仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
+本文定义新版 MVP 的规范性目标契约。截至 2026-08-16，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、五工具 COC 机械、六张生产角色卡、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放和真实恢复合同证据。统一 `CocTool` 生命周期、各工具生成的统一 `PublicMechanic` 投影、以及按未完成回合冻结 profile 恢复均已交付；Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。已有完整会话的继续入口、完整短篇、模型评估矩阵和默认入口切换仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
 
 ## 契约原则
 

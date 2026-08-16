@@ -4,7 +4,7 @@ Monmusu Agent 是一个由单一 AI 游戏主持人驱动、NPC 同行者陪伴�
 
 默认入口仍是规则驱动的 CLI 基线。下一版 MVP 以真实 DeepSeek GM 为核心，让模组成为参考书，并把 COC 规则映射为 Harness 中的可信工具；CLI 是该 MVP 唯一正式玩家界面。
 
-当前设计权威与迁移入口见 [Monmusu Agent 文档索引](docs/README.md)。Agentic MVP 仍在迁移中，运行行为以当前源码和测试为准。
+当前设计权威与迁移入口见 [Monmusu Agent 文档索引](docs/README.md)。Agentic MVP 已完成 Increment 1 至 Increment 3（五工具 COC 机械、生产角色卡与场景二/三真实验收），仍待完成已有会话继续入口、完整短篇与旧路径切换；运行行为以当前源码和测试为准。
 
 ## 快速开始
 

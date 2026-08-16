@@ -4,7 +4,7 @@
 
 本文定义 Monmusu Agent 下一版 MVP 的产品定位、体验范围、成功标准与交付顺序，是[本目录](README.md)所述目标设计的一部分。系统职责以[系统架构](architecture.md)为准，单轮行为以 [Agent Loop](agent_loop.md) 为准，字段形状以[数据契约](contracts.md)为准。
 
-本文描述的是**目标 MVP，不是已经全部交付的能力清单**。截至 2026-08-08，默认入口仍运行模组 JSON、`request_check`、`apply_effect`、效果白名单、固定场景状态、关系阶段和六格威胁时钟；独立的 opt-in Agentic 入口已完成 Increment 1 与 Increment 2 的确定性和真实恢复证明，包括显式恢复、工具结果幂等重放、执行限制、单次结构修正以及 non-thinking/thinking DeepSeek 恢复传输。完整 COC 工具、短篇内容整合、模型矩阵及默认入口切换仍未完成。替换顺序见[迁移清单](migration.md)。
+本文描述的是**目标 MVP，不是已经全部交付的能力清单**。截至 2026-08-16，默认入口仍运行模组 JSON、`request_check`、`apply_effect`、效果白名单、固定场景状态、关系阶段和六格威胁时钟；独立的 opt-in Agentic 入口已完成 Increment 1 至 Increment 3 的确定性和真实证明，包括五工具 COC 机械、六张生产角色卡、显式恢复、工具结果幂等重放、执行限制、单次结构修正、non-thinking/thinking DeepSeek 恢复传输，以及 Ticket 18 场景二和场景三的真实验收。短篇内容整合、模型矩阵及默认入口切换仍未完成。替换顺序见[迁移清单](migration.md)。
 
 ## 一句话定位
 

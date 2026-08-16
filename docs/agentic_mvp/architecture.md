@@ -4,7 +4,7 @@
 
 本文定义下一版 MVP 的目标模块、接口、seam、权威与数据流。执行时序以 [Agent Loop](agent_loop.md) 为准，持久化与消息字段以[数据契约](contracts.md)为准，产品取舍以 [MVP 产品方案](mvp_design.md)为准。
 
-本文定义目标架构，不把未交付能力写成当前事实。截至 2026-08-10，独立的 opt-in Agentic 路径已通过 `AgenticHarness.start_turn`、`resume_turn`、`AgenticSessionStore` 和 `GameMasterModel` seam 实现 Increment 1 与 Increment 2，包括最终答复、事实账本、完整回合记录、`make_check`、non-thinking/thinking DeepSeek adapter、显式恢复、幂等工具结果重放、结构修正、执行限制和真实恢复合同证据。Ticket 12 已建立动态 COC 工具注册目录和共同生命周期，但源码仍保留 `make_check` 专用 preflight、两种公开机械投影以及恢复 profile 必须等于 Harness 构造期 profile 的限制；这些是 Increment 3 首个实现检查点，不是目标 seam。默认入口及 `agent.py`、`engine.py`、`tools.py`、`rules.py`、`state.py` 仍保留旧规则驱动基线；其余四个 COC 工具、完整短篇、默认入口切换和旧路径清理仍是目标架构。
+本文定义目标架构，不把未交付能力写成当前事实。截至 2026-08-16，独立的 opt-in Agentic 路径已通过 `AgenticHarness.start_turn`、`resume_turn`、`AgenticSessionStore` 和 `GameMasterModel` seam 实现 Increment 1 至 Increment 3，包括最终答复、事实账本、完整回合记录、五工具 COC 机械、六张生产角色卡、non-thinking/thinking DeepSeek adapter、显式恢复、幂等工具结果重放、结构修正、执行限制和真实恢复合同证据。动态 COC 工具注册目录已统一到同一 `CocTool` 生命周期，`PublicMechanic` 由各工具自己的 `public_details` 生成，恢复继续使用未完成回合冻结的 `model_profile` 并由完整注册表逐项验证；Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。默认入口及 `agent.py`、`engine.py`、`tools.py`、`rules.py`、`state.py` 仍保留旧规则驱动基线；已有完整会话的继续入口、完整短篇六场景与开放试玩、模型评估矩阵、默认入口切换和旧路径清理仍是目标架构。
 
 ## 架构目标
 
