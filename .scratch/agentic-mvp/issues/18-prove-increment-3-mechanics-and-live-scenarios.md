@@ -4,17 +4,17 @@
 
 **Blocked by:** 14 — 支持玩家选择的 push_check; 15 — 支持玩家选择的 spend_luck; 16 — 支持公开与隐藏 deal_damage; 17 — 支持公开与隐藏 make_sanity_check
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] 新回合完整 profile 在同一请求配置中暴露五个规范工具并保持 `tool_schema_version: "coc-tools-agentic-mvp-1"`、JSON Object、non-streaming、单 GM 与单次响应至多一个工具调用的既有协议；完整注册表保留所有已发布验证器，旧未完成回合仍使用自己的冻结工具子集。原玩家输入和全部已提交结果始终回到同一 GM 上下文。
-- [ ] 确定性组合矩阵跨独立会话覆盖六张生产模板，每局只冻结选中调查员与三名同行者共四张 ActorSheet；矩阵覆盖五工具的成功路径、边界、非法前置、未知角色/能力、公开/隐藏投影、GM 结果续接及跨工具引用，不以真实模型结果替代规则断言。
-- [ ] 组合矩阵区分六张生产模板与每局四张冻结卡，并覆盖统一 preflight、统一 `PublicMechanic`、Push/Luck 资格快照与精确 Luck 点数、严格骰子限制、伤害阈值和 SAN threshold 字段。
-- [ ] 每种新增工具都制造工具成功后 provider 中断、进程重建和显式恢复，证明相同 `turn_id`、`tool_call_id`、mechanic ID、骰点及 HP/SAN/Luck 变化只出现一次；原子写入故障不留下部分机械或数值变化。
-- [ ] 跨工具测试证明 `check_id` 实际引用 `kind: "check"` 的 `mechanic_id`，push/Luck 在整条派生检定链上双向互斥，GM 最终叙事和事实变化不能覆盖任何已提交机械权威。
-- [ ] 聚焦场景二使用真实 DeepSeek 证明明显成立的行动被直接裁定，有真实不确定性与失败代价的行动才调用事前公开的 `make_check`，不增加检定前暂停，也不先叙述结果再补骰。
-- [ ] 聚焦场景三使用真实 DeepSeek 证明 GM 可以说明 push/Luck 机会但不会自动调用；玩家未选择时不消费资源或重掷，玩家明确提出不同做法并接受风险后只调用关联原失败检定的 `push_check`，不偷偷同时花 Luck。
-- [ ] live 记录固定模型、thinking、stream、tool schema、Prompt/profile、fixture、timeout 与依赖版本，按既有格式脱敏保存请求投影、usage、latency、结果和 hard gates；没有 key 或 skip 不能算通过，凭据与 reasoning 正文不得进入证据。
-- [ ] 确定性测试、真实 provider 合同和用户人工 GM 行为判断明确分栏报告；场景二、三都必须非跳过真实运行并由用户给出结论。缺少 key、任一真实场景或人工结论时本票保持未完成；通过本票只宣称 Increment 3 完成，不宣称场景四、完整六场景矩阵、默认模型选择、完整短篇、默认入口切换或旧路径退役完成。
+- [x] 新回合完整 profile 在同一请求配置中暴露五个规范工具并保持 `tool_schema_version: "coc-tools-agentic-mvp-1"`、JSON Object、non-streaming、单 GM 与单次响应至多一个工具调用的既有协议；完整注册表保留所有已发布验证器，旧未完成回合仍使用自己的冻结工具子集。原玩家输入和全部已提交结果始终回到同一 GM 上下文。
+- [x] 确定性组合矩阵跨独立会话覆盖六张生产模板，每局只冻结选中调查员与三名同行者共四张 ActorSheet；矩阵覆盖五工具的成功路径、边界、非法前置、未知角色/能力、公开/隐藏投影、GM 结果续接及跨工具引用，不以真实模型结果替代规则断言。
+- [x] 组合矩阵区分六张生产模板与每局四张冻结卡，并覆盖统一 preflight、统一 `PublicMechanic`、Push/Luck 资格快照与精确 Luck 点数、严格骰子限制、伤害阈值和 SAN threshold 字段。
+- [x] 每种新增工具都制造工具成功后 provider 中断、进程重建和显式恢复，证明相同 `turn_id`、`tool_call_id`、mechanic ID、骰点及 HP/SAN/Luck 变化只出现一次；原子写入故障不留下部分机械或数值变化。
+- [x] 跨工具测试证明 `check_id` 实际引用 `kind: "check"` 的 `mechanic_id`，push/Luck 在整条派生检定链上双向互斥，GM 最终叙事和事实变化不能覆盖任何已提交机械权威。
+- [x] 聚焦场景二使用真实 DeepSeek 证明明显成立的行动被直接裁定，有真实不确定性与失败代价的行动才调用事前公开的 `make_check`，不增加检定前暂停，也不先叙述结果再补骰。
+- [x] 聚焦场景三使用真实 DeepSeek 证明 GM 可以说明 push/Luck 机会但不会自动调用；玩家未选择时不消费资源或重掷，玩家明确提出不同做法并接受风险后只调用关联原失败检定的 `push_check`，不偷偷同时花 Luck。
+- [x] live 记录固定模型、thinking、stream、tool schema、Prompt/profile、fixture、timeout 与依赖版本，按既有格式脱敏保存请求投影、usage、latency、结果和 hard gates；没有 key 或 skip 不能算通过，凭据与 reasoning 正文不得进入证据。
+- [x] 确定性测试、真实 provider 合同和用户人工 GM 行为判断明确分栏报告；场景二、三都必须非跳过真实运行并由用户给出结论。缺少 key、任一真实场景或人工结论时本票保持未完成；通过本票只宣称 Increment 3 完成，不宣称场景四、完整六场景矩阵、默认模型选择、完整短篇、默认入口切换或旧路径退役完成。
 
 **Not in this ticket:** 修改单项工具规则来迁就模型输出、降低 hard gate、场景四 NPC 表现、72 次配置矩阵、完整试玩、默认配置选择、默认入口切换或旧代码删除。
 
@@ -29,3 +29,6 @@
 - 2026-08-12：用户明确回复“采用”，采纳 Codex 对 fixture-v2 的候选人工判断。场景二六项硬门全通过，六维为 `4/4/5/4/3/5`、平均 `4.17`；场景三因协议中断与完整连续性失败不进入正式六维评分。人工判断条件现已满足，但不能补偿真实场景三失败；按禁止挑样复跑和不得修改工具规则迁就输出的边界，本票没有可辩护的本票内修复路径，保持 `ready-for-agent`、未完成且不提交。
 - 2026-08-12：用户随后明确授权多跑场景三，以诊断原失败是否来自 provider 输出不稳定。相同 fixture-v2、profile、输入和骰序列下新增五个独立诊断样本，全部两回合 committed、路径 `final, push_check, final`、零 repair、零 provider/local error，五项自动门通过；这反驳确定性的 Push 后本地缺陷，并支持原无效 final 具有非确定性。原 repair 的 generic `provider_error` 仍无法由这些未触发 repair 的样本精确归因。五份样本的 run ID、usage、latency、脱敏记录哈希、自动结果与语义异常均已单独分栏记录；完整脱敏 JSON 暂存 `/tmp`，不替换冻结验收样本或已采纳的失败结论。
 - 2026-08-12：用户再次明确回复“采用”，确认五次成功运行仅作为稳定性诊断，不重新定义为 Ticket 18 的新验收批次。原场景三验收失败与已采纳人工结论保持有效，本票继续未完成。
+- 2026-08-16：项目所有者授权新建版本化验收批次 `ticket-18-acceptance-batch-v2`。本批次在不修改运行时、Prompt、fixture 或 profile 的前提下，固定代码基线 `022b54a`、`deepseek-v4-flash` non-thinking、`stream=false`、JSON Object、五工具 profile、60/180 秒时限和一次结构修正；场景二、三各运行一次组成一个配对批次。两场自动门必须全部通过才进入人工判断；失败样本全部保留，本批次内不重试，不把旧失败或诊断样本改写为通过。计划证据写入 `docs/agentic_mvp/evidence/ticket-18-increment-3-acceptance-batch-v2-2026-08-16.md`。
+- 2026-08-16：`ticket-18-acceptance-batch-v2` 已按计划完成一次配对运行。场景二 `increment3_bee1cdbea910445fbc5aeb9e40a1ae18` 路径为 `final, make_check, final`；场景三 `increment3_0e10f2f4b3fc418587c766d5e15738c7` 路径为 `final, push_check, final`。两场所有回合均 committed、自动门全部通过、无 repair、无 provider/local error；runner 状态为 `pending_human`。证据见 `docs/agentic_mvp/evidence/ticket-18-increment-3-acceptance-batch-v2-2026-08-16.md`。本票改为 `ready-for-human`，只等待项目所有者对两场公开输出给出人工硬门与六维结论；在此之前不宣称 Ticket 18 或 Increment 3 完成。
+- 2026-08-16：项目所有者明确回复“采用”本批次候选人工判断。场景二人工硬门通过，六维为 `4/4/5/4/4/5`、平均 `4.33`；场景三人工硬门通过，六维为 `4/4/3/4/4/5`、平均 `4.0`；两场均无单项低于 3，Ticket 18 与 Increment 3 通过。项目所有者指出文字表现仍不满意，提示词打磨明确留到后续工作，不改变本批次验收结论。本票验收项已全部完成；`Status` 按 tracker 当前五种 triage role 保持 `ready-for-human`，不新增未定义的 `done` 值。本票只宣称 Increment 3 完成，不宣称场景四、完整六场景矩阵、默认模型选择、完整短篇、默认入口切换或旧路径退役完成。
