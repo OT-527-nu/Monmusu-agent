@@ -25,7 +25,6 @@ from monmusu_agent.state import (
 )
 from monmusu_agent.storage import read_json
 
-
 _MODIFIER_REASON_TAGS = (
     "relevant_clue",
     "useful_equipment",

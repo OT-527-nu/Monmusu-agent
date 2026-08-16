@@ -19,7 +19,6 @@ from monmusu_agent.rules import CheckLedger
 from monmusu_agent.storage import read_json, write_json
 from monmusu_agent.tools import ToolExecutor, ToolTraceEntry, TurnContext
 
-
 _MODEL_STRATEGIES = frozenset({"fast", "dramatic", "urgent"})
 _USER_PUBLIC_STATE_FIELDS = (
     "character_id",
