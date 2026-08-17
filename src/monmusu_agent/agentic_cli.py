@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv, set_key
 
 from monmusu_agent.agentic_harness import (
     AgenticHarness,
@@ -30,6 +34,29 @@ from monmusu_agent.agentic_session import (
 )
 from monmusu_agent.config import PROJECT_ROOT
 
+_DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+_OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+_SUPPORTED_PROVIDERS = ("deepseek", "opencode-go", "custom")
+_PROVIDER_DISPLAY_NAMES = {
+    "deepseek": "DeepSeek 官方",
+    "opencode-go": "OpenCode Go",
+    "custom": "其它 DeepSeek 模型提供商",
+}
+_PROVIDER_KEY_ENVS = {
+    "deepseek": "DEEPSEEK_API_KEY",
+    "opencode-go": "OPENCODE_GO_API_KEY",
+    "custom": "MONMUSU_CUSTOM_API_KEY",
+}
+_PROVIDER_BASE_URL_ENVS = {
+    "deepseek": "DEEPSEEK_BASE_URL",
+    "opencode-go": "OPENCODE_GO_BASE_URL",
+    "custom": "MONMUSU_CUSTOM_BASE_URL",
+}
+_PROVIDER_DEFAULT_BASE_URLS = {
+    "deepseek": _DEEPSEEK_DEFAULT_BASE_URL,
+    "opencode-go": _OPENCODE_GO_DEFAULT_BASE_URL,
+}
+
 _INVALID_UTF8_INPUT_MESSAGE = (
     "终端输入不是有效的 UTF-8；请确认终端和输入法使用 UTF-8 后重试"
 )
@@ -37,6 +64,23 @@ _INVALID_UTF8_INPUT_MESSAGE = (
 
 class CliInputEncodingError(ValueError):
     """表示终端输入无法作为可靠的 UTF-8 文本使用。"""
+
+
+class ProviderConfigError(ValueError):
+    """表示用户提供的 provider 运行配置无效。"""
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    """保存一次 CLI 启动所需的非秘密 provider 运行配置。"""
+
+    provider: str
+    api_key: str
+    base_url: str
+
+    @property
+    def display_name(self) -> str:
+        return _PROVIDER_DISPLAY_NAMES[self.provider]
 
 
 @dataclass(frozen=True)
@@ -92,25 +136,224 @@ def _wrap_read_line(read_line: Callable[[str], str]) -> Callable[[str], str]:
     return wrapped
 
 
+def validated_base_url(value: str) -> str:
+    """只检查 base URL 的非空和协议前缀，不改写路径。"""
+
+    stripped = value.strip()
+    if not stripped or not stripped.startswith(("http://", "https://")):
+        raise ProviderConfigError("Base URL 必须以 http:// 或 https:// 开头。")
+    return stripped
+
+
+def provider_config_from_env(
+    env: Mapping[str, str],
+) -> ProviderConfig | None:
+    """从合并后的环境中解析当前 provider；缺失标记或 key 为空表示未配置。"""
+
+    raw_provider = env.get("MONMUSU_PROVIDER")
+    if raw_provider is None or not raw_provider.strip():
+        return None
+    provider = raw_provider.strip()
+    if provider not in _SUPPORTED_PROVIDERS:
+        raise ProviderConfigError(
+            "MONMUSU_PROVIDER 无效，可选 deepseek、opencode-go 或 custom。"
+        )
+    api_key = env.get(_PROVIDER_KEY_ENVS[provider], "").strip()
+    if not api_key:
+        return None
+    raw_base_url = env.get(_PROVIDER_BASE_URL_ENVS[provider], "").strip()
+    if not raw_base_url and provider in _PROVIDER_DEFAULT_BASE_URLS:
+        raw_base_url = _PROVIDER_DEFAULT_BASE_URLS[provider]
+    if not raw_base_url:
+        raise ProviderConfigError(
+            f"缺少 {_PROVIDER_BASE_URL_ENVS[provider]}。"
+        )
+    return ProviderConfig(
+        provider=provider,
+        api_key=api_key,
+        base_url=validated_base_url(raw_base_url),
+    )
+
+
+def _read_secret(
+    read_line: Callable[[str], str],
+    *,
+    prompt: str,
+    existing_value: str | None = None,
+    allow_blank_existing: bool = True,
+) -> str:
+    """读取 API key；可保留已有值时绝不回显明文。"""
+
+    if allow_blank_existing and existing_value:
+        value = read_line(f"{prompt}（已保存 ****，直接回车保留）：").strip()
+        return value or existing_value
+    while True:
+        value = read_line(f"{prompt}：").strip()
+        if value:
+            return value
+
+
+def _interactive_read_line(read_line: Callable[[str], str]) -> Callable[[str], str]:
+    """真实终端优先使用 getpass 隐藏 key；注入 seam 不经过 getpass。"""
+
+    if read_line is input and sys.stdin.isatty():
+        return lambda prompt: getpass.getpass(prompt)
+    return read_line
+
+
+def _read_provider_choice(
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+    *,
+    current_provider: str | None,
+) -> str:
+    write_line("请选择模型提供商：")
+    for index, provider in enumerate(_SUPPORTED_PROVIDERS, start=1):
+        write_line(f"{index}. {_PROVIDER_DISPLAY_NAMES[provider]}")
+    while True:
+        raw = read_line("请选择模型提供商编号：").strip()
+        if not raw and current_provider is not None:
+            return current_provider
+        try:
+            selected_index = int(raw)
+        except ValueError:
+            write_line("请输入有效的模型提供商编号。")
+            continue
+        if 1 <= selected_index <= len(_SUPPORTED_PROVIDERS):
+            return _SUPPORTED_PROVIDERS[selected_index - 1]
+        write_line("请输入有效的模型提供商编号。")
+
+
+def _read_base_url(
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+    *,
+    existing_value: str | None = None,
+    allow_blank_existing: bool = True,
+) -> str:
+    while True:
+        if allow_blank_existing and existing_value:
+            raw = read_line("请输入 Base URL（已保存，直接回车保留）：").strip()
+            if not raw:
+                return validated_base_url(existing_value)
+        else:
+            raw = read_line(
+                "请输入 Base URL（例如 https://your-gateway.example.com/v1）："
+            ).strip()
+        try:
+            return validated_base_url(raw)
+        except ProviderConfigError as error:
+            write_line(str(error))
+
+
+def configure_provider(
+    env: Mapping[str, str],
+    *,
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+    current_provider: str | None = None,
+) -> ProviderConfig:
+    """交互收集 provider、key 与 base_url，不写盘、不构造 Harness。"""
+
+    secret_read_line = _interactive_read_line(read_line)
+    current = current_provider or env.get("MONMUSU_PROVIDER", "").strip() or None
+    if current not in _SUPPORTED_PROVIDERS:
+        current = None
+    if current is not None:
+        write_line(f"当前模型提供商：{_PROVIDER_DISPLAY_NAMES[current]}")
+        if env.get(_PROVIDER_KEY_ENVS[current], "").strip():
+            write_line("API Key：已保存（****）")
+    selected = _read_provider_choice(
+        read_line,
+        write_line,
+        current_provider=current,
+    )
+
+    if selected == "custom":
+        write_line("当前版本仍按 DeepSeek 系列模型调用。")
+        existing_base_url = env.get(_PROVIDER_BASE_URL_ENVS[selected], "").strip()
+        keep_existing = current is None or selected == current
+        base_url = _read_base_url(
+            read_line,
+            write_line,
+            existing_value=existing_base_url or None,
+            allow_blank_existing=keep_existing,
+        )
+    else:
+        existing_base_url = env.get(_PROVIDER_BASE_URL_ENVS[selected], "").strip()
+        if existing_base_url:
+            base_url = validated_base_url(existing_base_url)
+        else:
+            base_url = _PROVIDER_DEFAULT_BASE_URLS[selected]
+
+    existing_key = env.get(_PROVIDER_KEY_ENVS[selected], "").strip()
+    keep_existing = current is None or selected == current
+    api_key = _read_secret(
+        secret_read_line,
+        prompt="请输入 API Key",
+        existing_value=existing_key or None,
+        allow_blank_existing=keep_existing,
+    )
+    return ProviderConfig(
+        provider=selected,
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+
+def save_provider_config(env_path: Path, config: ProviderConfig) -> None:
+    """只更新 CLI 拥有的 provider 键，保留 .env 中其他行。"""
+
+    set_key(str(env_path), "MONMUSU_PROVIDER", config.provider)
+    set_key(
+        str(env_path),
+        _PROVIDER_KEY_ENVS[config.provider],
+        config.api_key,
+    )
+    set_key(
+        str(env_path),
+        _PROVIDER_BASE_URL_ENVS[config.provider],
+        config.base_url,
+    )
+
+
+def _stdin_is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def compose_deepseek_harness(
     store: AgenticSessionStore,
     *,
     api_key: str,
     model_id: str,
     thinking: bool,
+    provider: str = "deepseek",
+    base_url: str | None = None,
     client: Any | None = None,
 ) -> AgenticHarness:
-    """在组合边界注入 key，并构造同一 Agentic Harness seam。"""
+    """在组合边界注入 provider 配置，并构造同一 Agentic Harness seam。"""
 
     try:
-        profile = deepseek_model_profile(model_id=model_id, thinking=thinking)
+        profile = deepseek_model_profile(
+            model_id=model_id,
+            thinking=thinking,
+            provider=provider,
+            base_url=base_url,
+        )
     except ModelProfileValidationError as error:
         raise ModelCallError(
             "unsupported_model_profile",
             "DeepSeek model profile is unsupported",
             retryable=False,
         ) from error
-    model = DeepSeekGameMasterModel(api_key, client=client)
+    model = DeepSeekGameMasterModel(
+        api_key,
+        base_url=profile["base_url"],
+        client=client,
+    )
     return AgenticHarness(store, model, model_profile=profile)
 
 
@@ -390,14 +633,72 @@ def _read_recovery_choice(
         write_line("只能输入“恢复”或“退出”。")
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """从外部运行配置组合 DeepSeek，并运行连续 Agentic GM 回合。"""
 
     _configure_terminal_input()
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if api_key is None or not api_key.strip():
-        print("DEEPSEEK_API_KEY 未设置，无法启动 Agentic GM。")
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    configure_requested = arguments == ("--configure",)
+    if arguments and not configure_requested:
+        print("未知参数。仅支持 monmusu-agent-agentic --configure。")
         return 2
+
+    env_path = PROJECT_ROOT / ".env"
+    config: ProviderConfig | None
+    if configure_requested:
+        try:
+            config = configure_provider(
+                os.environ,
+                read_line=input,
+                write_line=print,
+            )
+        except ProviderConfigError as error:
+            print(f"配置错误：{error}")
+            return 2
+        except (EOFError, KeyboardInterrupt):
+            print("配置未完成，未写入任何配置。")
+            return 2
+        try:
+            save_provider_config(env_path, config)
+        except OSError as error:
+            print(f"配置保存失败：{error}；未写入任何模型调用配置。")
+            return 2
+        print(f"模型提供商：{config.display_name}")
+        return 0
+
+    try:
+        config = provider_config_from_env(os.environ)
+    except ProviderConfigError as error:
+        print(f"配置错误：{error}")
+        return 2
+    if config is None:
+        if not _stdin_is_interactive():
+            print(
+                "未检测到模型提供商配置；请运行 "
+                "monmusu-agent-agentic --configure，或导出 "
+                "MONMUSU_PROVIDER 与对应 API Key。",
+            )
+            return 2
+        try:
+            config = configure_provider(
+                os.environ,
+                read_line=input,
+                write_line=print,
+            )
+        except ProviderConfigError as error:
+            print(f"配置错误：{error}")
+            return 2
+        except (EOFError, KeyboardInterrupt):
+            print("配置未完成，未写入任何配置。")
+            return 2
+        try:
+            save_provider_config(env_path, config)
+        except OSError as error:
+            print(f"配置保存失败：{error}；未写入任何模型调用配置。")
+            return 2
+
+    print(f"模型提供商：{config.display_name}")
     model_id = os.environ.get(
         "MONMUSU_DEEPSEEK_MODEL_ID",
         "deepseek-v4-flash",
@@ -415,9 +716,11 @@ def main() -> int:
     try:
         harness = compose_deepseek_harness(
             store,
-            api_key=api_key,
+            api_key=config.api_key,
             model_id=model_id,
             thinking=thinking_text == "true",
+            provider=config.provider,
+            base_url=config.base_url,
         )
     except ModelCallError as error:
         print(f"运行配置错误（{error.code}）：{error.message}")
@@ -464,4 +767,4 @@ def _optional_answer(value: str) -> str | None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

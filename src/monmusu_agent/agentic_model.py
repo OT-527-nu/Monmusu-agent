@@ -30,8 +30,19 @@ MODEL_PROFILE_FIELDS = (
     "prompt_revision",
     "tool_schema_version",
     "enabled_tools",
+    "base_url",
+)
+LEGACY_MODEL_PROFILE_FIELDS = tuple(
+    field for field in MODEL_PROFILE_FIELDS if field != "base_url"
 )
 DEFAULT_DEEPSEEK_MODEL_ID = "deepseek-v4-flash"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+SUPPORTED_PROVIDERS = ("deepseek", "opencode-go", "custom")
+_PROVIDER_DEFAULT_BASE_URLS = {
+    "deepseek": DEFAULT_DEEPSEEK_BASE_URL,
+    "opencode-go": DEFAULT_OPENCODE_GO_BASE_URL,
+}
 _USAGE_TOKEN_FIELDS = (
     "completion_tokens",
     "prompt_tokens",
@@ -52,18 +63,36 @@ class ModelProfileValidationError(ValueError):
     """表示行为相关模型配置不能形成精确的非秘密持久化形状。"""
 
 
+def default_base_url_for_provider(provider: object) -> str:
+    """返回受支持 provider 的默认 base URL；custom 没有默认值。"""
+
+    if not isinstance(provider, str) or provider not in _PROVIDER_DEFAULT_BASE_URLS:
+        raise ModelProfileValidationError(
+            f"model_profile.provider 不受支持：{provider!r}"
+        )
+    return _PROVIDER_DEFAULT_BASE_URLS[provider]
+
+
 def validated_model_profile(
     profile: Mapping[str, Any],
     *,
     enabled_tools: Sequence[str],
 ) -> dict[str, Any]:
-    """重建唯一受支持的非秘密模型配置，不保留未知字段。"""
+    """重建唯一受支持的非秘密模型配置，不保留未知字段。
 
-    if not isinstance(profile, Mapping) or set(profile) != set(MODEL_PROFILE_FIELDS):
+    历史 profile 没有 ``base_url`` 字段；它们按 provider 默认值补齐，因此旧
+    ``IncompleteTurn`` 仍可加载。custom provider 没有历史档案，不接受缺失。
+    """
+
+    if not isinstance(profile, Mapping):
         raise ModelProfileValidationError("model_profile 必须只包含已知非秘密字段")
-    rebuilt = {
-        field: copy.deepcopy(profile[field]) for field in MODEL_PROFILE_FIELDS
-    }
+    has_base_url = "base_url" in profile
+    expected_fields = MODEL_PROFILE_FIELDS if has_base_url else LEGACY_MODEL_PROFILE_FIELDS
+    if set(profile) != set(expected_fields):
+        raise ModelProfileValidationError("model_profile 必须只包含已知非秘密字段")
+    rebuilt = {field: copy.deepcopy(profile[field]) for field in expected_fields}
+    if not has_base_url:
+        rebuilt["base_url"] = default_base_url_for_provider(rebuilt.get("provider"))
     for field in (
         "provider",
         "model_id",
@@ -76,6 +105,13 @@ def validated_model_profile(
             raise ModelProfileValidationError(f"model_profile.{field} 格式无效")
     max_tokens = rebuilt["max_tokens"]
     profile_tools = rebuilt["enabled_tools"]
+    if (
+        not isinstance(rebuilt["base_url"], str)
+        or not rebuilt["base_url"].strip()
+        or rebuilt["base_url"] != rebuilt["base_url"].strip()
+        or not rebuilt["base_url"].startswith(("http://", "https://"))
+    ):
+        raise ModelProfileValidationError("model_profile.base_url 格式无效")
     if (
         not isinstance(rebuilt["thinking"], bool)
         or rebuilt["stream"] is not False
@@ -107,12 +143,21 @@ def deepseek_model_profile(
     model_id: str = DEFAULT_DEEPSEEK_MODEL_ID,
     thinking: bool = False,
     enabled_tools: Sequence[str] = DEFAULT_COC_TOOL_NAMES,
+    provider: str = "deepseek",
+    base_url: str | None = None,
 ) -> dict[str, Any]:
-    """生成当前纵向切片唯一的非秘密 DeepSeek 运行配置。"""
+    """生成当前纵向切片唯一的非秘密模型运行配置。"""
 
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ModelProfileValidationError(
+            f"model_profile.provider 不受支持：{provider!r}"
+        )
+    effective_base_url = base_url
+    if effective_base_url is None:
+        effective_base_url = default_base_url_for_provider(provider)
     return validated_model_profile(
         {
-            "provider": "deepseek",
+            "provider": provider,
             "model_id": model_id,
             "thinking": thinking,
             "stream": False,
@@ -123,6 +168,7 @@ def deepseek_model_profile(
             "prompt_revision": PROMPT_REVISION,
             "tool_schema_version": TOOL_SCHEMA_VERSION,
             "enabled_tools": list(enabled_tools),
+            "base_url": effective_base_url,
         },
         enabled_tools=tuple(enabled_tools),
     )
@@ -182,16 +228,18 @@ class DeepSeekGameMasterModel:
         self,
         api_key: str,
         *,
+        base_url: str = DEFAULT_DEEPSEEK_BASE_URL,
         client: Any | None = None,
         monotonic: Callable[[], float] = _monotonic,
         request_evidence_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
+        self._base_url = base_url
         if client is None:
             from openai import OpenAI
 
             client = OpenAI(
                 api_key=api_key,
-                base_url="https://api.deepseek.com",
+                base_url=base_url,
             )
         self._client: Any = client
         self._monotonic = monotonic
@@ -219,10 +267,16 @@ class DeepSeekGameMasterModel:
                 "DeepSeek model profile is unsupported",
                 retryable=False,
             ) from error
-        if validated_profile["provider"] != "deepseek":
+        if validated_profile["provider"] not in SUPPORTED_PROVIDERS:
             raise ModelCallError(
                 "unsupported_model_profile",
-                "DeepSeek adapter requires provider=deepseek",
+                "DeepSeek adapter received an unsupported provider",
+                retryable=False,
+            )
+        if validated_profile["base_url"] != self._base_url:
+            raise ModelCallError(
+                "unsupported_model_profile",
+                "adapter base_url does not match the frozen model profile",
                 retryable=False,
             )
 

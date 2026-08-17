@@ -20,6 +20,7 @@ from monmusu_agent.agentic_coc import (
     RandomSource,
 )
 from monmusu_agent.agentic_model import (
+    SUPPORTED_PROVIDERS,
     GameMasterModel,
     ModelCallError,
     ModelProfileValidationError,
@@ -279,6 +280,8 @@ class AgenticHarness:
                 selected_profile,
                 enabled_tools=tuple(profile_tools),
             )
+            if self.model_profile["provider"] not in SUPPORTED_PROVIDERS:
+                raise AgenticTurnInputError("model_profile.provider 不受支持")
             self.default_tools = {
                 name: self.tool_registry[name] for name in profile_tools
             }
@@ -305,6 +308,8 @@ class AgenticHarness:
             raise AgenticTurnInputError(str(error)) from error
         if validated_profile["provider"] != self.model_profile["provider"]:
             raise AgenticTurnInputError("model_profile.provider 当前不可用")
+        if validated_profile["base_url"] != self.model_profile["base_url"]:
+            raise AgenticTurnInputError("model_profile.base_url 当前不可用")
         unknown_tools = [name for name in enabled_tools if name not in self.tool_registry]
         if unknown_tools:
             raise AgenticTurnInputError(

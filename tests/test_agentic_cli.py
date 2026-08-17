@@ -975,12 +975,14 @@ class AgenticCliTest(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
+                    "MONMUSU_PROVIDER": "deepseek",
                     "DEEPSEEK_API_KEY": "sk-cli-secret-fragment",
                     "MONMUSU_DEEPSEEK_MODEL_ID": "deepseek-v4-flash",
                     "MONMUSU_DEEPSEEK_THINKING": "false",
                 },
                 clear=True,
             ),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
             patch(
                 "monmusu_agent.agentic_cli.AgenticSessionStore",
                 return_value=store,
@@ -992,13 +994,15 @@ class AgenticCliTest(unittest.TestCase):
             patch("monmusu_agent.agentic_cli.run_agentic_cli") as run_cli,
             redirect_stdout(output),
         ):
-            self.assertEqual(main(), 0)
+            self.assertEqual(main([]), 0)
 
         compose.assert_called_once_with(
             store,
             api_key="sk-cli-secret-fragment",
             model_id="deepseek-v4-flash",
             thinking=False,
+            provider="deepseek",
+            base_url="https://api.deepseek.com",
         )
         run_cli.assert_called_once_with(harness, store)
         self.assertNotIn(str(session_file), output.getvalue())
@@ -1008,13 +1012,19 @@ class AgenticCliTest(unittest.TestCase):
         output = io.StringIO()
         with (
             patch.dict(os.environ, {}, clear=True),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
+            patch(
+                "monmusu_agent.agentic_cli._stdin_is_interactive",
+                return_value=False,
+            ),
             patch("monmusu_agent.agentic_cli.AgenticSessionStore") as store,
             redirect_stdout(output),
         ):
-            self.assertEqual(main(), 2)
+            self.assertEqual(main([]), 2)
 
         store.assert_not_called()
-        self.assertIn("DEEPSEEK_API_KEY", output.getvalue())
+        self.assertIn("--configure", output.getvalue())
+        self.assertIn("MONMUSU_PROVIDER", output.getvalue())
 
     def test_main_reports_terminal_encoding_error_without_traceback(self) -> None:
         output = io.StringIO()
@@ -1022,12 +1032,14 @@ class AgenticCliTest(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
+                    "MONMUSU_PROVIDER": "deepseek",
                     "DEEPSEEK_API_KEY": "sk-cli-secret-fragment",
                     "MONMUSU_DEEPSEEK_MODEL_ID": "deepseek-v4-flash",
                     "MONMUSU_DEEPSEEK_THINKING": "false",
                 },
                 clear=True,
             ),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
             patch("monmusu_agent.agentic_cli.AgenticSessionStore"),
             patch("monmusu_agent.agentic_cli.compose_deepseek_harness"),
             patch(
@@ -1036,9 +1048,12 @@ class AgenticCliTest(unittest.TestCase):
             ),
             redirect_stdout(output),
         ):
-            self.assertEqual(main(), 2)
+            self.assertEqual(main([]), 2)
 
-        self.assertEqual(output.getvalue(), "输入错误：终端输入不是有效的 UTF-8\n")
+        self.assertEqual(
+            output.getvalue(),
+            "模型提供商：DeepSeek 官方\n输入错误：终端输入不是有效的 UTF-8\n",
+        )
 
     def test_game_cli_accepts_consecutive_actions_until_session_complete(
         self,
