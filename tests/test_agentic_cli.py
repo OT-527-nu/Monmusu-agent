@@ -1,7 +1,10 @@
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import UTC, datetime, timezone
@@ -832,6 +835,129 @@ class AgenticCliTest(unittest.TestCase):
             output.index(saved["setup"]["opening_narration"]),
             output.index("你推开潮湿的牢门，短篇在此收束。"),
         )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux IUTF8")
+    def test_cli_configures_utf8_backspace_for_terminal_input(self) -> None:
+        """真实终端应把一次退格视为删除一个完整的 UTF-8 字符。"""
+
+        import pty
+        import select
+        import termios
+
+        master_fd, slave_fd = pty.openpty()
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            attributes = termios.tcgetattr(slave_fd)
+            attributes[0] &= ~0x4000  # Linux termios 的 IUTF8 标志。
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attributes)
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "\n".join(
+                        (
+                            "from datetime import UTC, datetime",
+                            "from pathlib import Path",
+                            "from tempfile import TemporaryDirectory",
+                            "import json",
+                            "import termios",
+                            "from monmusu_agent.agentic_cli import (",
+                            "    _configure_terminal_input,",
+                            "    run_new_session_cli,",
+                            ")",
+                            "from monmusu_agent.agentic_session import AgenticSessionStore",
+                            "IUTF8 = 0x4000",
+                            "restore = _configure_terminal_input()",
+                            "print('READY', flush=True)",
+                            "try:",
+                            "    with TemporaryDirectory() as directory:",
+                            "        store = AgenticSessionStore(",
+                            "            session_root=Path(directory) / 'sessions',",
+                            "            game_id_factory=lambda: 'game_utf8_backspace',",
+                            "            clock=lambda: datetime(2026, 8, 17, tzinfo=UTC),",
+                            "        )",
+                            "        result = run_new_session_cli(",
+                            "            store,",
+                            "            write_line=lambda line: None,",
+                            "        )",
+                            "        profile = result.created.session['investigator_profile']",
+                            "        during = bool(termios.tcgetattr(0)[0] & IUTF8)",
+                            "finally:",
+                            "    if restore is not None:",
+                            "        restore()",
+                            "restored = bool(termios.tcgetattr(0)[0] & IUTF8)",
+                            "print('RESULT=' + json.dumps({",
+                            "    'display_name': profile['display_name'],",
+                            "    'honorific': profile['honorific'],",
+                            "    'first_action': result.first_action,",
+                            "    'iutf8_during': during,",
+                            "    'iutf8_after_restore': restored,",
+                            "}, ensure_ascii=True), flush=True)",
+                        )
+                    ),
+                ],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=environment,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            slave_fd = -1
+
+            output = bytearray()
+            deadline = time.monotonic() + 5
+            while b"READY" not in output:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.fail("PTY 子进程未在五秒内完成 CLI 输入配置")
+                readable, _, _ = select.select([master_fd], [], [], remaining)
+                if readable:
+                    output.extend(os.read(master_fd, 4096))
+
+            os.write(
+                master_fd,
+                b"1\nOT-527-nu\n"
+                + "它".encode("utf-8")
+                + b"\x7f\n\n\n\n\n\n\n"
+                + "我观察石牢里其他人的情况\n".encode("utf-8"),
+            )
+            process.wait(timeout=5)
+
+            while True:
+                readable, _, _ = select.select([master_fd], [], [], 0)
+                if not readable:
+                    break
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+
+            self.assertEqual(
+                process.returncode,
+                0,
+                output.decode("utf-8", errors="backslashreplace"),
+            )
+            result_line = output.split(b"RESULT=", maxsplit=1)[1].splitlines()[0]
+            self.assertEqual(
+                json.loads(result_line.decode("ascii")),
+                {
+                    "display_name": "OT-527-nu",
+                    "honorific": None,
+                    "first_action": "我观察石牢里其他人的情况",
+                    "iutf8_during": True,
+                    "iutf8_after_restore": False,
+                },
+            )
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            if slave_fd != -1:
+                os.close(slave_fd)
+            os.close(master_fd)
 
     def test_cli_repairs_utf8_bytes_preserved_by_surrogateescape(self) -> None:
         """终端以兼容编码解码时，可无损还原原始 UTF-8 输入。"""

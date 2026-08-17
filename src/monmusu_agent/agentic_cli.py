@@ -60,6 +60,7 @@ _PROVIDER_DEFAULT_BASE_URLS = {
 _INVALID_UTF8_INPUT_MESSAGE = (
     "终端输入不是有效的 UTF-8；请确认终端和输入法使用 UTF-8 后重试"
 )
+_LINUX_IUTF8 = 0x4000
 
 
 class CliInputEncodingError(ValueError):
@@ -91,9 +92,10 @@ class NewSessionCliResult:
     first_action: str
 
 
-def _configure_terminal_input() -> None:
+def _configure_terminal_input() -> Callable[[], None]:
     """让真实 CLI 的标准 I/O 不受启动 shell 默认 locale 的影响。"""
 
+    restore_utf8_backspace = _enable_utf8_backspace()
     for stream, errors in (
         (sys.stdin, "surrogateescape"),
         (sys.stdout, "strict"),
@@ -107,6 +109,41 @@ def _configure_terminal_input() -> None:
         except (OSError, ValueError):
             # 某些测试或嵌入式调用者提供不可重配置的标准流，仍使用注入的读取 seam。
             continue
+    return restore_utf8_backspace
+
+
+def _enable_utf8_backspace() -> Callable[[], None]:
+    """让 Linux 终端在 Python 读取前按 UTF-8 字符处理退格。"""
+
+    if not sys.platform.startswith("linux"):
+        return lambda: None
+    try:
+        import termios
+
+        file_descriptor = sys.stdin.fileno()
+        if not os.isatty(file_descriptor):
+            return lambda: None
+        original_attributes = termios.tcgetattr(file_descriptor)
+        if original_attributes[0] & _LINUX_IUTF8:
+            return lambda: None
+        configured_attributes = original_attributes[:]
+        configured_attributes[0] |= _LINUX_IUTF8
+        termios.tcsetattr(file_descriptor, termios.TCSANOW, configured_attributes)
+    except (AttributeError, OSError, ValueError):
+        return lambda: None
+
+    # stdin.reconfigure 不能影响内核的 canonical 行编辑；退出后必须还原调用者终端。
+    def restore() -> None:
+        try:
+            termios.tcsetattr(
+                file_descriptor,
+                termios.TCSANOW,
+                original_attributes,
+            )
+        except OSError:
+            pass
+
+    return restore
 
 
 def _normalise_cli_input(value: str) -> str:
@@ -634,9 +671,18 @@ def _read_recovery_choice(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """从外部运行配置组合 DeepSeek，并运行连续 Agentic GM 回合。"""
+    """配置终端后，从外部运行配置组合 DeepSeek 并运行连续 GM 回合。"""
 
-    _configure_terminal_input()
+    restore_terminal = _configure_terminal_input()
+    try:
+        return _run_main(argv)
+    finally:
+        restore_terminal()
+
+
+def _run_main(argv: Sequence[str] | None = None) -> int:
+    """在终端已配置的前提下组合并运行 Agentic CLI。"""
+
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     configure_requested = arguments == ("--configure",)
