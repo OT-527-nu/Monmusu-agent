@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from random import Random
+from time import sleep as _system_sleep
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping, cast
 from uuid import uuid4
@@ -29,9 +30,17 @@ from monmusu_agent.agentic_model import (
     deepseek_model_profile,
     validated_model_profile,
 )
+from monmusu_agent.agentic_retry import (
+    ResolvedRetryPolicy,
+    RetryPolicyValidationError,
+    random_01,
+    resolve_retry_policy,
+    scheduled_retry_delay_ms,
+)
 from monmusu_agent.agentic_session import (
     AgenticSessionStore,
     LoadedSession,
+    empty_provider_retry_state,
     tool_call_matches_interaction,
 )
 from monmusu_agent.config import PROJECT_ROOT
@@ -71,10 +80,17 @@ _PROVIDER_FAILURE_CODES = frozenset(
     {
         "request_timeout",
         "provider_authentication_failed",
+        "provider_bad_request",
+        "provider_conflict",
+        "provider_context_exceeded",
+        "provider_empty_response",
+        "provider_network_error",
+        "provider_not_found",
+        "provider_quota_exceeded",
         "provider_rate_limited",
         "provider_response_error",
         "provider_server_error",
-        "provider_network_error",
+        "provider_unprocessable",
         "unsupported_model_profile",
         "unsupported_streaming",
         "unsupported_thinking_mode",
@@ -88,6 +104,7 @@ _PUBLIC_INTERRUPTION_CODES = _PROVIDER_FAILURE_CODES | frozenset(
         "invalid_model_response",
         "invalid_final_response",
         "provider_protocol_error",
+        "retry_state_persistence_failed",
         "tool_commit_failed",
         "authority_id_error",
         "structure_repair_failed",
@@ -233,6 +250,8 @@ class AgenticHarness:
         random_source: RandomSource | None = None,
         clock: Callable[[], datetime] | None = None,
         session_writer: Callable[[Path, Any], None] = write_json_atomic,
+        retry_sleep: Callable[[float], None] = _system_sleep,
+        retry_random: Callable[[], float] = random_01,
         model_profile: Mapping[str, Any] | None = None,
         attempt_limits: Mapping[str, int] | None = None,
         tool_registry: Mapping[str, CocTool] | None = None,
@@ -251,6 +270,8 @@ class AgenticHarness:
         self.random_source = random_source or Random()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.session_writer = session_writer
+        self.retry_sleep = retry_sleep
+        self.retry_random = retry_random
         self.tool_registry = dict(
             DEFAULT_COC_TOOLS if tool_registry is None else tool_registry
         )
@@ -357,6 +378,7 @@ class AgenticHarness:
             "tool_interactions": [],
             "deepseek_messages": copy.deepcopy(messages),
             "provider_protocol_errors": [],
+            "provider_retry": empty_provider_retry_state(),
             "last_failure": None,
         }
         working["updated_at"] = started_at
@@ -461,6 +483,13 @@ class AgenticHarness:
         resumed["attempt_started_at"] = attempt_started_at
         resumed["round_trips_used"] = 0
         resumed["structure_repairs_used"] = 0
+        provider_retry = resumed.get("provider_retry")
+        if not isinstance(provider_retry, dict):
+            provider_retry = empty_provider_retry_state()
+        else:
+            provider_retry["retries_used"] = 0
+            provider_retry["last_retry"] = None
+        resumed["provider_retry"] = provider_retry
         resumed["last_failure"] = None
         working["updated_at"] = attempt_started_at
         self._write_initial_state(loaded, working)
@@ -496,6 +525,12 @@ class AgenticHarness:
             incomplete["deepseek_messages"]
         )
         repair_pending_from_previous_attempt = repair_pending
+        if not isinstance(incomplete.get("provider_retry"), dict):
+            incomplete["provider_retry"] = empty_provider_retry_state()
+        try:
+            retry_policy = resolve_retry_policy(profile.get("retry_policy"))
+        except RetryPolicyValidationError as error:
+            raise AgenticTurnInputError(str(error)) from error
         while True:
             incomplete = working["incomplete_turn"]
             assert isinstance(incomplete, dict)
@@ -532,34 +567,20 @@ class AgenticHarness:
                 ),
                 model_profile=copy.deepcopy(profile),
             )
-            try:
-                response = self.model.complete(request)
-            except ModelCallError as error:
-                code = self._safe_provider_failure_code(error.code)
-                if self._remaining_seconds(attempt_deadline) <= 0:
-                    code = "attempt_timeout"
-                return self._interrupt(
-                    loaded,
-                    working,
-                    turn_id,
-                    code,
-                    "GM 服务调用中断",
-                    public_mechanics=tuple(public_mechanics),
-                )
-            except Exception:
-                code = (
-                    "attempt_timeout"
-                    if self._remaining_seconds(attempt_deadline) <= 0
-                    else "provider_error"
-                )
-                return self._interrupt(
-                    loaded,
-                    working,
-                    turn_id,
-                    code,
-                    "GM 服务调用中断",
-                    public_mechanics=tuple(public_mechanics),
-                )
+            completed = self._complete_request_with_retries(
+                loaded,
+                working,
+                turn_id,
+                request,
+                retry_policy,
+                attempt_deadline,
+                limits,
+                public_mechanics=tuple(public_mechanics),
+            )
+            if isinstance(completed, TurnResult):
+                return completed
+            response = completed
+            self._reset_current_retry_chain(incomplete)
 
             incomplete["round_trips_used"] += 1
             incomplete["total_round_trips"] += 1
@@ -822,6 +843,167 @@ class AgenticHarness:
                 attempt_deadline,
                 tuple(public_mechanics),
             )
+
+    def _complete_request_with_retries(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        turn_id: str,
+        request: ModelRequest,
+        retry_policy: ResolvedRetryPolicy,
+        attempt_deadline: datetime,
+        limits: Mapping[str, int],
+        *,
+        public_mechanics: tuple[PublicMechanic, ...],
+    ) -> ModelResponse | TurnResult:
+        """执行一个有界重试边界的模型请求链。"""
+
+        pending_request = request
+        retry_number = 0
+        while True:
+            try:
+                return self.model.complete(pending_request)
+            except ModelCallError as error:
+                if not self._retry_is_eligible(
+                    error,
+                    retry_policy,
+                    retry_number,
+                ):
+                    code = self._safe_provider_failure_code(error.code)
+                    if self._remaining_seconds(attempt_deadline) <= 0:
+                        code = "attempt_timeout"
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        code,
+                        "GM 服务调用中断",
+                        public_mechanics=public_mechanics,
+                    )
+                delay_ms = scheduled_retry_delay_ms(
+                    retry_policy,
+                    retry_number + 1,
+                    error.provider_retry_after_ms,
+                    self.retry_random,
+                )
+                if delay_ms is None:
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        self._safe_provider_failure_code(error.code),
+                        "GM 服务调用中断",
+                        public_mechanics=public_mechanics,
+                    )
+                remaining = self._remaining_seconds(attempt_deadline)
+                if remaining - delay_ms / 1000 <= 0:
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "attempt_timeout",
+                        "GM 执行尝试超过时间限制",
+                        public_mechanics=public_mechanics,
+                    )
+                try:
+                    self._persist_scheduled_retry(
+                        loaded,
+                        working,
+                        error,
+                        delay_ms,
+                    )
+                except Exception:
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "retry_state_persistence_failed",
+                        "GM 重试状态无法保存",
+                        public_mechanics=public_mechanics,
+                    )
+                self.retry_sleep(delay_ms / 1000)
+                retry_number += 1
+                remaining = self._remaining_seconds(attempt_deadline)
+                if remaining <= 0:
+                    return self._interrupt(
+                        loaded,
+                        working,
+                        turn_id,
+                        "attempt_timeout",
+                        "GM 执行尝试超过时间限制",
+                        public_mechanics=public_mechanics,
+                    )
+                pending_request = ModelRequest(
+                    messages=request.messages,
+                    tools=request.tools,
+                    request_timeout_seconds=min(
+                        float(limits["request_timeout_seconds"]),
+                        remaining,
+                    ),
+                    model_profile=copy.deepcopy(request.model_profile),
+                )
+            except Exception:
+                code = (
+                    "attempt_timeout"
+                    if self._remaining_seconds(attempt_deadline) <= 0
+                    else "provider_error"
+                )
+                return self._interrupt(
+                    loaded,
+                    working,
+                    turn_id,
+                    code,
+                    "GM 服务调用中断",
+                    public_mechanics=public_mechanics,
+                )
+
+    @staticmethod
+    def _retry_is_eligible(
+        error: ModelCallError,
+        retry_policy: ResolvedRetryPolicy,
+        retry_number: int,
+    ) -> bool:
+        return (
+            error.retryable
+            and error.code in retry_policy.retryable_codes
+            and retry_number < retry_policy.max_retries
+        )
+
+    def _persist_scheduled_retry(
+        self,
+        loaded: LoadedSession,
+        working: dict[str, Any],
+        error: ModelCallError,
+        delay_ms: float,
+    ) -> None:
+        incomplete = working["incomplete_turn"]
+        assert isinstance(incomplete, dict)
+        provider_retry = incomplete["provider_retry"]
+        assert isinstance(provider_retry, dict)
+        provider_retry["retries_used"] += 1
+        provider_retry["total_retries"] += 1
+        scheduled_at = self._timestamp(self.clock())
+        provider_retry["last_retry"] = {
+            "code": error.code,
+            "message": error.message,
+            "delay_ms": delay_ms,
+            "scheduled_at": scheduled_at,
+            "status": error.status,
+            "request_id": error.request_id,
+        }
+        working["updated_at"] = scheduled_at
+        self.session_writer(
+            loaded.session_directory / "session.json",
+            working,
+        )
+
+    @staticmethod
+    def _reset_current_retry_chain(incomplete: dict[str, Any]) -> None:
+        provider_retry = incomplete.get("provider_retry")
+        if not isinstance(provider_retry, dict):
+            return
+        provider_retry["retries_used"] = 0
+        provider_retry["last_retry"] = None
 
     def _write_initial_state(
         self,
