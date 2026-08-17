@@ -4,7 +4,7 @@
 
 本文定义下一版 MVP 一次玩家输入如何经过同一个 GM、COC 工具、最终校验、提交、故障和显式恢复。模块职责以[系统架构](architecture.md)为准，字段和错误结构以[数据契约](contracts.md)为准，GM 行为依据[GM 能力章程与 Prompt](gm_prompt.md)。
 
-本文描述完整的**目标协议**。截至 2026-08-16，opt-in Agentic 路径已实现新回合外壳、non-thinking/thinking DeepSeek 消息、`make_check` / `push_check` / `spend_luck` / `deal_damage` / `make_sanity_check` 五工具统一生命周期、机械即时提交、最终事实/叙事原子提交、技术中断保存、一次结构修正、`attempt_timeout_seconds=180`、八次往返执行、显式恢复、已提交工具结果幂等重放和 thinking 消息回放；Ticket 11 已补充两种 profile 的真实 provider 恢复证据，Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。默认旧循环仍返回 `GameMasterDraft(strategy, narration, suggested_actions)` 并使用 `request_check` / `apply_effect`；已有完整会话的继续入口、完整短篇六场景与开放试玩和默认入口切换仍是目标工作。
+本文描述完整的**目标协议**。截至 2026-08-17，opt-in Agentic 路径已实现新回合外壳、non-thinking/thinking DeepSeek 消息、`make_check` / `push_check` / `spend_luck` / `deal_damage` / `make_sanity_check` 五工具统一生命周期、机械即时提交、最终事实/叙事原子提交、技术中断保存、一次结构修正、`attempt_timeout_seconds=180`、八次往返执行、provider 有界重试、显式恢复、已提交工具结果幂等重放和 thinking 消息回放；Ticket 11 已补充两种 profile 的真实 provider 恢复证据，Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。默认旧循环仍返回 `GameMasterDraft(strategy, narration, suggested_actions)` 并使用 `request_check` / `apply_effect`；已有完整会话的继续入口、完整短篇六场景与开放试玩和默认入口切换仍是目标工作。
 
 ## 循环切片
 
@@ -39,6 +39,7 @@ Harness 从接受新玩家输入或玩家明确选择恢复开始，到成功提
 - 最多 8 次模型往返。
 - 180 秒整次尝试时限。
 - 最多一次自动最终结构修正。
+- 每个模型请求链独立的重试预算，由冻结的 `model_profile.retry_policy` 限制。
 
 累计尝试次数、往返、延迟与结构修正只用于诊断。恢复不会清除既有模型/工具交互，也不会撤销或重放已提交机械。
 
@@ -51,7 +52,7 @@ Harness 向同一个 GM 发出一次模型请求并收到一次响应，计为�
 - 协议错误送回后的纠正响应。
 - 最终答复结构修正响应。
 
-本地执行 COC 工具不计模型往返。若一个响应包含多个 `tool_calls`，整个响应仍只计一次，但其中工具一个也不执行。
+本地执行 COC 工具不计模型往返。若一个响应包含多个 `tool_calls`，整个响应仍只计一次，但其中工具一个也不执行。**失败的 provider 请求也不计往返**：只有收到一个 `ModelResponse`（无论后续本地分类是否成功）才消耗一次 8 次额度；同一请求链的瞬时故障重试由 `retry_policy.max_retries` 单独计数。
 
 ### 未完成回合
 
@@ -293,7 +294,18 @@ Provider token 流、`reasoning_content`、隐藏机械、隐藏事实、无效�
 
 ### 单请求 60 秒
 
-每个 DeepSeek 请求默认最多等待 `request_timeout_seconds=60`。实际等待上限还受本次尝试剩余的 `attempt_timeout_seconds=180` 约束。请求超时后不追加补偿性模型调用，本次执行尝试直接中断。
+每个 DeepSeek 请求默认最多等待 `request_timeout_seconds=60`。实际等待上限还受本次尝试剩余的 `attempt_timeout_seconds=180` 约束。
+
+### Provider 有界重试
+
+鉴权、quota、坏请求和上下文超限等永久性错误不重试。`provider_rate_limited`、`provider_server_error`、`provider_network_error`、`request_timeout` 与 `provider_empty_response` 按冻结的 `model_profile.retry_policy` 重试；默认 `max_retries=2`。
+
+- 退避采用有界指数退避：500ms 起、10s 封顶、10% 对称 jitter。
+- 合法且不超过 `max_delay_ms` 的 provider `Retry-After` 直接采用，不加 jitter；超过上限时放弃重试。
+- 每次 sleep 前把 `IncompleteTurn.provider_retry` 写盘；落盘失败以 `retry_state_persistence_failed` 中断。
+- sleep 前若 `remaining - delay <= 0`，或 sleep 后 `remaining <= 0`，本次尝试以 `attempt_timeout` 中断。
+- 下一次请求 timeout 继续取 `min(request_timeout_seconds, remaining)`。
+- 重试耗尽后保留最后一次 provider 错误码并中断本次尝试。
 
 ### 整次尝试 180 秒
 
@@ -311,8 +323,9 @@ Provider token 流、`reasoning_content`、隐藏机械、隐藏事实、无效�
 | 单工具调用缺少可用 `tool_call_id` | 无新增 | 不提交 | 只保存受限原始响应记录与 provider 协议错误并中断；恢复从最后一个可回放前缀重试 |
 | 多个 `tool_calls`，ID 全部可用且唯一 | 一个也不执行 | 无新增 | 为每个调用追加协议错误 tool result；无余额则中断 |
 | 多个 `tool_calls`，任一 ID 缺失、不可用或重复 | 一个也不执行 | 不提交 | 只保存受限原始响应记录与 provider 协议错误并中断；恢复从最后一个可回放前缀重试 |
-| DeepSeek 鉴权、限流、服务端或网络错误 | 保留 | 不提交 | 保存未完成回合并技术中断 |
-| 单请求超过 60 秒 | 保留 | 不提交 | 保存未完成回合并技术中断 |
+| DeepSeek 鉴权、quota、坏请求等永久错误 | 保留 | 不提交 | 保存未完成回合并技术中断 |
+| 可重试 provider 错误 | 保留 | 不提交 | 在重试预算和 180 秒预算内自动重试；耗尽后保存未完成回合并技术中断 |
+| 单请求超过 60 秒且重试耗尽 | 保留 | 不提交 | 保存未完成回合并技术中断 |
 | 执行尝试超过 180 秒 | 保留 | 不提交 | 保存未完成回合并技术中断 |
 | 第 8 次响应仍未产生合法最终答复 | 保留 | 不提交 | 保存未完成回合并技术中断 |
 | 最终结构首次无效 | 保留 | 不提交 | 有预算时由同一 GM 修正一次 |
@@ -403,7 +416,7 @@ DeepSeek 同一响应请求 `make_check` 和 `deal_damage`。Harness 两者都�
 - 新回合使用五工具默认 profile；恢复回合使用自己的冻结 profile，只要其版本与工具子集仍受完整注册表支持。
 - 最终答复严格使用四个顶层字段，Harness 不从自由文本中另行抽取事实。
 - 最终叙事与事实变化原子提交；无效或未提交内容对玩家不可见且不成为正典。
-- 非流式 DeepSeek 输出、8 次往返、`request_timeout_seconds=60`、`attempt_timeout_seconds=180` 和每次尝试一次结构修正均有可观察测试。
+- 非流式 DeepSeek 输出、8 次往返、`request_timeout_seconds=60`、`attempt_timeout_seconds=180`、provider 有界重试和每次尝试一次结构修正均有可观察测试。
 - 技术故障保留机械并产生可恢复的未完成回合，不生成兜底剧情。
 - CLI 在未完成回合存在时不接受新行动，只有玩家明确选择才发起恢复模型调用。
 - 首个真实纵向切片证明未预写行动能够建立事实并跨两个回合连续成立。

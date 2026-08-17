@@ -1273,10 +1273,13 @@ def _run_recovery_scenario(
     store: AgenticSessionStore,
     client: Any | None,
 ) -> dict[str, Any]:
+    # Recovery contract intentionally disables retries: its purpose is to prove
+    # the committed-tool recovery boundary, not provider retry policy.
     profile = deepseek_model_profile(
         model_id="deepseek-v4-flash",
         thinking=scenario.thinking,
         enabled_tools=("make_check",),
+        retry_policy={"mode": "normal", "max_retries": 0},
     )
     created = store.create_session(
         NewSessionRequest(

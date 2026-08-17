@@ -14,12 +14,12 @@ from monmusu_agent.agentic_retry import (
 
 
 class RetryPolicyTest(unittest.TestCase):
-    def test_default_policy_is_normal_zero_then_backoff_defaults(self) -> None:
+    def test_default_policy_is_normal_with_two_retries_and_backoff_defaults(self) -> None:
         policy = resolve_retry_policy(None)
 
-        self.assertEqual(DEFAULT_MAX_RETRIES, 0)
+        self.assertEqual(DEFAULT_MAX_RETRIES, 2)
         self.assertEqual(policy.mode, "normal")
-        self.assertEqual(policy.max_retries, 0)
+        self.assertEqual(policy.max_retries, 2)
         self.assertEqual(
             policy.retryable_codes,
             (

@@ -198,13 +198,17 @@ class HarnessRetryTest(unittest.TestCase):
                 },
             )
 
-    def test_default_policy_does_not_retry(self) -> None:
+    def test_default_policy_retries_twice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store, game_id = self._create_session(root)
             sleeps: list[float] = []
             model = ScriptedGameMasterModel(
-                [ModelCallError("request_timeout", "stop", retryable=True)]
+                [
+                    ModelCallError("request_timeout", "stop", retryable=True),
+                    ModelCallError("request_timeout", "stop", retryable=True),
+                    ModelCallError("request_timeout", "stop", retryable=True),
+                ]
             )
             harness = AgenticHarness(
                 store,
@@ -218,8 +222,8 @@ class HarnessRetryTest(unittest.TestCase):
 
             self.assertEqual(result.status, "interrupted")
             self.assertEqual(result.error_code, "request_timeout")
-            self.assertEqual(len(model.requests), 1)
-            self.assertEqual(sleeps, [])
+            self.assertEqual(len(model.requests), 3)
+            self.assertEqual(len(sleeps), 2)
 
     def test_non_retryable_error_stops_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

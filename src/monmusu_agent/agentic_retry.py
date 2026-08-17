@@ -9,7 +9,7 @@ import random as _random
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping
 
-DEFAULT_MAX_RETRIES = 0
+DEFAULT_MAX_RETRIES = 2
 DEFAULT_INITIAL_DELAY_MS = 500
 DEFAULT_MAX_DELAY_MS = 10_000
 DEFAULT_JITTER_RATIO = 0.1
