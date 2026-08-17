@@ -112,6 +112,15 @@ def validated_model_profile(
         or not rebuilt["base_url"].startswith(("http://", "https://"))
     ):
         raise ModelProfileValidationError("model_profile.base_url 格式无效")
+    if rebuilt["provider"] == "opencode-go":
+        if rebuilt["thinking"]:
+            raise ModelProfileValidationError(
+                "opencode-go 首版只支持 thinking=false"
+            )
+        if rebuilt["model_id"] != DEFAULT_DEEPSEEK_MODEL_ID:
+            raise ModelProfileValidationError(
+                "opencode-go 首版只支持 deepseek-v4-flash"
+            )
     if (
         not isinstance(rebuilt["thinking"], bool)
         or rebuilt["stream"] is not False
@@ -280,13 +289,12 @@ class DeepSeekGameMasterModel:
                 retryable=False,
             )
 
-        sdk_request = {
+        sdk_request: dict[str, Any] = {
             "model": validated_profile["model_id"],
             "messages": [
                 copy.deepcopy(dict(message)) for message in request.messages
             ],
             "tools": [copy.deepcopy(dict(tool)) for tool in request.tools],
-            "response_format": {"type": "json_object"},
             "stream": False,
             "max_tokens": validated_profile["max_tokens"],
             "timeout": request.request_timeout_seconds,
@@ -298,6 +306,11 @@ class DeepSeekGameMasterModel:
                 }
             },
         }
+        # opencode-go 在 response_format=json_object 下不会返回原生
+        # tool_calls，而是把工具调用写进 JSON content；省略该字段才能走
+        # Chat Completions function tools。最终答复仍由 Harness 本地校验 JSON。
+        if validated_profile["provider"] != "opencode-go":
+            sdk_request["response_format"] = {"type": "json_object"}
         started_at = self._monotonic()
         try:
             if self._request_evidence_sink is not None:
@@ -330,11 +343,17 @@ class DeepSeekGameMasterModel:
                 usage = _sanitized_usage(
                     response.usage.model_dump(mode="json")
                 )
+            reasoning_content = message.get("reasoning_content")
+            if validated_profile["provider"] == "opencode-go":
+                if not isinstance(reasoning_content, str):
+                    reasoning_content = message.get("reasoning")
+                if not isinstance(reasoning_content, str):
+                    reasoning_content = ""
             return ModelResponse(
                 assistant_message={
                     "role": message.get("role"),
                     "content": content,
-                    "reasoning_content": message.get("reasoning_content"),
+                    "reasoning_content": reasoning_content,
                     "tool_calls": tool_calls,
                 },
                 finish_reason=choice.finish_reason,
