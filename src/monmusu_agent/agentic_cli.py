@@ -369,6 +369,7 @@ def compose_deepseek_harness(
     thinking: bool,
     provider: str = "deepseek",
     base_url: str | None = None,
+    retry_policy: Mapping[str, Any] | None = None,
     client: Any | None = None,
 ) -> AgenticHarness:
     """在组合边界注入 provider 配置，并构造同一 Agentic Harness seam。"""
@@ -379,6 +380,7 @@ def compose_deepseek_harness(
             thinking=thinking,
             provider=provider,
             base_url=base_url,
+            retry_policy=retry_policy,
         )
     except ModelProfileValidationError as error:
         raise ModelCallError(

@@ -206,9 +206,13 @@ _INCOMPLETE_TURN_FIELDS = frozenset(
         "tool_interactions",
         "deepseek_messages",
         "provider_protocol_errors",
+        "provider_retry",
         "last_failure",
     }
 )
+_LEGACY_INCOMPLETE_TURN_FIELDS = _INCOMPLETE_TURN_FIELDS - {
+    "provider_retry"
+}
 _ATTEMPT_LIMIT_FIELDS = frozenset(
     {
         "max_round_trips",
@@ -220,7 +224,19 @@ _ATTEMPT_LIMIT_FIELDS = frozenset(
 _PROVIDER_PROTOCOL_ERROR_FIELDS = frozenset(
     {"code", "message", "model_response_json", "recorded_at"}
 )
+_PROVIDER_RETRY_FIELDS = frozenset(
+    {"retries_used", "total_retries", "last_retry"}
+)
+_LAST_RETRY_FIELDS = frozenset(
+    {"code", "message", "delay_ms", "scheduled_at", "status", "request_id"}
+)
 _LAST_FAILURE_FIELDS = frozenset({"code", "message"})
+
+
+def empty_provider_retry_state() -> dict[str, Any]:
+    """返回新 attempt 的 provider 重试持久化初态。"""
+
+    return {"retries_used": 0, "total_retries": 0, "last_retry": None}
 _TOOL_INTERACTION_FIELDS = frozenset(
     {
         "tool_call_id",
@@ -916,7 +932,12 @@ class AgenticSessionStore:
         actors: object,
     ) -> None:
         cls = type(self)
-        if set(incomplete) != _INCOMPLETE_TURN_FIELDS:
+        incomplete_fields = set(incomplete)
+        if incomplete_fields == _LEGACY_INCOMPLETE_TURN_FIELDS:
+            provider_retry = None
+        elif incomplete_fields == _INCOMPLETE_TURN_FIELDS:
+            provider_retry = incomplete.get("provider_retry")
+        else:
             raise AgenticSessionLoadError("IncompleteTurn 格式无效")
         turn_id = cls._load_required_string(
             incomplete.get("turn_id"),
@@ -1014,6 +1035,7 @@ class AgenticSessionStore:
         cls._validate_protocol_errors(
             incomplete.get("provider_protocol_errors")
         )
+        cls._validate_provider_retry(provider_retry)
         last_failure = incomplete.get("last_failure")
         if last_failure is not None:
             if (
@@ -1026,6 +1048,66 @@ class AgenticSessionStore:
                 last_failure.get("message"),
                 "failure.message",
             )
+
+    @classmethod
+    def _validate_provider_retry(cls, provider_retry: object) -> None:
+        if provider_retry is None:
+            return
+        if (
+            not isinstance(provider_retry, dict)
+            or set(provider_retry) != _PROVIDER_RETRY_FIELDS
+        ):
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
+        retries_used = provider_retry.get("retries_used")
+        total_retries = provider_retry.get("total_retries")
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for value in (retries_used, total_retries)
+        ):
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
+        assert isinstance(retries_used, int)
+        assert isinstance(total_retries, int)
+        if retries_used > total_retries:
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
+        last_retry = provider_retry.get("last_retry")
+        if last_retry is None:
+            return
+        if not isinstance(last_retry, dict) or set(last_retry) != _LAST_RETRY_FIELDS:
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
+        cls._load_required_string(last_retry.get("code"), "last_retry.code")
+        cls._load_required_string(
+            last_retry.get("message"),
+            "last_retry.message",
+        )
+        delay_ms = last_retry.get("delay_ms")
+        if (
+            isinstance(delay_ms, bool)
+            or not isinstance(delay_ms, (int, float))
+            or delay_ms != delay_ms
+            or delay_ms < 0
+        ):
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
+        cls._validate_timestamp(
+            last_retry.get("scheduled_at"),
+            "last_retry.scheduled_at",
+        )
+        status = last_retry.get("status")
+        if status is not None and (
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or status < 100
+            or status > 599
+        ):
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
+        request_id = last_retry.get("request_id")
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or not request_id.strip()
+            or request_id != request_id.strip()
+        ):
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
 
     @classmethod
     def _validate_model_profile(cls, profile: object) -> None:

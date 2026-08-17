@@ -97,6 +97,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
         constructor.assert_called_once_with(
             api_key="sk-constructor-secret",
             base_url="https://api.deepseek.com",
+            max_retries=0,
         )
 
     def test_complete_converts_one_request_and_preserves_response_envelope(
@@ -528,7 +529,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
                     response=httpx.Response(400, request=sdk_request),
                     body={"private": "unmapped provider diagnostic"},
                 ),
-                "provider_error",
+                "provider_bad_request",
                 False,
             ),
         )
@@ -607,8 +608,8 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
         with self.assertRaises(ModelCallError) as caught:
             model.complete(request)
 
-        self.assertEqual(caught.exception.code, "provider_response_error")
-        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.code, "provider_empty_response")
+        self.assertTrue(caught.exception.retryable)
         self.assertNotIn("secret-response-key", str(caught.exception))
 
     def test_real_adapter_class_commits_direct_final_through_harness(
