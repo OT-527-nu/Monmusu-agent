@@ -485,7 +485,9 @@ def run_new_session_cli(
         created = store.create_session(request)
 
         # 只有目录事务完成并返回后，玩家才会看到可成为正典的开场文本。
+        _write_section_heading("建局开场", write_line)
         write_line(created.opening_narration)
+        write_line("")
         first_action = _read_first_action(read_line, write_line)
     except KeyboardInterrupt:
         write_line(_EXIT_BEFORE_GAME_MESSAGE)
@@ -506,8 +508,9 @@ def run_turn_cli(
     result = harness.start_turn(
         game_id,
         player_input,
-        public_mechanic_sink=lambda mechanic: write_line(
-            _format_public_mechanic(mechanic)
+        public_mechanic_sink=lambda mechanic: _write_public_mechanic(
+            mechanic,
+            write_line,
         ),
     )
     _write_turn_result(result, write_line)
@@ -521,19 +524,35 @@ def _write_turn_result(
     """展示一次生命周期调用新提交的公开投影。"""
 
     if result.status == "interrupted":
+        _write_section_heading(
+            f"回合 {result.turn_id}：技术中断",
+            write_line,
+        )
         write_line(f"未完成回合：{result.turn_id}")
         write_line(
             f"技术中断（{result.error_code}）：{result.error_message}"
         )
+        write_line("")
         return
 
     assert result.narration is not None
+    _write_section_heading(
+        f"回合 {result.turn_id}：GM 叙事（已提交）",
+        write_line,
+    )
     write_line(result.narration)
-    for change in result.public_fact_changes:
+    for index, change in enumerate(result.public_fact_changes):
+        if index == 0:
+            write_line("")
+            _write_section_heading(
+                f"回合 {result.turn_id}：公开事实变化",
+                write_line,
+            )
         if change.kind == "established":
             write_line(f"公开事实已确立：{change.text}")
         else:
             write_line(f"公开事实已结束：{change.text}")
+    write_line("")
 
 
 def run_game_cli(
@@ -588,16 +607,19 @@ def _run_session_cli(
                 result = harness.resume_turn(
                     game_id,
                     lifecycle.turn_id,
-                    public_mechanic_sink=lambda mechanic: write_line(
-                        _format_public_mechanic(mechanic)
+                    public_mechanic_sink=lambda mechanic: _write_public_mechanic(
+                        mechanic,
+                        write_line,
                     ),
                 )
             except AgenticTurnBlockedError:
                 # 冻结运行配置不可用时，保持 blocker 并回到同一显式门。
+                _write_section_heading("恢复技术中断", write_line)
                 write_line(
                     "技术中断（recovery_unavailable）："
                     "当前运行配置无法恢复该回合；未完成回合已保留"
                 )
+                write_line("")
                 show_recovery_state = False
                 continue
             except KeyboardInterrupt:
@@ -643,14 +665,32 @@ def _format_public_mechanic(mechanic: PublicMechanic) -> str:
     )
 
 
+def _write_section_heading(
+    title: str,
+    write_line: Callable[[str], None],
+) -> None:
+    write_line(f"--- {title} ---")
+
+
+def _write_public_mechanic(
+    mechanic: PublicMechanic,
+    write_line: Callable[[str], None],
+) -> None:
+    _write_section_heading("公开机械结果（已提交）", write_line)
+    write_line(_format_public_mechanic(mechanic))
+    write_line("")
+
+
 def _select_incomplete_session(
     game_ids: tuple[str, ...],
     read_line: Callable[[str], str],
     write_line: Callable[[str], None],
 ) -> str | None:
+    _write_section_heading("未完成回合恢复", write_line)
     write_line("检测到未完成回合：")
     for index, game_id in enumerate(game_ids, start=1):
         write_line(f"{index}. 会话 {game_id}")
+    write_line("")
     while True:
         try:
             raw = read_line("请选择要处理的未完成会话编号：").strip()
@@ -673,12 +713,20 @@ def _write_recovery_state(
 ) -> None:
     if not lifecycle.has_incomplete_turn or lifecycle.turn_id is None:
         raise RuntimeError("发现的会话当前没有未完成回合")
+    _write_section_heading(
+        f"回合 {lifecycle.turn_id}：未完成状态",
+        write_line,
+    )
     write_line(f"未完成回合：{lifecycle.turn_id}")
     for mechanic in lifecycle.public_mechanics:
-        write_line(_format_public_mechanic(mechanic))
+        _write_public_mechanic(mechanic, write_line)
+    if not lifecycle.public_mechanics:
+        write_line("")
+    _write_section_heading("技术中断", write_line)
     write_line(
         f"技术中断（{lifecycle.error_code}）：{lifecycle.error_message}"
     )
+    write_line("")
 
 
 def _read_recovery_choice(

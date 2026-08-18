@@ -117,13 +117,15 @@ class PersistedMechanicThenFinalModel(GameMasterModel):
         ]:
             raise AssertionError("第二次 GM 请求前机械尚未持久化")
         if self.output != [
+            "--- 公开机械结果（已提交） ---",
             "公开机械 | 类型：check | 角色：investigator_tracker | 详情："
             '{"ability": "spot_hidden", "ability_value": 70, '
             '"action": "检查牢门铰链", '
             '"dice_adjustment": {"count": 0, "kind": "none"}, '
             '"difficulty": "regular", "roll": 43, '
             '"stakes": "失败会错过新鲜刮痕", '
-            '"success_level": "regular_success", "target": 70}'
+            '"success_level": "regular_success", "target": 70}',
+            "",
         ]:
             raise AssertionError("第二次 GM 请求前 CLI 尚未收到公开机械")
         return ModelResponse(
@@ -210,9 +212,9 @@ class AgenticCliTest(unittest.TestCase):
             write_line=output.append,
         )
 
-        self.assertIn('"pushed_from": "mechanic_check_0001"', output[0])
-        self.assertIn('"is_pushed": true', output[0])
-        self.assertEqual(output[1], "门轴应声脱落。")
+        self.assertIn('"pushed_from": "mechanic_check_0001"', output[1])
+        self.assertIn('"is_pushed": true', output[1])
+        self.assertEqual(output[4], "门轴应声脱落。")
 
     def test_startup_discovers_incomplete_session_and_exit_preserves_it(
         self,
@@ -313,11 +315,17 @@ class AgenticCliTest(unittest.TestCase):
             self.assertEqual(
                 output,
                 [
+                    "--- 未完成回合恢复 ---",
                     "检测到未完成回合：",
                     "1. 会话 game_interrupted_a",
                     "2. 会话 game_interrupted_b",
+                    "",
+                    "--- 回合 turn_interrupted_b：未完成状态 ---",
                     "未完成回合：turn_interrupted_b",
+                    "",
+                    "--- 技术中断 ---",
                     "技术中断（request_timeout）：回合因技术问题中断，需要显式恢复",
+                    "",
                     "已退出；未完成回合已保留。",
                 ],
             )
@@ -1063,8 +1071,8 @@ class AgenticCliTest(unittest.TestCase):
                 if prompt == "你的行动：":
                     loaded = store.load_session("game_test_0001")
                     self.assertEqual(
-                        output[-1],
-                        loaded.session["setup"]["opening_narration"],
+                        output[-2:],
+                        [loaded.session["setup"]["opening_narration"], ""],
                     )
                     self.assertEqual(loaded.session["turns"], [])
                     self.assertIsNone(loaded.session["incomplete_turn"])
@@ -1363,8 +1371,12 @@ class AgenticCliTest(unittest.TestCase):
             self.assertEqual(
                 output,
                 [
+                    "--- 回合 turn_0001：GM 叙事（已提交） ---",
                     "墙后传来潮湿的回声。",
+                    "",
+                    "--- 回合 turn_0001：公开事实变化 ---",
                     "公开事实已确立：排水沟通往旧蓄水池。",
+                    "",
                 ],
             )
             rendered = "\n".join(output)
@@ -1410,8 +1422,18 @@ class AgenticCliTest(unittest.TestCase):
 
             self.assertEqual(result.status, "committed")
             self.assertEqual(model.calls, 2)
-            self.assertEqual(output[-1], "你发现了新鲜的工具刮痕。")
-            self.assertEqual(len(output), 2)
+            self.assertEqual(output[-2], "你发现了新鲜的工具刮痕。")
+            self.assertEqual(
+                output,
+                [
+                    "--- 公开机械结果（已提交） ---",
+                    output[1],
+                    "",
+                    "--- 回合 turn_0001：GM 叙事（已提交） ---",
+                    "你发现了新鲜的工具刮痕。",
+                    "",
+                ],
+            )
 
     def test_turn_cli_never_publishes_hidden_mechanic(self) -> None:
         """隐藏检定只进入 GM 协议与存档，技术中断也不泄露其内容。"""
@@ -1491,8 +1513,16 @@ class AgenticCliTest(unittest.TestCase):
             )
 
             self.assertEqual(result.status, "interrupted")
-            self.assertEqual(len(output), 2)
-            self.assertEqual(output[0], "未完成回合：turn_0001")
+            self.assertEqual(len(output), 4)
+            self.assertEqual(
+                output[:3],
+                [
+                    "--- 回合 turn_0001：技术中断 ---",
+                    "未完成回合：turn_0001",
+                    "技术中断（request_timeout）：GM 服务调用中断",
+                ],
+            )
+            self.assertEqual(output[3], "")
             rendered = "\n".join(output)
             self.assertIn("技术中断（request_timeout）", rendered)
             self.assertNotIn(secret_text, rendered)
@@ -1640,7 +1670,9 @@ class AgenticCliTest(unittest.TestCase):
             self.assertEqual(
                 output,
                 [
+                    "--- 回合 turn_committed：GM 叙事（已提交） ---",
                     "墙后传来潮湿的回声。",
+                    "",
                     "已退出；本局已提交回合均已保存。",
                 ],
             )
