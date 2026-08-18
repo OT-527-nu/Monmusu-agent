@@ -509,7 +509,8 @@ class AgenticSessionStore:
                         has_incomplete_turn=incomplete_turn is not None,
                     )
                 )
-            except AgenticSessionError:
+            # 候选 JSON 是不可信边界；任何单条装载失败都只能淘汰该条目。
+            except Exception:
                 issues.append(SessionCatalogIssue())
 
         sessions.sort(

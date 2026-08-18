@@ -568,10 +568,11 @@ class AgenticSessionStoreTest(unittest.TestCase):
             corrupt.mkdir()
             secret = "Authorization: Bearer provider-secret"
             (corrupt / "session.json").write_text(
-                json.dumps({"provider_detail": secret}),
+                json.dumps({"schema_version": {"provider_detail": secret}}),
                 encoding="utf-8",
             )
-            before = valid.session_file.read_bytes()
+            valid_before = valid.session_file.read_bytes()
+            corrupt_before = (corrupt / "session.json").read_bytes()
 
             catalog = store.list_session_catalog()
 
@@ -587,7 +588,11 @@ class AgenticSessionStoreTest(unittest.TestCase):
             self.assertNotIn(secret, rendered)
             self.assertNotIn(str(corrupt), rendered)
             self.assertNotIn("Traceback", rendered)
-            self.assertEqual(valid.session_file.read_bytes(), before)
+            self.assertEqual(valid.session_file.read_bytes(), valid_before)
+            self.assertEqual(
+                (corrupt / "session.json").read_bytes(),
+                corrupt_before,
+            )
 
     def test_load_session_uses_read_only_snapshots_after_sources_change(self) -> None:
         """工作树材料变化后，会话仍只装载建局时冻结的全文。"""
