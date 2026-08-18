@@ -439,6 +439,7 @@ class ModelProfileBaseUrlTest(unittest.TestCase):
         constructor.assert_called_once_with(
             api_key="sk-secret",
             base_url="https://gateway.example.com/v1",
+            max_retries=0,
         )
 
 

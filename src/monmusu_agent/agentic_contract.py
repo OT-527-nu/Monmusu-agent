@@ -10,10 +10,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -34,6 +35,7 @@ from monmusu_agent.agentic_session import (
     NewSessionRequest,
 )
 from monmusu_agent.config import PROJECT_ROOT
+from monmusu_agent.storage import write_json_atomic
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,26 @@ class _InterruptAfterToolModel:
                 "request_timeout",
                 "contract runner interrupted after committed tool",
                 retryable=True,
+            )
+        return self.delegate.complete(request)
+
+
+class _InjectRetryableProviderErrorModel:
+    """真实 retry 观察契约的本地注入边界：第一跳失败，随后走真实 adapter。"""
+
+    def __init__(self, delegate: GameMasterModel) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        self.calls += 1
+        if self.calls == 1:
+            raise ModelCallError(
+                "provider_server_error",
+                "retry observation injected transient server failure",
+                retryable=True,
+                status=503,
+                provider_retry_after_ms=1_000,
             )
         return self.delegate.complete(request)
 
@@ -1266,6 +1288,166 @@ def run_deepseek_recovery_contract(
     )
 
 
+def run_deepseek_retry_contract(
+    *,
+    enabled: bool,
+    api_key: str | None,
+    session_root: Path,
+    client: Any | None = None,
+    retry_sleep: Callable[[float], None] | None = None,
+) -> ContractRunResult:
+    """真实 provider 的 retry 观察契约。
+
+    第一跳在本地模型 seam 注入一个可重试 provider_server_error，并携带
+    Retry-After=1s；Harness 按生产 retry_policy 落盘、等待并重试，第二跳
+    通过真实 DeepSeek adapter 完成 direct-final 并提交。该契约验证真实
+    provider 恢复路径与重试观测证据，而不要求 provider 真的发生故障。
+    """
+
+    if not enabled:
+        return ContractRunResult(
+            status="skipped",
+            reason="DeepSeek retry observation contract was not explicitly enabled",
+            records=(),
+        )
+    if api_key is None or not api_key.strip():
+        return ContractRunResult(
+            status="skipped",
+            reason="DEEPSEEK_API_KEY is not set",
+            records=(),
+        )
+
+    scenario = _SCENARIOS[0]
+    profile = deepseek_model_profile(
+        model_id="deepseek-v4-flash",
+        thinking=False,
+        enabled_tools=("make_check",),
+        retry_policy={
+            "mode": "normal",
+            "max_retries": 2,
+            "backoff": {
+                "initial_delay_ms": 500,
+                "max_delay_ms": 10_000,
+                "jitter_ratio": 0,
+            },
+        },
+    )
+    store = AgenticSessionStore(session_root=session_root)
+    created = store.create_session(
+        NewSessionRequest(
+            investigator_id="investigator_tracker",
+            display_name="重试观察调查员",
+        )
+    )
+
+    sdk_requests: list[Mapping[str, Any]] = []
+    retry_state_snapshots: list[dict[str, Any]] = []
+    sleeps: list[dict[str, Any]] = []
+
+    def session_writer(path: Path, payload: Any) -> None:
+        incomplete = payload.get("incomplete_turn")
+        provider_retry = (
+            incomplete.get("provider_retry")
+            if isinstance(incomplete, Mapping)
+            else None
+        )
+        if isinstance(provider_retry, Mapping):
+            last_retry = provider_retry.get("last_retry")
+            if last_retry is not None:
+                retry_state_snapshots.append(copy.deepcopy(dict(provider_retry)))
+        write_json_atomic(path, payload)
+
+    def observed_retry_sleep(seconds: float) -> None:
+        started = time.monotonic()
+        if retry_sleep is None:
+            time.sleep(seconds)
+        else:
+            retry_sleep(seconds)
+        sleeps.append(
+            {
+                "scheduled_seconds": seconds,
+                "observed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+
+    recording_model = _EvaluationRecordingModel(
+        _InjectRetryableProviderErrorModel(
+            DeepSeekGameMasterModel(
+                api_key,
+                client=client,
+                request_evidence_sink=sdk_requests.append,
+            )
+        ),
+        sdk_requests,
+        phase="retry-observation",
+    )
+    harness = AgenticHarness(
+        store,
+        recording_model,
+        model_profile=profile,
+        session_writer=session_writer,
+        retry_sleep=observed_retry_sleep,
+        retry_random=lambda: 0.5,
+    )
+    result = harness.start_turn(created.game_id, scenario.player_input)
+    final_session = store.load_session(created.game_id).session
+    request_records = list(recording_model.requests)
+
+    first_attempt = request_records[0] if request_records else {}
+    second_attempt = request_records[1] if len(request_records) > 1 else {}
+    last_attempt = request_records[-1] if request_records else {}
+    first_retry_snapshot = retry_state_snapshots[0] if retry_state_snapshots else {}
+    observed = {
+        "version": "retry-live-observation-v1",
+        "scenario": scenario.version,
+        "expected_path": scenario.expected_path,
+        "provider": profile["provider"],
+        "model_id": profile["model_id"],
+        "retry_policy": copy.deepcopy(profile["retry_policy"]),
+        "turn_status": result.status,
+        "turn_id": result.turn_id,
+        "request_attempts": len(request_records),
+        "sdk_requests": len(sdk_requests),
+        "first_attempt_local_error_category": first_attempt.get("local_error_category"),
+        "second_attempt_finish_reason": second_attempt.get("finish_reason"),
+        "last_attempt_finish_reason": last_attempt.get("finish_reason"),
+        "scheduled_retry_snapshots": retry_state_snapshots,
+        "sleeps": sleeps,
+        "final_incomplete_turn_is_none": final_session.get("incomplete_turn") is None,
+        "committed_turns": len(final_session.get("turns", [])),
+        "first_scheduled_retry": {
+            "code": first_retry_snapshot.get("last_retry", {}).get("code"),
+            "delay_ms": first_retry_snapshot.get("last_retry", {}).get("delay_ms"),
+            "status": first_retry_snapshot.get("last_retry", {}).get("status"),
+        },
+    }
+    passed = (
+        result.status == "committed"
+        and len(request_records) >= 2
+        and len(sdk_requests) == len(request_records) - 1
+        and observed["first_attempt_local_error_category"] == "provider_server_error"
+        and observed["last_attempt_finish_reason"] == "stop"
+        and observed["final_incomplete_turn_is_none"] is True
+        and len(retry_state_snapshots) >= 1
+        and len(sleeps) >= 1
+        and observed["first_scheduled_retry"]["code"] == "provider_server_error"
+        and observed["first_scheduled_retry"]["delay_ms"] == 1_000
+        and observed["first_scheduled_retry"]["status"] == 503
+        and observed["committed_turns"] == 1
+    )
+    return ContractRunResult(
+        status="passed" if passed else "failed",
+        reason=(
+            "real DeepSeek turn committed after one locally injected transient "
+            "failure, one observed retry, and zero or more real continuation "
+            "requests"
+            if passed
+            else "retry observation contract failed"
+        ),
+        records=(observed,),
+    )
+
+
 def _run_recovery_scenario(
     scenario: _RecoveryContractScenario,
     *,
@@ -1273,10 +1455,13 @@ def _run_recovery_scenario(
     store: AgenticSessionStore,
     client: Any | None,
 ) -> dict[str, Any]:
+    # Recovery contract intentionally disables retries: its purpose is to prove
+    # the committed-tool recovery boundary, not provider retry policy.
     profile = deepseek_model_profile(
         model_id="deepseek-v4-flash",
         thinking=scenario.thinking,
         enabled_tools=("make_check",),
+        retry_policy={"mode": "normal", "max_retries": 0},
     )
     created = store.create_session(
         NewSessionRequest(
@@ -2376,6 +2561,9 @@ def main() -> int:
     recovery_enabled = (
         os.environ.get("MONMUSU_RUN_DEEPSEEK_RECOVERY_CONTRACT") == "1"
     )
+    retry_enabled = (
+        os.environ.get("MONMUSU_RUN_DEEPSEEK_RETRY_CONTRACT") == "1"
+    )
     increment3_enabled = (
         os.environ.get("MONMUSU_RUN_INCREMENT3_EVALUATION") == "1"
     )
@@ -2384,6 +2572,7 @@ def main() -> int:
     )
     enabled = (
         recovery_enabled
+        or retry_enabled
         or increment3_enabled
         or opencode_go_enabled
         or os.environ.get("MONMUSU_RUN_DEEPSEEK_CONTRACT") == "1"
@@ -2394,7 +2583,13 @@ def main() -> int:
         with tempfile.TemporaryDirectory(
             prefix="monmusu-agent-deepseek-contract-"
         ) as directory:
-            if opencode_go_enabled:
+            if retry_enabled:
+                result = run_deepseek_retry_contract(
+                    enabled=enabled,
+                    api_key=api_key,
+                    session_root=Path(directory) / "sessions",
+                )
+            elif opencode_go_enabled:
                 result = run_opencode_go_contract(
                     enabled=enabled,
                     api_key=opencode_go_api_key,

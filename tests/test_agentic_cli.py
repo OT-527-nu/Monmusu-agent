@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import UTC, datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from monmusu_agent.agent import GameMasterAgent
@@ -145,6 +146,16 @@ class PersistedMechanicThenFinalModel(GameMasterModel):
         )
 
 
+def zero_retry_profile(**kwargs: Any) -> dict[str, Any]:
+    """构造默认关闭重试的测试 profile，保留终端错误语义。"""
+
+    kwargs.setdefault(
+        "retry_policy",
+        {"mode": "normal", "max_retries": 0},
+    )
+    return deepseek_model_profile(**kwargs)
+
+
 class AgenticCliTest(unittest.TestCase):
     def test_turn_cli_preserves_all_tool_owned_public_details(self) -> None:
         """同 kind 的不同工具仍完整显示各自选择的公开字段。"""
@@ -250,6 +261,7 @@ class AgenticCliTest(unittest.TestCase):
                         ]
                     ),
                     turn_id_factory=lambda turn_id=turn_id: turn_id,
+                    model_profile=zero_retry_profile(),
                     clock=lambda: datetime(
                         2026,
                         8,
@@ -316,7 +328,7 @@ class AgenticCliTest(unittest.TestCase):
         """再次中断仍门控，原回合提交后才接受下一条行动。"""
 
         reasoning_canary = "THINKING_CLI_RECOVERY_CANARY_10"
-        profile = deepseek_model_profile(thinking=True)
+        profile = zero_retry_profile(thinking=True)
         tool_response = ModelResponse(
             assistant_message={
                 "role": "assistant",
@@ -1465,6 +1477,7 @@ class AgenticCliTest(unittest.TestCase):
                 turn_id_factory=lambda: "turn_0001",
                 mechanic_id_factory=lambda: "mechanic_0001",
                 random_source=FixedRandom(),
+                model_profile=zero_retry_profile(),
                 clock=lambda: datetime(2026, 7, 28, 0, 2, tzinfo=timezone.utc),
             )
             output: list[str] = []

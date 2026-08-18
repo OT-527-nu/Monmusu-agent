@@ -5,9 +5,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from time import monotonic as _monotonic
 from typing import Any, Callable, Mapping, Protocol, Sequence
+
+from monmusu_agent.agentic_retry import (
+    RetryPolicyValidationError,
+    resolve_retry_policy,
+)
 
 PROMPT_REVISION = "gm-capability-charter-agentic-mvp-2"
 TOOL_SCHEMA_VERSION = "coc-tools-agentic-mvp-1"
@@ -30,10 +38,14 @@ MODEL_PROFILE_FIELDS = (
     "prompt_revision",
     "tool_schema_version",
     "enabled_tools",
+    "retry_policy",
     "base_url",
 )
+_OPTIONAL_LEGACY_PROFILE_FIELDS = frozenset({"retry_policy", "base_url"})
 LEGACY_MODEL_PROFILE_FIELDS = tuple(
-    field for field in MODEL_PROFILE_FIELDS if field != "base_url"
+    field
+    for field in MODEL_PROFILE_FIELDS
+    if field not in _OPTIONAL_LEGACY_PROFILE_FIELDS
 )
 DEFAULT_DEEPSEEK_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -86,13 +98,35 @@ def validated_model_profile(
 
     if not isinstance(profile, Mapping):
         raise ModelProfileValidationError("model_profile 必须只包含已知非秘密字段")
-    has_base_url = "base_url" in profile
-    expected_fields = MODEL_PROFILE_FIELDS if has_base_url else LEGACY_MODEL_PROFILE_FIELDS
-    if set(profile) != set(expected_fields):
+    present_fields = set(profile)
+    missing_optional_fields = {
+        field
+        for field in _OPTIONAL_LEGACY_PROFILE_FIELDS
+        if field not in present_fields
+    }
+    expected_fields = tuple(
+        field for field in MODEL_PROFILE_FIELDS if field not in missing_optional_fields
+    )
+    if present_fields != set(expected_fields):
         raise ModelProfileValidationError("model_profile 必须只包含已知非秘密字段")
-    rebuilt = {field: copy.deepcopy(profile[field]) for field in expected_fields}
-    if not has_base_url:
+    rebuilt = {
+        field: copy.deepcopy(profile[field])
+        for field in MODEL_PROFILE_FIELDS
+        if field in profile
+    }
+    if "base_url" not in rebuilt:
         rebuilt["base_url"] = default_base_url_for_provider(rebuilt.get("provider"))
+    if "retry_policy" not in rebuilt:
+        rebuilt["retry_policy"] = resolve_retry_policy(None).as_profile()
+    else:
+        try:
+            rebuilt["retry_policy"] = resolve_retry_policy(
+                rebuilt["retry_policy"]
+            ).as_profile()
+        except RetryPolicyValidationError as error:
+            raise ModelProfileValidationError(
+                "model_profile.retry_policy 格式无效"
+            ) from error
     for field in (
         "provider",
         "model_id",
@@ -154,6 +188,7 @@ def deepseek_model_profile(
     enabled_tools: Sequence[str] = DEFAULT_COC_TOOL_NAMES,
     provider: str = "deepseek",
     base_url: str | None = None,
+    retry_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """生成当前纵向切片唯一的非秘密模型运行配置。"""
 
@@ -164,6 +199,10 @@ def deepseek_model_profile(
     effective_base_url = base_url
     if effective_base_url is None:
         effective_base_url = default_base_url_for_provider(provider)
+    try:
+        resolved_retry_policy = resolve_retry_policy(retry_policy).as_profile()
+    except RetryPolicyValidationError as error:
+        raise ModelProfileValidationError(str(error)) from error
     return validated_model_profile(
         {
             "provider": provider,
@@ -177,6 +216,7 @@ def deepseek_model_profile(
             "prompt_revision": PROMPT_REVISION,
             "tool_schema_version": TOOL_SCHEMA_VERSION,
             "enabled_tools": list(enabled_tools),
+            "retry_policy": resolved_retry_policy,
             "base_url": effective_base_url,
         },
         enabled_tools=tuple(enabled_tools),
@@ -216,11 +256,23 @@ class ModelResponse:
 class ModelCallError(RuntimeError):
     """以稳定且不含凭据的字段报告一次 provider 调用失败。"""
 
-    def __init__(self, code: str, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        status: int | None = None,
+        provider_retry_after_ms: int | float | None = None,
+        request_id: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.status = status
+        self.provider_retry_after_ms = provider_retry_after_ms
+        self.request_id = request_id
 
 
 class GameMasterModel(Protocol):
@@ -249,6 +301,7 @@ class DeepSeekGameMasterModel:
             client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
+                max_retries=0,
             )
         self._client: Any = client
         self._monotonic = monotonic
@@ -327,7 +380,15 @@ class DeepSeekGameMasterModel:
             ) from error
         latency_ms = round((self._monotonic() - started_at) * 1000)
         try:
-            choice = response.choices[0]
+            choices = response.choices
+            if not isinstance(choices, list) or not choices:
+                raise ModelCallError(
+                    "provider_empty_response",
+                    "DeepSeek completed without any response choices",
+                    retryable=True,
+                    request_id=_response_request_id(response),
+                )
+            choice = choices[0]
             message = choice.message.model_dump(mode="json")
             tool_calls = _normalized_sdk_tool_calls(message.get("tool_calls"))
             content = message.get("content")
@@ -338,6 +399,18 @@ class DeepSeekGameMasterModel:
                 and not content.strip()
             ):
                 content = None
+            finish_reason = choice.finish_reason
+            if (
+                finish_reason in {None, "stop"}
+                and (content is None or isinstance(content, str) and not content.strip())
+                and (not isinstance(tool_calls, list) or not tool_calls)
+            ):
+                raise ModelCallError(
+                    "provider_empty_response",
+                    "DeepSeek completed without replayable content",
+                    retryable=True,
+                    request_id=_response_request_id(response),
+                )
             usage = None
             if response.usage is not None:
                 usage = _sanitized_usage(
@@ -356,10 +429,12 @@ class DeepSeekGameMasterModel:
                     "reasoning_content": reasoning_content,
                     "tool_calls": tool_calls,
                 },
-                finish_reason=choice.finish_reason,
+                finish_reason=finish_reason,
                 usage=usage,
                 latency_ms=latency_ms,
             )
+        except ModelCallError:
+            raise
         except Exception as error:
             raise ModelCallError(
                 "provider_response_error",
@@ -368,45 +443,238 @@ class DeepSeekGameMasterModel:
             ) from error
 
 
-def _mapped_openai_error(error: Exception) -> ModelCallError | None:
-    from openai import (
-        APIConnectionError,
-        APITimeoutError,
-        AuthenticationError,
-        InternalServerError,
-        RateLimitError,
-    )
+_PROVIDER_FAILURE_MESSAGES = {
+    "provider_authentication_failed": "DeepSeek authentication failed",
+    "provider_quota_exceeded": "DeepSeek quota was exhausted",
+    "provider_rate_limited": "DeepSeek rate limit reached",
+    "provider_context_exceeded": "DeepSeek request exceeded the context window",
+    "provider_bad_request": "DeepSeek request was rejected",
+    "provider_not_found": "DeepSeek request target was not found",
+    "provider_conflict": "DeepSeek request conflicted with provider state",
+    "provider_unprocessable": "DeepSeek request could not be processed",
+    "provider_server_error": "DeepSeek service failed",
+    "request_timeout": "DeepSeek request timed out",
+    "provider_network_error": "DeepSeek network request failed",
+}
 
-    if isinstance(error, AuthenticationError):
-        return ModelCallError(
-            "provider_authentication_failed",
-            "DeepSeek authentication failed",
-            retryable=False,
-        )
-    if isinstance(error, RateLimitError):
-        return ModelCallError(
-            "provider_rate_limited",
-            "DeepSeek rate limit reached",
-            retryable=True,
-        )
+_QUOTA_ERROR_PATTERNS = (
+    re.compile(r"\binsufficient[\s_-]+(?:quota|balance|credits?)\b", re.I),
+    re.compile(
+        r"\b(?:quota|usage[\s_-]+limit)[\s_-]+"
+        r"(?:exceeded|exhausted|reached)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\bexceed(?:ed|s)?[\s_-]+(?:(?:your|the)[\s_-]+)?"
+        r"(?:current[\s_-]+)?quota\b",
+        re.I,
+    ),
+    re.compile(r"\b(?:balance|credits?)[\s_-]+(?:exhausted|depleted)\b", re.I),
+    re.compile(r"\bout[\s_-]+of[\s_-]+(?:credits?|budget)\b", re.I),
+)
+
+_CONTEXT_ERROR_PATTERNS = (
+    re.compile(
+        r"(?:^|[^a-z0-9])context[\s_-](?:length|window)[\s_-]"
+        r"(?:exceed(?:ed|s)?|overflow(?:ed)?|limit[\s_-]exceeded)"
+        r"(?:$|[^a-z0-9])",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:request|prompt|input|messages?)\s+(?:is\s+|are\s+)?"
+        r"too\s+(?:large|long)\s+for\s+(?:(?:this|the)\s+)?"
+        r"(?:model(?:'s)?\s+)?context(?:\s+window)?\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:input|prompt|request|messages?)\b.{0,40}"
+        r"\b(?:exceed(?:s|ed)?|overflows?|is\s+larger\s+than)\b.{0,40}"
+        r"\b(?:the\s+)?(?:model(?:'s)?\s+)?context(?:\s+(?:length|window))?\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:maximum|max)(?:\s+(?:allowed|supported))?\s+context"
+        r"\s+(?:length|window)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:input|prompt|request)\s+(?:is\s+)?too\s+(?:long|large)"
+        r"\s+for\s+(?:this|the)\s+model\b",
+        re.I,
+    ),
+)
+
+
+def _mapped_openai_error(error: Exception) -> ModelCallError | None:
+    """把 OpenAI SDK 异常归一化为稳定、脱敏的 ModelCallError。"""
+
+    from openai import APIConnectionError, APIStatusError, APITimeoutError
+
     if isinstance(error, APITimeoutError):
         return ModelCallError(
             "request_timeout",
-            "DeepSeek request timed out",
+            _PROVIDER_FAILURE_MESSAGES["request_timeout"],
             retryable=True,
         )
     if isinstance(error, APIConnectionError):
         return ModelCallError(
             "provider_network_error",
-            "DeepSeek network request failed",
+            _PROVIDER_FAILURE_MESSAGES["provider_network_error"],
             retryable=True,
         )
-    if isinstance(error, InternalServerError):
+    if not isinstance(error, APIStatusError):
+        return None
+
+    status = error.status_code
+    detail = _openai_error_detail(error)
+    retry_after_ms = _provider_retry_after_ms(error)
+    request_id = _response_request_id(error)
+    if status in {401, 403}:
+        return ModelCallError(
+            "provider_authentication_failed",
+            _PROVIDER_FAILURE_MESSAGES["provider_authentication_failed"],
+            retryable=False,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if _is_quota_exceeded_error(detail):
+        return ModelCallError(
+            "provider_quota_exceeded",
+            _PROVIDER_FAILURE_MESSAGES["provider_quota_exceeded"],
+            retryable=False,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if status == 429:
+        return ModelCallError(
+            "provider_rate_limited",
+            _PROVIDER_FAILURE_MESSAGES["provider_rate_limited"],
+            retryable=True,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if status == 400:
+        if _is_context_window_exceeded_error(detail):
+            return ModelCallError(
+                "provider_context_exceeded",
+                _PROVIDER_FAILURE_MESSAGES["provider_context_exceeded"],
+                retryable=False,
+                status=status,
+                provider_retry_after_ms=retry_after_ms,
+                request_id=request_id,
+            )
+        return ModelCallError(
+            "provider_bad_request",
+            _PROVIDER_FAILURE_MESSAGES["provider_bad_request"],
+            retryable=False,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if status == 404:
+        return ModelCallError(
+            "provider_not_found",
+            _PROVIDER_FAILURE_MESSAGES["provider_not_found"],
+            retryable=False,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if status == 409:
+        return ModelCallError(
+            "provider_conflict",
+            _PROVIDER_FAILURE_MESSAGES["provider_conflict"],
+            retryable=False,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if status == 422:
+        return ModelCallError(
+            "provider_unprocessable",
+            _PROVIDER_FAILURE_MESSAGES["provider_unprocessable"],
+            retryable=False,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
+        )
+    if status >= 500:
         return ModelCallError(
             "provider_server_error",
-            "DeepSeek service failed",
+            _PROVIDER_FAILURE_MESSAGES["provider_server_error"],
             retryable=True,
+            status=status,
+            provider_retry_after_ms=retry_after_ms,
+            request_id=request_id,
         )
+    return None
+
+
+def _openai_error_detail(error: Exception) -> str:
+    body = getattr(error, "body", None)
+    if isinstance(body, Mapping):
+        nested = body.get("error")
+        if isinstance(nested, Mapping):
+            return " ".join(
+                str(part)
+                for part in (nested.get("code"), nested.get("type"), nested.get("message"))
+                if part is not None
+            )
+    return ""
+
+
+def _is_quota_exceeded_error(detail: str) -> bool:
+    return any(pattern.search(detail) is not None for pattern in _QUOTA_ERROR_PATTERNS)
+
+
+def _is_context_window_exceeded_error(detail: str) -> bool:
+    return any(pattern.search(detail) is not None for pattern in _CONTEXT_ERROR_PATTERNS)
+
+
+def _response_headers(source: object) -> object:
+    response = getattr(source, "response", None)
+    return getattr(response, "headers", None)
+
+
+def _provider_retry_after_ms(error: Exception) -> int | None:
+    headers = _response_headers(error)
+    get = getattr(headers, "get", None)
+    if not callable(get):
+        return None
+    value = get("retry-after")
+    if not isinstance(value, str):
+        return None
+    if re.fullmatch(r"\d+", value.strip()) is not None:
+        delay_ms = int(value.strip()) * 1000
+        return delay_ms if delay_ms > 0 else None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed_delay_ms = (
+        parsed - datetime.now(timezone.utc)
+    ).total_seconds() * 1000
+    if parsed_delay_ms != parsed_delay_ms or parsed_delay_ms <= 0:
+        return None
+    return round(parsed_delay_ms)
+
+
+def _response_request_id(source: object) -> str | None:
+    headers = _response_headers(source)
+    get = getattr(headers, "get", None)
+    if not callable(get):
+        return None
+    for name in ("x-request-id", "x-deepseek-request-id"):
+        value = get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 

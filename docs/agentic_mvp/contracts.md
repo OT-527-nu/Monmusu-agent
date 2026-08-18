@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义新版 MVP 的规范性目标契约。截至 2026-08-16，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、五工具 COC 机械、六张生产角色卡、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放和真实恢复合同证据。统一 `CocTool` 生命周期、各工具生成的统一 `PublicMechanic` 投影、以及按未完成回合冻结 profile 恢复均已交付；Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。已有完整会话的继续入口、完整短篇、模型评估矩阵和默认入口切换仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
+本文定义新版 MVP 的规范性目标契约。截至 2026-08-17，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、五工具 COC 机械、六张生产角色卡、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放、真实恢复合同证据和 provider 有界重试。统一 `CocTool` 生命周期、各工具生成的统一 `PublicMechanic` 投影、按未完成回合冻结 profile 恢复，以及 `model_profile.retry_policy` 与 `IncompleteTurn.provider_retry` 均已交付。已有完整会话的继续入口、完整短篇、模型评估矩阵和默认入口切换仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
 
 ## 契约原则
 
@@ -638,7 +638,24 @@ indefinite_insanity_threshold_crossed = (
       "spend_luck",
       "deal_damage",
       "make_sanity_check"
-    ]
+    ],
+    "retry_policy": {
+      "mode": "normal",
+      "max_retries": 2,
+      "retryable_codes": [
+        "provider_empty_response",
+        "provider_network_error",
+        "provider_rate_limited",
+        "provider_server_error",
+        "request_timeout"
+      ],
+      "backoff": {
+        "initial_delay_ms": 500,
+        "max_delay_ms": 10000,
+        "jitter_ratio": 0.1
+      }
+    },
+    "base_url": "https://api.deepseek.com"
   },
   "attempt_limits": {
     "max_round_trips": 8,
@@ -650,6 +667,11 @@ indefinite_insanity_threshold_crossed = (
   "tool_interactions": [],
   "deepseek_messages": [],
   "provider_protocol_errors": [],
+  "provider_retry": {
+    "retries_used": 0,
+    "total_retries": 0,
+    "last_retry": null
+  },
   "last_failure": null
 }
 ```
@@ -676,6 +698,21 @@ indefinite_insanity_threshold_crossed = (
 }
 ```
 
+`provider_retry` 记录当前请求链的重试状态。`retries_used` 在每次成功收到 `ModelResponse` 后归零，`total_retries` 只增不减；`last_retry` 只在 sleep 前写入一次已调度重试：
+
+```json
+{
+  "code": "request_timeout",
+  "message": "DeepSeek request timed out",
+  "delay_ms": 500,
+  "scheduled_at": "2026-08-17T10:06:02Z",
+  "status": null,
+  "request_id": null
+}
+```
+
+该对象仅供恢复与诊断，不进入玩家输出。
+
 约束：
 
 - Harness 接受玩家输入并分配 `turn_id` 后立即保存未完成回合。
@@ -683,6 +720,8 @@ indefinite_insanity_threshold_crossed = (
 - `model_profile` 保存恢复该 provider 对话所需的全部非秘密、行为相关配置。新回合默认冻结五个 COC 工具；恢复必须使用该未完成回合自己的模型、thinking 模式、Prompt 修订、工具 schema 版本和 `enabled_tools`，不要求等于当前新回合默认 profile。Harness 以完整注册表逐项验证冻结工具子集仍受 `coc-tools-agentic-mvp-1` 支持；若版本、工具实现不可用或 profile 损坏，明确拒绝恢复，不能静默换配置。API key 永不保存。
 - `attempt_limits` 描述当前执行尝试。玩家恢复会增加 `attempt_number` 并重置计数与 deadline，但默认继续使用相同的冻结限额；显式开发配置变更必须记录为新的尝试配置。
 - `round_trips_used` 与 `structure_repairs_used` 在新执行尝试中重置；`total_round_trips` 与 `total_structure_repairs` 只增不减，用于恢复与费用诊断。
+- 失败的 provider 请求不增加 `round_trips_used`；重试次数由冻结的 `model_profile.retry_policy.max_retries` 单独限制，且每次重试 sleep 与下一次请求都必须落在 `attempt_timeout_seconds` 剩余预算内。
+- 重试耗尽后保留最后一次 provider 错误码；只有 deadline 耗尽时转 `attempt_timeout`。`provider_retry` 落盘失败时以 `retry_state_persistence_failed` 中断。
 - 每次成功机械调用都会把机械记录、相关角色数值、`ToolInteraction`、assistant tool-call 消息和对应 tool result 消息在同一次完整聚合原子替换中写盘，再把结果交给 GM 和 CLI。
 - `deepseek_messages` 是恢复 DeepSeek Chat Completions 协议所需的可回放消息前缀；无法配对的 assistant 响应不加入该前缀，而是以 `provider_protocol_errors[].model_response_json` 的可序列化原始 provider envelope 保存在受限恢复状态中，并在 `last_failure` 记录 `provider_protocol_error`。显式恢复只把 `deepseek_messages` 前缀发送给同一冻结 provider 配置，不回放该原始 envelope，也不伪造 `ToolInteraction` 或 tool 消息。thinking 模式的 `reasoning_content` 必须原样保存和回传，但永不进入玩家记录或事实。
 - 成功提交最终答复时，Harness 将该对象转换为 `CommittedTurn`、更新事实账本与会话状态，并在同一次原子写入中把 `incomplete_turn` 设为 `null`。
@@ -732,7 +771,7 @@ MVP 不提供摘要、RAG、Memory Agent、场景投影或模组权限目录。A
 
 `tool_calls` 长度为 1 且 ID 可用于协议关联时进入单工具分支；单个调用缺失或不可用 ID 时只把序列化原始 envelope 写入受限 `provider_protocol_errors`，不创建 `ToolInteraction` 或 tool 消息。长度大于 1 时保留消息并按[工具调用统一外壳](#工具调用统一外壳)为每个可用且唯一 ID 形成协议错误；任一 ID 缺失、不可用或重复时只保存原始协议事件并保持最后一个可回放消息前缀。长度为 0 且 `content` 非空时进入最终答复分支；其他形状是稳定 provider 协议错误。正常 DeepSeek 请求同时提供当前 function tools 与 JSON Object response format。
 
-鉴权、限流、网络、请求超时和无法形成 assistant 消息的 SDK 响应不伪装成 `ModelResponse`。adapter 通过稳定 `ModelCallError(code, message, retryable)` 错误模式返回，Harness 将其映射到 `IncompleteTurn.last_failure` 并中断本次尝试；已经收到且可以序列化的异常 assistant 消息则仍作为 `ModelResponse` 交给 Harness 做协议分类。
+鉴权、限流、网络、请求超时和无法形成 assistant 消息的 SDK 响应不伪装成 `ModelResponse`。adapter 通过稳定 `ModelCallError(code, message, retryable, status, provider_retry_after_ms, request_id)` 错误模式返回；Harness 按 `model_profile.retry_policy` 做有界重试，重试耗尽后把最后一次错误映射到 `IncompleteTurn.last_failure` 并中断本次尝试。正常结束但没有可回放内容的响应归类为可重试的 `provider_empty_response`。已经收到且可以序列化的异常 assistant 消息则仍作为 `ModelResponse` 交给 Harness 做协议分类。
 
 - 生产 adapter：`DeepSeekGameMasterModel`，使用 OpenAI Python SDK Chat Completions 与 `base_url="https://api.deepseek.com"`。
 - 测试 adapter：可编程假模型，用于稳定制造工具调用、超时、非法结构和恢复路径。
@@ -750,7 +789,23 @@ MVP 不提供摘要、RAG、Memory Agent、场景投影或模组权限目录。A
   "stream": false,
   "max_round_trips": 8,
   "request_timeout_seconds": 60,
-  "attempt_timeout_seconds": 180
+  "attempt_timeout_seconds": 180,
+  "retry_policy": {
+    "mode": "normal",
+    "max_retries": 2,
+    "retryable_codes": [
+      "provider_empty_response",
+      "provider_network_error",
+      "provider_rate_limited",
+      "provider_server_error",
+      "request_timeout"
+    ],
+    "backoff": {
+      "initial_delay_ms": 500,
+      "max_delay_ms": 10000,
+      "jitter_ratio": 0.1
+    }
+  }
 }
 ```
 
@@ -760,6 +815,7 @@ MVP 不提供摘要、RAG、Memory Agent、场景投影或模组权限目录。A
 - `tool_schema_version` 保持 `coc-tools-agentic-mvp-1`；版本对应的完整工具注册表不得因 profile 只暴露子集而删除已发布验证器。
 - 八次往返包含初始响应、工具结果后的继续响应、协议修正与最终结构修正；本地工具执行不计入。
 - 每次执行尝试拥有独立的 `request_timeout_seconds=60` 请求上限和 `attempt_timeout_seconds=180` 总时限。
+- `retry_policy` 由 `deepseek_model_profile` 解析后冻结；`mode` 当前只支持 `normal`，默认 `max_retries=2`。可重试 code 只接受 `provider_rate_limited`、`provider_server_error`、`provider_network_error`、`request_timeout`、`provider_empty_response`。
 - API key 由项目所有者选择的外部机制注入 adapter，不属于该配置 schema，也不得持久化或输出。
 
 ## CLI 回合结果

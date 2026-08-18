@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from unittest.mock import patch
 
+import monmusu_agent.agentic_harness as agentic_harness_module
 from monmusu_agent.agentic_coc import (
     MakeCheckError,
     MakeCheckTool,
@@ -35,6 +37,22 @@ from monmusu_agent.agentic_session import (
     NewSessionRequest,
 )
 from monmusu_agent.storage import read_json, write_json_atomic
+
+_ZERO_RETRY_POLICY = {
+    "mode": "normal",
+    "max_retries": 0,
+}
+_real_deepseek_model_profile = deepseek_model_profile
+
+
+def zero_retry_profile(**kwargs: Any) -> dict[str, Any]:
+    """构造默认关闭重试的测试 profile，保留既有终端错误语义。"""
+
+    kwargs.setdefault("retry_policy", _ZERO_RETRY_POLICY)
+    return _real_deepseek_model_profile(**kwargs)
+
+
+deepseek_model_profile = zero_retry_profile  # type: ignore[assignment]
 
 
 class ScriptedRandom:
@@ -474,6 +492,15 @@ class MutatingPersistenceValidatorTool(LifecycleTestTool):
 
 
 class AgenticHarnessTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._default_profile_patcher = patch.object(
+            agentic_harness_module,
+            "deepseek_model_profile",
+            zero_retry_profile,
+        )
+        self._default_profile_patcher.start()
+        self.addCleanup(self._default_profile_patcher.stop)
+
     @staticmethod
     def _lifecycle_profile() -> dict[str, Any]:
         profile = deepseek_model_profile()

@@ -97,6 +97,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
         constructor.assert_called_once_with(
             api_key="sk-constructor-secret",
             base_url="https://api.deepseek.com",
+            max_retries=0,
         )
 
     def test_complete_converts_one_request_and_preserves_response_envelope(
@@ -528,7 +529,7 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
                     response=httpx.Response(400, request=sdk_request),
                     body={"private": "unmapped provider diagnostic"},
                 ),
-                "provider_error",
+                "provider_bad_request",
                 False,
             ),
         )
@@ -607,8 +608,8 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
         with self.assertRaises(ModelCallError) as caught:
             model.complete(request)
 
-        self.assertEqual(caught.exception.code, "provider_response_error")
-        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.code, "provider_empty_response")
+        self.assertTrue(caught.exception.retryable)
         self.assertNotIn("secret-response-key", str(caught.exception))
 
     def test_real_adapter_class_commits_direct_final_through_harness(
@@ -1979,6 +1980,63 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
         self.assertEqual(
             duplicate_record["hard_gates"]["mechanical_truth"]["status"],
             "failed",
+        )
+
+
+    def test_retry_contract_recovers_through_real_adapter_boundary(self) -> None:
+        """注入一次可重试 provider 错误后，契约通过真实 adapter 边界恢复并提交。"""
+
+        from monmusu_agent.agentic_contract import run_deepseek_retry_contract
+
+        final = {
+            "narration": "你拿起铜钥匙。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=Dumpable(
+                        {
+                            "role": "assistant",
+                            "content": json.dumps(final, ensure_ascii=False),
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                        }
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+        completions = RecordingCompletions(response)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_deepseek_retry_contract(
+                enabled=True,
+                api_key="sk-retry-observation-test",
+                session_root=Path(directory) / "sessions",
+                client=client,
+                retry_sleep=lambda seconds: None,
+            )
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(len(completions.requests), 1)
+        observed = result.records[0]
+        self.assertEqual(observed["request_attempts"], 2)
+        self.assertEqual(observed["sdk_requests"], 1)
+        self.assertEqual(
+            observed["first_attempt_local_error_category"],
+            "provider_server_error",
+        )
+        self.assertEqual(observed["second_attempt_finish_reason"], "stop")
+        self.assertEqual(
+            observed["first_scheduled_retry"],
+            {"code": "provider_server_error", "delay_ms": 1000, "status": 503},
         )
 
 

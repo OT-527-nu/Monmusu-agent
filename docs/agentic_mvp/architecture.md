@@ -91,7 +91,7 @@ Agent Harness 是运行时的主要深模块。它把复杂的上下文、模型
 - 在 COC 工具成功后，把机械记录、角色数值变化、`ToolInteraction` 和 assistant/tool 协议消息一次原子持久化，再由实际工具选择允许公开的字段并向 CLI 发布统一 `PublicMechanic` 投影。
 - 本地解析和校验 GM 最终答复；只校验结构、引用和可原子写入性，不审批虚构内容。
 - 将 `narration`、`establish`、`retire`、`session_status` 与回合记录作为一个最终提交写入，并刷新事实索引。
-- 维护每次执行尝试的 8 次模型往返、60 秒单请求时限、180 秒执行尝试时限和一次最终结构修正。
+- 维护每次执行尝试的 8 次模型往返、60 秒单请求时限、180 秒执行尝试时限和一次最终结构修正，并按冻结的 `retry_policy` 对可重试 provider 错误做有界重试。
 - 保存未完成回合及冻结的 `model_profile` / `attempt_limits`，恢复 provider 对话和既有工具交互，并保证已提交机械不被重放。新回合默认暴露五个 COC 工具；恢复回合使用自己的冻结 profile，只要求其版本与工具子集仍被完整注册表支持，不要求它等于新回合默认 profile。冻结 profile 不可用或损坏时拒绝恢复，不静默换配置。
 - 记录用量、延迟、错误和累计恢复次数等诊断数据，同时从玩家视图和正典记录中隔离这些信息。
 
@@ -126,7 +126,11 @@ GM Agent Loop 是 Harness 内部唯一由 LLM 驱动的循环，不是由多个�
 DeepSeek adapter 使用 OpenAI Python SDK：
 
 ```python
-OpenAI(api_key=deepseek_api_key, base_url="https://api.deepseek.com")
+OpenAI(
+    api_key=deepseek_api_key,
+    base_url="https://api.deepseek.com",
+    max_retries=0,
+)
 ```
 
 它调用 `client.chat.completions.create(...)`，不使用 OpenAI Responses API。模型 ID、thinking 模式和 API key 由组合入口显式传入；adapter 不决定凭据来自哪里，也不把 key 写入日志或存档。
@@ -137,7 +141,7 @@ Adapter 负责：
 - 在正常请求中同时提供当前 function tools 与 JSON Object response format，并按 `tool_calls` 或最终 content 分支解析响应。
 - 保留 assistant `tool_calls`、对应 `tool_call_id` 和 tool result 的协议关联。
 - 把 DeepSeek 响应解析为保留完整 assistant 消息的 `ModelResponse`；Harness 决定单工具、最终 JSON、多个工具或协议错误分支。
-- 鉴权、限流、网络、请求超时和无法形成 assistant 消息的 SDK 响应以稳定 `ModelCallError` 返回，不伪装成模型答复；Harness 将其写入 `last_failure` 并执行中断/恢复语义。
+- 鉴权、限流、网络、请求超时和无法形成 assistant 消息的 SDK 响应以稳定 `ModelCallError(code, message, retryable, status, provider_retry_after_ms, request_id)` 返回，不伪装成模型答复；正常完成但无内容则归类为 `provider_empty_response`。Harness 按冻结策略重试可重试错误，重试耗尽后写入 `last_failure` 并执行中断/恢复语义。SDK 自身重试固定关闭，避免与 Harness 预算叠加。
 - 在 thinking 模式下原样保存并回传 provider 要求的 `reasoning_content`。
 - 对多个 `tool_calls` 保留完整原始 assistant 响应供 Harness 分类；只有所有 `tool_call_id` 都存在且互不重复时，Harness 才为每个 ID 形成对应的 `multiple_tool_calls_not_allowed` tool error。ID 缺失或重复时只保存原始响应和 provider 协议错误，不生成可回放的 assistant/tool 对。
 - 返回 usage、延迟和 provider 错误供 Harness 记录。
@@ -231,6 +235,7 @@ COC 规则工具是 Harness 内部的深模块，对 GM 暴露少量高层语义
 
 - 一次执行尝试最多收到 8 次模型响应；初始响应、工具结果后的响应、协议纠错响应和最终结构修正响应都计入。
 - 单次 DeepSeek 请求默认最多等待 `request_timeout_seconds=60`；一次执行尝试默认最多 `attempt_timeout_seconds=180`。恢复是同一 `turn_id` 的新执行尝试，重新获得这些运行预算。
+- 可重试 provider 错误由 Harness 按 `model_profile.retry_policy` 自动重试；失败请求不消耗 8 次往返额度，重试等待和下一次请求仍受 180 秒预算约束。
 - 一个模型响应若包含多个 `tool_calls`，Harness 一个也不执行；仅当所有 `tool_call_id` 都存在且互不重复时，才保留可回放的 assistant 消息并为每个 ID 追加 `multiple_tool_calls_not_allowed` tool error。ID 缺失或重复时只保存原始响应和 provider 协议错误，不生成 assistant/tool 对；该响应仍计入往返预算。
 - 每次执行尝试最多自动修正一次无效最终结构。玩家显式恢复开启新尝试，因此可以再次获得一次结构修正机会。
 - 任何 provider 故障、时限、往返超限或最终校验失败都不触发 Harness 创作兜底叙事。
