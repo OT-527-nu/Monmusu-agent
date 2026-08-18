@@ -71,6 +71,20 @@ class ProviderConfigError(ValueError):
     """表示用户提供的 provider 运行配置无效。"""
 
 
+class CliPlayerInterrupt(Exception):
+    """表示玩家在会话流程中以 Ctrl+C 请求的优雅退出。
+
+    捕获 seam 已按存档真实状态打印提示；main 将其收敛为退出码 130。
+    """
+
+
+_EXIT_BEFORE_GAME_MESSAGE = "已退出。"
+_EXIT_SAVED_SESSION_MESSAGE = "已退出；本局已提交回合均已保存。"
+_EXIT_INTERRUPTED_TURN_MESSAGE = (
+    "已退出；未完成回合已保留，下次启动选择恢复即可继续。"
+)
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     """保存一次 CLI 启动所需的非秘密 provider 运行配置。"""
@@ -447,31 +461,35 @@ def run_new_session_cli(
     """收集建局资料，展示已冻结开场，并返回首条自由文本。"""
 
     read_line = _wrap_read_line(read_line)
-    choices = store.available_investigators()
-    write_line("选择调查员：")
-    for index, choice in enumerate(choices, start=1):
-        write_line(
-            f"{index}. {choice.label}（建议姓名：{choice.suggested_display_name}）"
+    try:
+        choices = store.available_investigators()
+        write_line("选择调查员：")
+        for index, choice in enumerate(choices, start=1):
+            write_line(
+                f"{index}. {choice.label}（建议姓名：{choice.suggested_display_name}）"
+            )
+        selected = _read_choice(choices, read_line, write_line)
+        display_name = read_line(
+            f"显示姓名（默认 {selected.suggested_display_name}）："
+        ).strip()
+        request = NewSessionRequest(
+            investigator_id=selected.actor_id,
+            display_name=display_name or selected.suggested_display_name,
+            honorific=_optional_answer(read_line("称谓（可留空）：")),
+            pronouns=_optional_answer(read_line("代词（可留空）：")),
+            occupation=_optional_answer(read_line("职业表述（可留空）：")),
+            appearance=_optional_answer(read_line("外观（可留空）：")),
+            background_hook=_optional_answer(read_line("背景钩子（可留空）：")),
+            keepsake=_optional_answer(read_line("随身小物（可留空）：")),
         )
-    selected = _read_choice(choices, read_line, write_line)
-    display_name = read_line(
-        f"显示姓名（默认 {selected.suggested_display_name}）："
-    ).strip()
-    request = NewSessionRequest(
-        investigator_id=selected.actor_id,
-        display_name=display_name or selected.suggested_display_name,
-        honorific=_optional_answer(read_line("称谓（可留空）：")),
-        pronouns=_optional_answer(read_line("代词（可留空）：")),
-        occupation=_optional_answer(read_line("职业表述（可留空）：")),
-        appearance=_optional_answer(read_line("外观（可留空）：")),
-        background_hook=_optional_answer(read_line("背景钩子（可留空）：")),
-        keepsake=_optional_answer(read_line("随身小物（可留空）：")),
-    )
-    created = store.create_session(request)
+        created = store.create_session(request)
 
-    # 只有目录事务完成并返回后，玩家才会看到可成为正典的开场文本。
-    write_line(created.opening_narration)
-    first_action = _read_first_action(read_line, write_line)
+        # 只有目录事务完成并返回后，玩家才会看到可成为正典的开场文本。
+        write_line(created.opening_narration)
+        first_action = _read_first_action(read_line, write_line)
+    except KeyboardInterrupt:
+        write_line(_EXIT_BEFORE_GAME_MESSAGE)
+        raise CliPlayerInterrupt from None
     return NewSessionCliResult(created=created, first_action=first_action)
 
 
@@ -582,6 +600,9 @@ def _run_session_cli(
                 )
                 show_recovery_state = False
                 continue
+            except KeyboardInterrupt:
+                write_line(_interrupt_exit_message(harness, game_id))
+                raise CliPlayerInterrupt from None
             _write_turn_result(result, write_line)
             last_result = result
             show_recovery_state = False
@@ -590,13 +611,21 @@ def _run_session_cli(
         if lifecycle.technical_status == "complete":
             return last_result
         if player_input is None:
-            player_input = _read_first_action(read_line, write_line)
-        result = run_turn_cli(
-            harness,
-            game_id,
-            player_input,
-            write_line=write_line,
-        )
+            try:
+                player_input = _read_first_action(read_line, write_line)
+            except KeyboardInterrupt:
+                write_line(_EXIT_SAVED_SESSION_MESSAGE)
+                raise CliPlayerInterrupt from None
+        try:
+            result = run_turn_cli(
+                harness,
+                game_id,
+                player_input,
+                write_line=write_line,
+            )
+        except KeyboardInterrupt:
+            write_line(_interrupt_exit_message(harness, game_id))
+            raise CliPlayerInterrupt from None
         last_result = result
         player_input = None
         show_recovery_state = False
@@ -672,12 +701,31 @@ def _read_recovery_choice(
         write_line("只能输入“恢复”或“退出”。")
 
 
+def _interrupt_exit_message(
+    harness: AgenticHarness,
+    game_id: str,
+) -> str:
+    """按存档真实状态给出中断退出提示，不承诺任何未保存的进度。"""
+
+    try:
+        lifecycle = harness.get_session_state(game_id)
+    except Exception:
+        return _EXIT_BEFORE_GAME_MESSAGE
+    if lifecycle.has_incomplete_turn:
+        return _EXIT_INTERRUPTED_TURN_MESSAGE
+    return _EXIT_SAVED_SESSION_MESSAGE
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """配置终端后，从外部运行配置组合 DeepSeek 并运行连续 GM 回合。"""
 
     restore_terminal = _configure_terminal_input()
     try:
         return _run_main(argv)
+    except KeyboardInterrupt:
+        # 兜底：_run_main 未覆盖的启动窗口（终端配置、env 装载等）。
+        print(_EXIT_BEFORE_GAME_MESSAGE)
+        return 130
     finally:
         restore_terminal()
 
@@ -778,6 +826,12 @@ def _run_main(argv: Sequence[str] | None = None) -> int:
     except CliInputEncodingError as error:
         print(f"输入错误：{error}")
         return 2
+    except CliPlayerInterrupt:
+        return 130
+    except KeyboardInterrupt:
+        # 兜底：落在未被 seam 捕获的窗口（会话读取、目录发布等）。
+        print(_EXIT_BEFORE_GAME_MESSAGE)
+        return 130
     return 0
 
 

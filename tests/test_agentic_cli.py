@@ -15,6 +15,7 @@ from unittest.mock import patch
 from monmusu_agent.agent import GameMasterAgent
 from monmusu_agent.agentic_cli import (
     CliInputEncodingError,
+    CliPlayerInterrupt,
     main,
     run_agentic_cli,
     run_game_cli,
@@ -1497,6 +1498,238 @@ class AgenticCliTest(unittest.TestCase):
             self.assertNotIn(secret_text, rendered)
             self.assertNotIn("隐藏推理材料", rendered)
             self.assertNotIn("骰点", rendered)
+
+    def test_game_cli_interrupt_during_turn_preserves_incomplete_turn(
+        self,
+    ) -> None:
+        """回合执行中 Ctrl+C 优雅退出，未完成回合保留且重启可发现。"""
+
+        class InterruptModel(GameMasterModel):
+            def __init__(self) -> None:
+                self.requests = 0
+
+            def complete(self, request: ModelRequest) -> ModelResponse:
+                self.requests += 1
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_interrupt_turn",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            model = InterruptModel()
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_interrupted",
+                model_profile=zero_retry_profile(),
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            )
+            output: list[str] = []
+
+            def read_line(prompt: str) -> str:
+                raise AssertionError("回合执行中不应读取新行动")
+
+            with self.assertRaises(CliPlayerInterrupt):
+                run_game_cli(
+                    harness,
+                    created.game_id,
+                    "我检查门锁。",
+                    read_line=read_line,
+                    write_line=output.append,
+                )
+
+            saved = store.load_session(created.game_id).session
+            self.assertEqual(model.requests, 1)
+            self.assertEqual(saved["turns"], [])
+            self.assertIsNotNone(saved["incomplete_turn"])
+            self.assertEqual(
+                saved["incomplete_turn"]["turn_id"],
+                "turn_interrupted",
+            )
+            self.assertEqual(
+                saved["incomplete_turn"]["player_input"],
+                "我检查门锁。",
+            )
+            self.assertEqual(
+                store.find_incomplete_session_ids(),
+                ("game_interrupt_turn",),
+            )
+            self.assertEqual(
+                output,
+                ["已退出；未完成回合已保留，下次启动选择恢复即可继续。"],
+            )
+
+    def test_game_cli_interrupt_at_input_preserves_committed_turns(
+        self,
+    ) -> None:
+        """回合之间的输入处 Ctrl+C 优雅退出，已提交回合保持完整。"""
+
+        final_response = ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": "墙后传来潮湿的回声。",
+                        "establish": [],
+                        "retire": [],
+                        "session_status": "ongoing",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": None,
+                "tool_calls": [],
+            },
+            finish_reason="stop",
+            usage=None,
+            latency_ms=10,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_interrupt_input",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(
+                NewSessionRequest(
+                    investigator_id="investigator_tracker",
+                    display_name="林雁",
+                )
+            )
+            model = ScriptedGameMasterModel([final_response])
+            harness = AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_committed",
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            )
+            prompts: list[str] = []
+            output: list[str] = []
+
+            def read_line(prompt: str) -> str:
+                prompts.append(prompt)
+                raise KeyboardInterrupt
+
+            with self.assertRaises(CliPlayerInterrupt):
+                run_game_cli(
+                    harness,
+                    created.game_id,
+                    "我敲探排水沟。",
+                    read_line=read_line,
+                    write_line=output.append,
+                )
+
+            saved = store.load_session(created.game_id).session
+            self.assertEqual(len(model.requests), 1)
+            self.assertEqual(prompts, ["你的行动："])
+            self.assertEqual(len(saved["turns"]), 1)
+            self.assertEqual(
+                saved["turns"][0]["player_input"],
+                "我敲探排水沟。",
+            )
+            self.assertIsNone(saved["incomplete_turn"])
+            self.assertEqual(saved["session_status"], "ongoing")
+            self.assertEqual(store.find_incomplete_session_ids(), ())
+            self.assertEqual(
+                output,
+                [
+                    "墙后传来潮湿的回声。",
+                    "已退出；本局已提交回合均已保存。",
+                ],
+            )
+
+    def test_new_session_cli_interrupt_creates_no_session_and_no_model_calls(
+        self,
+    ) -> None:
+        """建局问答中 Ctrl+C 优雅退出，不创建会话、不调用模型。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_never_created",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            prompts: list[str] = []
+            output: list[str] = []
+
+            def read_line(prompt: str) -> str:
+                prompts.append(prompt)
+                raise KeyboardInterrupt
+
+            with self.assertRaises(CliPlayerInterrupt):
+                run_new_session_cli(
+                    store,
+                    read_line=read_line,
+                    write_line=output.append,
+                )
+
+            self.assertEqual(prompts, ["请选择调查员编号："])
+            self.assertFalse((Path(directory) / "sessions").exists())
+            self.assertEqual(output[0], "选择调查员：")
+            self.assertEqual(output[-1], "已退出。")
+            self.assertNotIn("Traceback", "\n".join(output))
+
+    def test_main_returns_130_for_player_interrupt(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MONMUSU_PROVIDER": "deepseek",
+                    "DEEPSEEK_API_KEY": "sk-cli-secret-fragment",
+                    "MONMUSU_DEEPSEEK_MODEL_ID": "deepseek-v4-flash",
+                    "MONMUSU_DEEPSEEK_THINKING": "false",
+                },
+                clear=True,
+            ),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
+            patch("monmusu_agent.agentic_cli.AgenticSessionStore"),
+            patch("monmusu_agent.agentic_cli.compose_deepseek_harness"),
+            patch(
+                "monmusu_agent.agentic_cli.run_agentic_cli",
+                side_effect=CliPlayerInterrupt,
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main([]), 130)
+
+        self.assertEqual(output.getvalue(), "模型提供商：DeepSeek 官方\n")
+
+    def test_main_returns_130_for_uncaught_keyboard_interrupt(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MONMUSU_PROVIDER": "deepseek",
+                    "DEEPSEEK_API_KEY": "sk-cli-secret-fragment",
+                    "MONMUSU_DEEPSEEK_MODEL_ID": "deepseek-v4-flash",
+                    "MONMUSU_DEEPSEEK_THINKING": "false",
+                },
+                clear=True,
+            ),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
+            patch("monmusu_agent.agentic_cli.AgenticSessionStore"),
+            patch("monmusu_agent.agentic_cli.compose_deepseek_harness"),
+            patch(
+                "monmusu_agent.agentic_cli.run_agentic_cli",
+                side_effect=KeyboardInterrupt,
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main([]), 130)
+
+        self.assertEqual(
+            output.getvalue(),
+            "模型提供商：DeepSeek 官方\n已退出。\n",
+        )
 
 
 if __name__ == "__main__":
