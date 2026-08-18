@@ -1983,5 +1983,62 @@ class DeepSeekContractRunnerTest(unittest.TestCase):
         )
 
 
+    def test_retry_contract_recovers_through_real_adapter_boundary(self) -> None:
+        """注入一次可重试 provider 错误后，契约通过真实 adapter 边界恢复并提交。"""
+
+        from monmusu_agent.agentic_contract import run_deepseek_retry_contract
+
+        final = {
+            "narration": "你拿起铜钥匙。",
+            "establish": [],
+            "retire": [],
+            "session_status": "ongoing",
+        }
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=Dumpable(
+                        {
+                            "role": "assistant",
+                            "content": json.dumps(final, ensure_ascii=False),
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                        }
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+        completions = RecordingCompletions(response)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_deepseek_retry_contract(
+                enabled=True,
+                api_key="sk-retry-observation-test",
+                session_root=Path(directory) / "sessions",
+                client=client,
+                retry_sleep=lambda seconds: None,
+            )
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(len(completions.requests), 1)
+        observed = result.records[0]
+        self.assertEqual(observed["request_attempts"], 2)
+        self.assertEqual(observed["sdk_requests"], 1)
+        self.assertEqual(
+            observed["first_attempt_local_error_category"],
+            "provider_server_error",
+        )
+        self.assertEqual(observed["second_attempt_finish_reason"], "stop")
+        self.assertEqual(
+            observed["first_scheduled_retry"],
+            {"code": "provider_server_error", "delay_ms": 1000, "status": 503},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
