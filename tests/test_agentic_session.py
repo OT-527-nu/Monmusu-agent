@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from dataclasses import fields
@@ -5,7 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from monmusu_agent.agentic_harness import AgenticHarness
-from monmusu_agent.agentic_model import ModelCallError, ScriptedGameMasterModel
+from monmusu_agent.agentic_model import (
+    ModelCallError,
+    ModelResponse,
+    ScriptedGameMasterModel,
+)
 from monmusu_agent.agentic_session import (
     AgenticSessionLoadError,
     AgenticSessionPublishError,
@@ -13,6 +18,7 @@ from monmusu_agent.agentic_session import (
     AgenticSessionSources,
     AgenticSessionStore,
     NewSessionRequest,
+    SessionCatalogIssue,
 )
 from monmusu_agent.storage import read_json, write_json_atomic
 
@@ -417,6 +423,9 @@ class AgenticSessionStoreTest(unittest.TestCase):
                 turn_id_factory=lambda: "turn_interrupted",
                 clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
             ).start_turn(interrupted.game_id, "我检查门锁。")
+            corrupt = Path(directory) / "sessions" / "game_corrupt"
+            corrupt.mkdir()
+            (corrupt / "session.json").write_text("{}", encoding="utf-8")
             ready_bytes = ready.session_file.read_bytes()
             interrupted_bytes = interrupted.session_file.read_bytes()
 
@@ -425,6 +434,160 @@ class AgenticSessionStoreTest(unittest.TestCase):
             self.assertEqual(found, ("game_interrupted",))
             self.assertEqual(ready.session_file.read_bytes(), ready_bytes)
             self.assertEqual(interrupted.session_file.read_bytes(), interrupted_bytes)
+
+    def test_list_session_catalog_projects_valid_sessions_in_updated_order(
+        self,
+    ) -> None:
+        """目录投影只暴露安全摘要，并按更新时间稳定排序。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions"
+            game_ids = iter(("game_ongoing", "game_incomplete", "game_complete"))
+            store = AgenticSessionStore(
+                session_root=root,
+                game_id_factory=game_ids.__next__,
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            empty_catalog = store.list_session_catalog()
+            self.assertEqual(empty_catalog.sessions, ())
+            self.assertEqual(empty_catalog.issues, ())
+            ongoing = store.create_session(self._request())
+            incomplete = store.create_session(self._request())
+            complete = store.create_session(self._request())
+
+            incomplete_model = ScriptedGameMasterModel(
+                [ModelCallError("request_timeout", "private", retryable=True)]
+            )
+            AgenticHarness(
+                store,
+                incomplete_model,
+                turn_id_factory=lambda: "turn_incomplete",
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            ).start_turn(incomplete.game_id, "我检查门锁。")
+            complete_model = ScriptedGameMasterModel(
+                [
+                    ModelResponse(
+                        assistant_message={
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "narration": "门开了。",
+                                    "establish": [],
+                                    "retire": [],
+                                    "session_status": "complete",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            "reasoning_content": None,
+                            "tool_calls": [],
+                        },
+                        finish_reason="stop",
+                        usage=None,
+                        latency_ms=1,
+                    )
+                ]
+            )
+            AgenticHarness(
+                store,
+                complete_model,
+                turn_id_factory=lambda: "turn_complete",
+                clock=lambda: datetime(2026, 8, 7, 0, 2, tzinfo=timezone.utc),
+            ).start_turn(complete.game_id, "我推开门。")
+
+            for game_id, updated_at in (
+                (ongoing.game_id, "2026-08-07T00:03:00Z"),
+                (incomplete.game_id, "2026-08-07T00:02:00Z"),
+                (complete.game_id, "2026-08-07T00:02:00Z"),
+            ):
+                session_file = root / game_id / "session.json"
+                session = json.loads(session_file.read_text(encoding="utf-8"))
+                session["updated_at"] = updated_at
+                write_json_atomic(session_file, session)
+
+            before = {
+                game_id: (root / game_id / "session.json").read_bytes()
+                for game_id in (
+                    ongoing.game_id,
+                    incomplete.game_id,
+                    complete.game_id,
+                )
+            }
+            model_request_counts = (
+                len(incomplete_model.requests),
+                len(complete_model.requests),
+            )
+
+            catalog = store.list_session_catalog()
+
+            self.assertEqual(
+                [entry.game_id for entry in catalog.sessions],
+                ["game_ongoing", "game_complete", "game_incomplete"],
+            )
+            self.assertEqual(
+                catalog.sessions[0].investigator_display_name,
+                "林雁",
+            )
+            self.assertEqual(catalog.sessions[0].session_status, "ongoing")
+            self.assertEqual(catalog.sessions[0].committed_turn_count, 0)
+            self.assertEqual(catalog.sessions[0].updated_at, "2026-08-07T00:03:00Z")
+            self.assertFalse(catalog.sessions[0].has_incomplete_turn)
+            self.assertEqual(catalog.sessions[1].session_status, "complete")
+            self.assertEqual(catalog.sessions[1].committed_turn_count, 1)
+            self.assertTrue(catalog.sessions[2].has_incomplete_turn)
+            self.assertEqual(catalog.sessions[2].committed_turn_count, 0)
+            self.assertEqual(catalog.issues, ())
+            self.assertEqual(
+                (
+                    len(incomplete_model.requests),
+                    len(complete_model.requests),
+                ),
+                model_request_counts,
+            )
+            self.assertEqual(
+                {
+                    game_id: (root / game_id / "session.json").read_bytes()
+                    for game_id in before
+                },
+                before,
+            )
+
+    def test_list_session_catalog_isolates_corrupt_entries_with_safe_issue(
+        self,
+    ) -> None:
+        """损坏条目只产生固定提示，不泄露路径、异常或 provider 内容。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions"
+            store = AgenticSessionStore(
+                session_root=root,
+                game_id_factory=lambda: "game_valid",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            valid = store.create_session(self._request())
+            corrupt = root / "game_corrupt"
+            corrupt.mkdir()
+            secret = "Authorization: Bearer provider-secret"
+            (corrupt / "session.json").write_text(
+                json.dumps({"provider_detail": secret}),
+                encoding="utf-8",
+            )
+            before = valid.session_file.read_bytes()
+
+            catalog = store.list_session_catalog()
+
+            self.assertEqual([entry.game_id for entry in catalog.sessions], [valid.game_id])
+            self.assertEqual(len(catalog.issues), 1)
+            self.assertIsInstance(catalog.issues[0], SessionCatalogIssue)
+            self.assertFalse(catalog.issues[0].selectable)
+            self.assertEqual(
+                catalog.issues[0].message,
+                "有一个 session 无法读取，已跳过。",
+            )
+            rendered = repr(catalog)
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(str(corrupt), rendered)
+            self.assertNotIn("Traceback", rendered)
+            self.assertEqual(valid.session_file.read_bytes(), before)
 
     def test_load_session_uses_read_only_snapshots_after_sources_change(self) -> None:
         """工作树材料变化后，会话仍只装载建局时冻结的全文。"""

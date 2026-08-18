@@ -12,7 +12,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping, cast
 from uuid import uuid4
 
 from monmusu_agent.agentic_coc import (
@@ -372,6 +372,35 @@ class LoadedSession:
     character_reference: str
 
 
+@dataclass(frozen=True)
+class SessionCatalogEntry:
+    """向玩家边界暴露一个已完整校验的 session 摘要。"""
+
+    game_id: str
+    investigator_display_name: str
+    session_status: Literal["ongoing", "complete"]
+    committed_turn_count: int
+    updated_at: str
+    has_incomplete_turn: bool
+    selectable: bool = True
+
+
+@dataclass(frozen=True)
+class SessionCatalogIssue:
+    """表示一个不可选择且不泄露内部原因的目录条目。"""
+
+    message: str = "有一个 session 无法读取，已跳过。"
+    selectable: bool = False
+
+
+@dataclass(frozen=True)
+class SessionCatalog:
+    """把可选择摘要与不可选择提示分开，避免暴露完整 session 聚合。"""
+
+    sessions: tuple[SessionCatalogEntry, ...]
+    issues: tuple[SessionCatalogIssue, ...]
+
+
 class AgenticSessionStore:
     """隐藏 Agentic 会话的静态装载、聚合构造与本地发布。"""
 
@@ -433,29 +462,86 @@ class AgenticSessionStore:
     def find_incomplete_session_ids(self) -> tuple[str, ...]:
         """返回经过完整装载校验的已发布未完成会话。"""
 
+        catalog = self.list_session_catalog()
+        return tuple(
+            entry.game_id
+            for entry in catalog.sessions
+            if entry.has_incomplete_turn
+        )
+
+    def list_session_catalog(self) -> SessionCatalog:
+        """逐个完整校验目录，并返回玩家安全的只读摘要。"""
+
+        sessions: list[SessionCatalogEntry] = []
+        issues: list[SessionCatalogIssue] = []
+        for session_directory in self._session_directories():
+            try:
+                game_id = self._validated_game_id(session_directory.name)
+                loaded = self._load_session_directory(session_directory, game_id)
+                session = loaded.session
+                profile = session.get("investigator_profile")
+                display_name = (
+                    profile.get("display_name")
+                    if isinstance(profile, dict)
+                    else None
+                )
+                status = session.get("session_status")
+                updated_at = session.get("updated_at")
+                turns = session.get("turns")
+                incomplete_turn = session.get("incomplete_turn")
+                if (
+                    not isinstance(display_name, str)
+                    or status not in {"ongoing", "complete"}
+                    or not isinstance(updated_at, str)
+                    or not isinstance(turns, list)
+                ):
+                    raise AgenticSessionLoadError("session 摘要字段无效")
+                sessions.append(
+                    SessionCatalogEntry(
+                        game_id=game_id,
+                        investigator_display_name=display_name,
+                        session_status=cast(
+                            Literal["ongoing", "complete"],
+                            status,
+                        ),
+                        committed_turn_count=len(turns),
+                        updated_at=updated_at,
+                        has_incomplete_turn=incomplete_turn is not None,
+                    )
+                )
+            except AgenticSessionError:
+                issues.append(SessionCatalogIssue())
+
+        sessions.sort(
+            key=lambda entry: (
+                -self._parse_catalog_timestamp(entry.updated_at).timestamp(),
+                entry.game_id,
+            )
+        )
+        return SessionCatalog(sessions=tuple(sessions), issues=tuple(issues))
+
+    def _session_directories(self) -> tuple[Path, ...]:
         if not self.session_root.exists():
             return ()
         try:
-            candidates = sorted(
-                (
-                    path
-                    for path in self.session_root.iterdir()
-                    if not path.name.startswith(".")
-                    and not path.is_symlink()
-                    and path.is_dir()
-                ),
-                key=lambda path: path.name,
+            return tuple(
+                sorted(
+                    (
+                        path
+                        for path in self.session_root.iterdir()
+                        if not path.name.startswith(".")
+                        and not path.is_symlink()
+                        and path.is_dir()
+                    ),
+                    key=lambda path: path.name,
+                )
             )
         except OSError as error:
             raise AgenticSessionLoadError("会话目录无法读取") from error
 
-        incomplete_ids: list[str] = []
-        for session_directory in candidates:
-            game_id = self._validated_game_id(session_directory.name)
-            loaded = self._load_session_directory(session_directory, game_id)
-            if loaded.session["incomplete_turn"] is not None:
-                incomplete_ids.append(game_id)
-        return tuple(incomplete_ids)
+    @staticmethod
+    def _parse_catalog_timestamp(value: str) -> datetime:
+        return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
     def create_session(self, request: NewSessionRequest) -> CreatedSession:
         """构造完整开场聚合，并发布到一个新的游戏目录。"""
