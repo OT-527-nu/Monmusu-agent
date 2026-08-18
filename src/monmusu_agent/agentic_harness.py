@@ -887,11 +887,14 @@ class AgenticHarness:
                     self.retry_random,
                 )
                 if delay_ms is None:
+                    code = self._safe_provider_failure_code(error.code)
+                    if self._remaining_seconds(attempt_deadline) <= 0:
+                        code = "attempt_timeout"
                     return self._interrupt(
                         loaded,
                         working,
                         turn_id,
-                        self._safe_provider_failure_code(error.code),
+                        code,
                         "GM 服务调用中断",
                         public_mechanics=public_mechanics,
                     )

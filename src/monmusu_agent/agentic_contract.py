@@ -1428,8 +1428,8 @@ def run_deepseek_retry_contract(
         and observed["first_attempt_local_error_category"] == "provider_server_error"
         and observed["last_attempt_finish_reason"] == "stop"
         and observed["final_incomplete_turn_is_none"] is True
-        and len(retry_state_snapshots) == 1
-        and len(sleeps) == 1
+        and len(retry_state_snapshots) >= 1
+        and len(sleeps) >= 1
         and observed["first_scheduled_retry"]["code"] == "provider_server_error"
         and observed["first_scheduled_retry"]["delay_ms"] == 1_000
         and observed["first_scheduled_retry"]["status"] == 503

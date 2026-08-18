@@ -1073,7 +1073,11 @@ class AgenticSessionStore:
             raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
         last_retry = provider_retry.get("last_retry")
         if last_retry is None:
+            if retries_used != 0:
+                raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
             return
+        if retries_used == 0:
+            raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
         if not isinstance(last_retry, dict) or set(last_retry) != _LAST_RETRY_FIELDS:
             raise AgenticSessionLoadError("IncompleteTurn.provider_retry 格式无效")
         cls._load_required_string(last_retry.get("code"), "last_retry.code")
