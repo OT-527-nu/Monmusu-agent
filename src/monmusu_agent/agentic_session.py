@@ -401,6 +401,29 @@ class SessionCatalog:
     issues: tuple[SessionCatalogIssue, ...]
 
 
+@dataclass(frozen=True)
+class SessionReviewFact:
+    """向玩家回顾页暴露一条当前有效的公开事实。"""
+
+    fact_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class SessionReview:
+    """向玩家边界暴露一份脱敏的 session 回顾。"""
+
+    game_id: str
+    investigator_display_name: str
+    session_status: Literal["ongoing", "complete"]
+    committed_turn_count: int
+    updated_at: str
+    has_incomplete_turn: bool
+    latest_narration: str | None
+    opening_narration: str
+    public_facts: tuple[SessionReviewFact, ...]
+
+
 class AgenticSessionStore:
     """隐藏 Agentic 会话的静态装载、聚合构造与本地发布。"""
 
@@ -543,6 +566,49 @@ class AgenticSessionStore:
     @staticmethod
     def _parse_catalog_timestamp(value: str) -> datetime:
         return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+
+    def get_session_review(self, game_id: str) -> SessionReview:
+        """装载并投影一份玩家安全回顾，不返回完整 session 聚合。"""
+
+        loaded = self.load_session(game_id)
+        session = loaded.session
+        profile = session["investigator_profile"]
+        turns = session["turns"]
+        facts = session["facts"]
+        assert isinstance(profile, dict)
+        assert isinstance(turns, list)
+        assert isinstance(facts, list)
+        latest_narration: str | None = None
+        if turns:
+            latest_turn = turns[-1]
+            assert isinstance(latest_turn, dict)
+            latest_narration = cast(str, latest_turn["narration"])
+        public_facts = tuple(
+            SessionReviewFact(
+                fact_id=cast(str, fact["fact_id"]),
+                text=cast(str, fact["text"]),
+            )
+            for fact in facts
+            if isinstance(fact, dict)
+            and fact.get("visibility") == "public"
+            and fact.get("status") == "active"
+        )
+        return SessionReview(
+            game_id=cast(str, session["game_id"]),
+            investigator_display_name=cast(str, profile["display_name"]),
+            session_status=cast(
+                Literal["ongoing", "complete"],
+                session["session_status"],
+            ),
+            committed_turn_count=len(turns),
+            updated_at=cast(str, session["updated_at"]),
+            has_incomplete_turn=session["incomplete_turn"] is not None,
+            latest_narration=latest_narration,
+            opening_narration=cast(dict[str, Any], session["setup"])[
+                "opening_narration"
+            ],
+            public_facts=public_facts,
+        )
 
     def create_session(self, request: NewSessionRequest) -> CreatedSession:
         """构造完整开场聚合，并发布到一个新的游戏目录。"""

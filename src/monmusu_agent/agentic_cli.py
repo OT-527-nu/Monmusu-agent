@@ -31,6 +31,9 @@ from monmusu_agent.agentic_session import (
     CreatedSession,
     InvestigatorChoice,
     NewSessionRequest,
+    SessionCatalog,
+    SessionCatalogEntry,
+    SessionReview,
 )
 from monmusu_agent.config import PROJECT_ROOT
 
@@ -417,39 +420,84 @@ def run_agentic_cli(
     read_line: Callable[[str], str] = input,
     write_line: Callable[[str], None] = print,
 ) -> TurnResult | None:
-    """优先门控未完成回合，否则进入现有新游戏流程。"""
-
-    incomplete_game_ids = store.find_incomplete_session_ids()
-    if not incomplete_game_ids:
-        new_session = run_new_session_cli(
-            store,
-            read_line=read_line,
-            write_line=write_line,
-        )
-        return run_game_cli(
-            harness,
-            new_session.created.game_id,
-            new_session.first_action,
-            read_line=read_line,
-            write_line=write_line,
-        )
-
     wrapped_read_line = _wrap_read_line(read_line)
-    game_id = _select_incomplete_session(
-        incomplete_game_ids,
-        wrapped_read_line,
-        write_line,
-    )
-    if game_id is None:
-        return None
-    return _run_session_cli(
-        harness,
-        game_id,
-        first_action=None,
-        show_initial_recovery=True,
-        read_line=read_line,
-        write_line=write_line,
-    )
+    while True:
+        catalog = store.list_session_catalog()
+        has_incomplete = any(
+            entry.has_incomplete_turn for entry in catalog.sessions
+        )
+        choice = _read_session_menu_choice(
+            has_incomplete,
+            catalog,
+            wrapped_read_line,
+            write_line,
+        )
+        if choice is None:
+            return None
+        if choice == "new":
+            new_session = run_new_session_cli(
+                store,
+                read_line=read_line,
+                write_line=write_line,
+            )
+            return run_game_cli(
+                harness,
+                new_session.created.game_id,
+                new_session.first_action,
+                read_line=read_line,
+                write_line=write_line,
+            )
+        if choice == "recover":
+            incomplete_game_ids = tuple(
+                entry.game_id
+                for entry in catalog.sessions
+                if entry.has_incomplete_turn
+            )
+            game_id = _select_incomplete_session(
+                incomplete_game_ids,
+                wrapped_read_line,
+                write_line,
+            )
+            if game_id is None:
+                return None
+            return _run_session_cli(
+                harness,
+                game_id,
+                first_action=None,
+                show_initial_recovery=True,
+                read_line=read_line,
+                write_line=write_line,
+            )
+
+        selected_game_id = _select_existing_session(
+            catalog,
+            wrapped_read_line,
+            write_line,
+        )
+        if selected_game_id is None:
+            return None
+        review = store.get_session_review(selected_game_id)
+        if review.has_incomplete_turn:
+            return _run_session_cli(
+                harness,
+                selected_game_id,
+                first_action=None,
+                show_initial_recovery=True,
+                read_line=read_line,
+                write_line=write_line,
+            )
+        if review.session_status == "complete":
+            _write_completed_session(review, write_line)
+            continue
+        _write_session_review(review, write_line)
+        return _run_session_cli(
+            harness,
+            selected_game_id,
+            first_action=None,
+            show_initial_recovery=False,
+            read_line=read_line,
+            write_line=write_line,
+        )
 
 
 def run_new_session_cli(
@@ -678,6 +726,127 @@ def _write_public_mechanic(
 ) -> None:
     _write_section_heading("公开机械结果（已提交）", write_line)
     write_line(_format_public_mechanic(mechanic))
+    write_line("")
+
+
+def _read_session_menu_choice(
+    has_incomplete: bool,
+    catalog: SessionCatalog,
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+) -> str | None:
+    """展示启动入口，并返回恢复、已有 session 或新建选择。"""
+
+    _write_section_heading("Agentic 会话菜单", write_line)
+    option = 1
+    if has_incomplete:
+        write_line(f"{option}. 从上一次未完成的回合继续")
+        option += 1
+    write_line(f"{option}. 从已存在的 session 继续")
+    option += 1
+    write_line(f"{option}. 创建新游戏")
+    for issue in catalog.issues:
+        write_line(issue.message)
+    write_line("")
+    while True:
+        try:
+            raw = read_line("请选择入口编号：").strip()
+        except (EOFError, KeyboardInterrupt):
+            write_line(_EXIT_BEFORE_GAME_MESSAGE)
+            return None
+        try:
+            selected = int(raw)
+        except ValueError:
+            write_line("请输入有效的入口编号。")
+            continue
+        if has_incomplete:
+            if selected == 1:
+                return "recover"
+            if selected == 2:
+                return "existing"
+            if selected == 3:
+                return "new"
+        elif selected == 1:
+            return "existing"
+        elif selected == 2:
+            return "new"
+        write_line("请输入有效的入口编号。")
+
+
+def _select_existing_session(
+    catalog: SessionCatalog,
+    read_line: Callable[[str], str],
+    write_line: Callable[[str], None],
+) -> str | None:
+    """只用安全目录摘要选择一个已有 session。"""
+
+    _write_section_heading("已有 session", write_line)
+    for index, entry in enumerate(catalog.sessions, start=1):
+        write_line(_format_session_catalog_entry(index, entry))
+    for issue in catalog.issues:
+        write_line(issue.message)
+    write_line("")
+    while True:
+        try:
+            raw = read_line("请选择要继续的 session 编号：").strip()
+        except (EOFError, KeyboardInterrupt):
+            write_line(_EXIT_BEFORE_GAME_MESSAGE)
+            return None
+        try:
+            index = int(raw)
+        except ValueError:
+            write_line("请输入有效的 session 编号。")
+            continue
+        if 1 <= index <= len(catalog.sessions):
+            return catalog.sessions[index - 1].game_id
+        write_line("请输入有效的 session 编号。")
+
+
+def _format_session_catalog_entry(
+    index: int,
+    entry: SessionCatalogEntry,
+) -> str:
+    status = "已完成" if entry.session_status == "complete" else "进行中"
+    if entry.has_incomplete_turn:
+        status = "未完成回合"
+    return (
+        f"{index}. 会话 {entry.game_id} | 调查员：{entry.investigator_display_name} | "
+        f"状态：{status} | 已提交回合：{entry.committed_turn_count} | "
+        f"更新时间：{entry.updated_at}"
+    )
+
+
+def _write_session_review(
+    review: SessionReview,
+    write_line: Callable[[str], None],
+) -> None:
+    """只展示已提交的叙事和公开事实。"""
+
+    _write_section_heading("session 公开回顾", write_line)
+    write_line(f"调查员：{review.investigator_display_name}")
+    write_line(f"已提交回合：{review.committed_turn_count}")
+    write_line(f"更新时间：{review.updated_at}")
+    if review.committed_turn_count == 0:
+        _write_section_heading("开场叙述", write_line)
+        write_line(review.opening_narration)
+    elif review.latest_narration is not None:
+        _write_section_heading("最近一次 GM 叙事", write_line)
+        write_line(review.latest_narration)
+    if review.public_facts:
+        _write_section_heading("当前有效公开事实", write_line)
+        for fact in review.public_facts:
+            write_line(fact.text)
+    write_line("")
+
+
+def _write_completed_session(
+    review: SessionReview,
+    write_line: Callable[[str], None],
+) -> None:
+    """完成的 session 只显示状态，不能触发新回合。"""
+
+    _write_section_heading("session 已完成", write_line)
+    write_line(f"会话 {review.game_id} 已完成，不能追加新的虚构回合。")
     write_line("")
 
 

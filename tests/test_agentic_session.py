@@ -594,6 +594,90 @@ class AgenticSessionStoreTest(unittest.TestCase):
                 corrupt_before,
             )
 
+    def test_get_session_review_projects_zero_turn_public_state(self) -> None:
+        """零回合回顾使用冻结开场，并过滤隐藏或非 active 事实。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_review",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(self._request())
+            session = json.loads(created.session_file.read_text(encoding="utf-8"))
+            hidden_text = "不应出现在玩家回顾中的秘密"
+            session["facts"][0]["visibility"] = "hidden"
+            session["facts"][0]["text"] = hidden_text
+            write_json_atomic(created.session_file, session)
+            before = created.session_file.read_bytes()
+
+            review = store.get_session_review(created.game_id)
+
+            self.assertEqual(review.game_id, created.game_id)
+            self.assertEqual(review.investigator_display_name, "林雁")
+            self.assertEqual(review.session_status, "ongoing")
+            self.assertEqual(review.committed_turn_count, 0)
+            self.assertEqual(review.latest_narration, None)
+            self.assertEqual(
+                review.opening_narration,
+                session["setup"]["opening_narration"],
+            )
+            self.assertTrue(review.public_facts)
+            self.assertNotIn(hidden_text, repr(review))
+            self.assertEqual(created.session_file.read_bytes(), before)
+
+    def test_get_session_review_uses_latest_narration_and_filters_hidden_facts(
+        self,
+    ) -> None:
+        """有回合回顾使用最近叙事，只保留当前有效公开事实。"""
+
+        response = ModelResponse(
+            assistant_message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "narration": "你在墙缝里找到一枚新铜片。",
+                        "establish": [
+                            {"visibility": "public", "text": "墙缝里有新铜片"},
+                            {"visibility": "hidden", "text": "守卫已经听见动静"},
+                        ],
+                        "retire": [],
+                        "session_status": "ongoing",
+                    },
+                    ensure_ascii=False,
+                ),
+                "reasoning_content": "provider reasoning must stay private",
+                "tool_calls": [],
+            },
+            finish_reason="stop",
+            usage=None,
+            latency_ms=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = AgenticSessionStore(
+                session_root=Path(directory) / "sessions",
+                game_id_factory=lambda: "game_review_turn",
+                clock=lambda: datetime(2026, 8, 7, tzinfo=timezone.utc),
+            )
+            created = store.create_session(self._request())
+            model = ScriptedGameMasterModel([response])
+            AgenticHarness(
+                store,
+                model,
+                turn_id_factory=lambda: "turn_review",
+                fact_id_factory=iter(("fact_public", "fact_hidden")).__next__,
+                clock=lambda: datetime(2026, 8, 7, 0, 1, tzinfo=timezone.utc),
+            ).start_turn(created.game_id, "我检查墙缝。")
+
+            review = store.get_session_review(created.game_id)
+
+        self.assertEqual(review.committed_turn_count, 1)
+        self.assertEqual(review.latest_narration, "你在墙缝里找到一枚新铜片。")
+        public_texts = {fact.text for fact in review.public_facts}
+        self.assertIn("墙缝里有新铜片", public_texts)
+        self.assertNotIn("守卫已经听见动静", public_texts)
+        self.assertNotIn("provider reasoning must stay private", repr(review))
+
     def test_load_session_uses_read_only_snapshots_after_sources_change(self) -> None:
         """工作树材料变化后，会话仍只装载建局时冻结的全文。"""
 
