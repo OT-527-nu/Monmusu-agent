@@ -1,6 +1,6 @@
 # 回合协议设计 v2
 
-> **状态：已归档。** 本文档记录被 [ADR-001](../adr/0001-single-gm-agent-and-character-tools.md) 替代的 multi-agent 设计探索，不再作为实现依据。现行流程见 [回合循环](../turn_loop.md)。
+> **状态：已归档。** 本文档记录被 [ADR-001](../adr/0001-single-gm-agent-and-character-tools.md) 替代的 multi-agent 设计探索，不再作为实现依据。现行流程见 [Agent Loop](../agentic_mvp/agent_loop.md)。
 
 ## 文档状态
 

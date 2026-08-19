@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from monmusu_agent.agent import GameMasterAgent
 from monmusu_agent.agentic_cli import (
     CliInputEncodingError,
     CliPlayerInterrupt,
@@ -36,17 +35,6 @@ from monmusu_agent.agentic_session import (
     NewSessionRequest,
 )
 from monmusu_agent.storage import write_json_atomic
-
-
-class ForbiddenModelLoop:
-    """记录任何不该发生的旧 GM 模型循环启动。"""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        self.calls += 1
-        raise AssertionError("会话初始化不得调用 GM 模型")
 
 
 class FixedRandom:
@@ -1302,16 +1290,13 @@ class AgenticCliTest(unittest.TestCase):
                     self.assertIsNone(loaded.session["incomplete_turn"])
                 return next(answers)
 
-            model_loop = ForbiddenModelLoop()
-            with patch.object(GameMasterAgent, "run", model_loop):
-                result = run_new_session_cli(
-                    store,
-                    read_line=read_line,
-                    write_line=output.append,
-                )
+            result = run_new_session_cli(
+                store,
+                read_line=read_line,
+                write_line=output.append,
+            )
 
             self.assertEqual(result.created.game_id, "game_test_0001")
-            self.assertEqual(model_loop.calls, 0)
             self.assertEqual(
                 result.first_action,
                 "我先贴近牢门，听门外还有没有脚步声。",

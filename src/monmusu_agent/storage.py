@@ -1,4 +1,4 @@
-"""提供项目统一使用的 JSON 文件读写函数。"""
+"""提供 Agentic 会话使用的 JSON 文件读写函数。"""
 
 from __future__ import annotations
 
@@ -14,15 +14,6 @@ def read_json(path: Path) -> Any:
 
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
-
-
-def write_json(path: Path, value: Any) -> None:
-    """创建所需目录，并以便于人工查看的格式写入 JSON。"""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(value, file, ensure_ascii=False, indent=2)
-        file.write("\n")
 
 
 def write_json_atomic(path: Path, value: Any) -> None:

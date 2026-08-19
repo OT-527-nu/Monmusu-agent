@@ -2,9 +2,9 @@
 
 ## 文档状态
 
-本目录定义 Monmusu Agent 下一版 MVP 的目标产品、目标架构与验收方式，落实 [ADR-005](../adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-044](../adr/0044-real-llm-vertical-slice-leads-migration.md)。它是新实现的设计权威，但不是当前源码已经完成的能力清单。
+本目录定义 Monmusu Agent MVP 的目标产品、目标架构与验收方式，落实 [ADR-005](../adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-045](../adr/0045-bounded-provider-retry-policy.md)。它是当前实现与后续工作的设计权威，但不是全部目标能力已经完成的清单。
 
-截至 2026-08-16，默认入口仍运行旧的模组 JSON、`request_check`、`apply_effect`、效果白名单、关系阶段与六格威胁时钟。独立的 opt-in Agentic 入口已经完成 Increment 1 至 Increment 3：不可变 `SessionSetup`、自然语言事实账本、GM 最终答复原子提交、六张生产角色卡、统一 `CocTool` 生命周期、统一 `PublicMechanic` 投影、`make_check` / `push_check` / `spend_luck` / `deal_damage` / `make_sanity_check` 五工具、non-thinking/thinking DeepSeek adapter、连续 CLI、`IncompleteTurn` 持久化、显式 CLI 恢复门、同 ID 工具结果幂等重放、结构修正、执行尝试时限/往返保险丝，以及 `reasoning_content` 受限回放均已交付；Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。已有完整会话的继续入口、完整短篇六场景与开放试玩、模型评估矩阵、默认入口切换与旧路径退役仍未交付。具体差异与迁移门见[迁移清单](migration.md)。
+截至 2026-08-19，默认入口已经切换为 Agentic CLI，旧规则驱动运行链、旧测试、旧 JSON 数据和旧顶层设计文档已经退役。Agentic 路径已完成 Increment 1 至 Increment 4 的工程切片：不可变 `SessionSetup`、自然语言事实账本、GM 最终答复原子提交、六张生产角色卡、统一五工具 COC 生命周期、non-thinking/thinking DeepSeek adapter、连续 CLI、`IncompleteTurn` 持久化、显式恢复、工具结果幂等重放、结构修正、执行限制、会话续玩和内容 provenance 审计均已交付；Ticket 18 场景二和场景三已通过。完整短篇六场景、开放试玩、模型评估矩阵和默认模型选择仍未交付。具体差异与迁移门见[迁移清单](migration.md)。
 
 ## 产品核心
 
@@ -33,9 +33,9 @@ MVP 是一局由真实 LLM GM 主持、玩家可以自由行动并形成叙事�
 
 领域词汇以仓库根目录的 [CONTEXT.md](../../CONTEXT.md) 为准。若本目录内部发生冲突，数据形状以[数据契约](contracts.md)为准，执行顺序以 [Agent Loop](agent_loop.md) 为准，人物事实以[调查员与 NPC 参考](characters.md)为准，模组素材以[模组参考书](module_reference.md)为准；ADR 解释这些取舍为何成立。
 
-## 不再作为新设计依据的文档
+## 已退役的旧设计层
 
-现有顶层 `docs/mvp_design.md`、`architecture.md`、`turn_loop.md`、`schemas.md`、`prompts.md`、`game_design.md`、`character_cards.md` 与 `thalarion_setting.md` 保留在原路径，用于比较旧实现和规划迁移。它们不再约束本目录，也不会在本阶段被覆盖或移动。
+旧顶层设计文档已从当前树删除。旧 ADR、`docs/archive/` 和 Git 历史仍保留用于追溯，但不再作为当前实现依据。
 
 ## 设计纪律
 

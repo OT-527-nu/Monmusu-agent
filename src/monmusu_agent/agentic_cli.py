@@ -954,7 +954,7 @@ def _run_main(argv: Sequence[str] | None = None) -> int:
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     configure_requested = arguments == ("--configure",)
     if arguments and not configure_requested:
-        print("未知参数。仅支持 monmusu-agent-agentic --configure。")
+        print("未知参数。仅支持 --configure。")
         return 2
 
     env_path = PROJECT_ROOT / ".env"
@@ -989,7 +989,7 @@ def _run_main(argv: Sequence[str] | None = None) -> int:
         if not _stdin_is_interactive():
             print(
                 "未检测到模型提供商配置；请运行 "
-                "monmusu-agent-agentic --configure，或导出 "
+                "monmusu-agent --configure，或导出 "
                 "MONMUSU_PROVIDER 与对应 API Key。",
             )
             return 2

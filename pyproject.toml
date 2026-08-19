@@ -18,7 +18,7 @@ dev = [
 ]
 
 [project.scripts]
-monmusu-agent = "monmusu_agent.cli:main"
+monmusu-agent = "monmusu_agent.agentic_cli:main"
 monmusu-agent-agentic = "monmusu_agent.agentic_cli:main"
 monmusu-agent-deepseek-contract = "monmusu_agent.agentic_contract:main"
 
@@ -34,21 +34,6 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
 
-# 旧规则驱动基线待 Increment 6 退役；迁移期只隔离其已知告警，不继续修改旧逻辑。
-[tool.ruff.lint.per-file-ignores]
-"src/monmusu_agent/state.py" = ["F401", "B904"]
-"tests/test_engine.py" = ["B023"]
-
 [tool.mypy]
 python_version = "3.11"
 files = ["src"]
-
-# mypy 只强制当前目标路径；旧规则驱动模块待退役，不要求通过类型门禁。
-exclude = [
-    "^src/monmusu_agent/cli\\.py$",
-    "^src/monmusu_agent/agent\\.py$",
-    "^src/monmusu_agent/engine\\.py$",
-    "^src/monmusu_agent/rules\\.py$",
-    "^src/monmusu_agent/state\\.py$",
-    "^src/monmusu_agent/tools\\.py$",
-]

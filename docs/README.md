@@ -2,9 +2,9 @@
 
 ## 当前权威
 
-下一版 MVP 的设计权威是 [Agentic MVP 文档集](agentic_mvp/README.md)，由 [ADR-005](adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-044](adr/0044-real-llm-vertical-slice-leads-migration.md) 记录其关键取舍。领域词汇统一见仓库根目录的 [CONTEXT.md](../CONTEXT.md)。
+下一版 MVP 的设计权威是 [Agentic MVP 文档集](agentic_mvp/README.md)，由 [ADR-005](adr/0005-gm-authority-over-fictional-causality.md) 至 [ADR-045](adr/0045-bounded-provider-retry-policy.md) 记录其关键取舍。领域词汇统一见仓库根目录的 [CONTEXT.md](../CONTEXT.md)。
 
-这次权威切换不表示目标架构已经全部实现。截至 2026-08-16，默认 `monmusu-agent` 仍运行旧的规则驱动路径；独立的 opt-in `monmusu-agent-agentic` 已完成 Increment 1 至 Increment 3，包括不可变会话、GM 最终答复与事实账本、完整五工具 COC 机械、六张生产角色卡、统一 `CocTool` 生命周期、统一 `PublicMechanic` 投影、真实 DeepSeek adapter、两回合开放行动、显式恢复门、执行限制、幂等工具结果重放、一次结构修正，以及 non-thinking/thinking 真实恢复传输证据；Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。已有完整会话的继续入口、完整短篇六场景与开放试玩、模型评估矩阵、默认入口切换与旧路径退役仍是目标工作。判断“代码现在会做什么”时必须检查源码和测试，判断“下一版应该实现什么”时使用 `docs/agentic_mvp/`；具体差距见[迁移清单](agentic_mvp/migration.md)。
+这次权威切换不表示目标架构已经全部实现。截至 2026-08-19，`monmusu-agent` 已切换为 Agentic CLI，旧规则驱动运行链、旧测试、旧 JSON 数据和旧顶层设计文档已退役；Agentic 路径已完成 Increment 1 至 Increment 4 的工程切片，包括不可变会话、GM 最终答复与事实账本、GM 五工具 COC 机械、六张生产角色卡、显式恢复、会话续玩和内容发布边界。真实六场景、完整短篇、开放试玩、模型评估矩阵和默认模型选择仍未完成。判断“代码现在会做什么”时检查源码和测试，判断目标设计时使用 `docs/agentic_mvp/`；具体差距见[迁移清单](agentic_mvp/migration.md)。
 
 新设计的核心边界是：GM 裁定虚构因果并建立正典；Markdown 模组是参考书而不是权限表；Harness 提供可信 COC 机械、事实与回合持久化、结构校验和恢复，但不审批故事是否允许发生；运行时只有一个连续 GM Agent Loop。
 
@@ -26,24 +26,11 @@
 
 本目录内部发生冲突时，字段形状以[数据契约](agentic_mvp/contracts.md)为准，执行顺序以 [Agent Loop](agentic_mvp/agent_loop.md) 为准，人物参考以[角色文档](agentic_mvp/characters.md)为准，模组素材以[模组参考书](agentic_mvp/module_reference.md)为准；ADR 解释为什么选择这些边界。
 
-## 迁移基线
+## 迁移边界
 
-以下顶层文档保留在原路径，用于理解当前源码、比较迁移差异和追溯旧决策。它们不再约束 Agentic MVP，也不会在本次设计重写中覆盖或移动。
+旧规则驱动源码、旧 JSON 数据、旧测试和旧顶层设计文档已经从当前树删除。旧 ADR、`docs/archive/`、Git 历史和本地备份仍保留，用于追溯决策；它们不再代表当前运行时契约。
 
-| 旧文档 | 迁移价值 |
-| --- | --- |
-| [旧 MVP 设计](mvp_design.md) | 旧规则驱动产品范围与八周计划 |
-| [旧系统架构](architecture.md) | `RuleEngine`、`StateCommitter`、场景投影和旧状态权威 |
-| [旧回合循环](turn_loop.md) | `request_check` / `apply_effect`、工具预算与兜底路径 |
-| [旧 JSON 数据契约](schemas.md) | 模组规则、效果授权、旧状态与记忆结构 |
-| [旧 Prompt 契约](prompts.md) | `strategy`、固定建议、角色生成和模组边界 Prompt |
-| [城市设定](thalarion_setting.md) | 新模组参考书吸收与重新解释的内容来源 |
-| [旧模组设计](game_design.md) | 固定场景、线索、威胁时钟和结局基线 |
-| [旧角色卡](character_cards.md) | 人物素材、关系阶段和角色工具方案基线 |
-| [StateCommitter 同步计划](statecommitter-document-sync-plan.md) | 旧单效果授权 seam 的同步记录 |
-| [GameEngine 同步说明](gameengine-design-sync.md) | 旧 `run_turn` 和可信结果组装的同步记录 |
-
-[ADR-001](adr/0001-single-gm-agent-and-character-tools.md) 至 [ADR-004](adr/0004-user-input-gameengine-turn-contract.md) 同样保留为当前规则驱动实现的历史决策。若它们与 ADR-005 至 ADR-044 或 `agentic_mvp/` 冲突，以后者作为下一版设计依据；旧 ADR 不因被取代而删除。
+[ADR-001](adr/0001-single-gm-agent-and-character-tools.md) 至 [ADR-004](adr/0004-user-input-gameengine-turn-contract.md) 保留为已退役规则驱动实现的历史决策。若它们与 ADR-005 至 ADR-045 或 `agentic_mvp/` 冲突，以后者作为当前设计依据；旧 ADR 不因被取代而删除。
 
 ## 参考与历史
 

@@ -2,13 +2,13 @@
 
 ## 文档目的
 
-本文件把当前规则驱动实现迁移到 [Agentic MVP](README.md) 的顺序、验收门和退役条件写清楚。它不是要求一次性重写所有源码，也不把目标设计描述成已经实现。迁移以可运行的真实 LLM 纵向切片为主线；旧路径在对应新版能力通过验收前保留为对照基线，但不能反过来限制新架构。
+本文件记录规则驱动实现迁移到 [Agentic MVP](README.md) 的顺序、验收门和退役结果。它不把未完成的真实质量验收描述成已经实现。项目原计划在模型矩阵和完整试玩后删除旧路径；项目所有者于 2026-08-19 明确决定提前退役无比较价值的旧基线。这个决定改变清理顺序，不改变剩余质量门。
 
 目标模块职责见[系统架构](architecture.md)，接口形状见[数据契约](contracts.md)，执行与恢复顺序见 [Agent Loop](agent_loop.md)。本文只规定迁移结果与依赖顺序，不预先锁定目标 Python 文件布局。
 
 ## 截至 2026-08-19 的实现事实
 
-Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了真实 DeepSeek 两回合开放行动验证，还完成了确定性故障/恢复矩阵、显式 CLI 恢复门、工具结果幂等重放、thinking 恢复传输、non-thinking/thinking 真实恢复合同、六张生产角色卡、五个 COC 工具的统一生命周期，以及 Ticket 18 场景二和场景三的真实验收。Ticket 22 至 Ticket 24 又完成了玩家安全的 session 目录投影、已有 ongoing session 的选择续玩，以及增量四内容发布边界的确定性审计。默认 `monmusu-agent` 与旧存档仍保留规则驱动基线。下表同时列出已经交付的新路径与仍用于迁移对照的旧路径，避免把目标文档误当成当前能力，也避免继续声称新路径不存在。
+Increment 1 至 Increment 3 已完成真实 DeepSeek 两回合开放行动验证、确定性故障/恢复矩阵、显式 CLI 恢复门、工具结果幂等重放、thinking 恢复传输、non-thinking/thinking 真实恢复合同、六张生产角色卡、五个 COC 工具的统一生命周期，以及 Ticket 18 场景二和场景三的真实验收。Ticket 22 至 Ticket 24 又完成了玩家安全的 session 目录投影、已有 ongoing session 的选择续玩，以及增量四内容发布边界的确定性审计。默认 `monmusu-agent` 已切换到 Agentic CLI；旧运行链、旧测试、旧 JSON 数据和旧顶层设计文档已删除。完整短篇、六场景、72 次矩阵、四局复试和默认模型选择仍未完成。
 
 | 当前区域 | 已有能力 | 与目标设计的差距 | 迁移处理 |
 | --- | --- | --- | --- |
@@ -16,19 +16,11 @@ Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了
 | [`agentic_coc.py`](../../src/monmusu_agent/agentic_coc.py) | `CocTool` 统一 `normalize` / `preflight` / `execute` / `validate_result` / `validate_result_arguments` / `validate_persistence` / `public_details` 生命周期；`DEFAULT_COC_TOOLS` 注册 `make_check`、`push_check`、`spend_luck`、`deal_damage`、`make_sanity_check` 五工具；每个工具拥有领域预检、RNG、即时机械与恢复幂等校验 | 与目标 seam 一致；当前仅以单一模块承载五工具，尚未按内部职责拆文件 | 保持为 Harness 内部深模块；是否拆文件不改变公开 seam 和 GM 可调用权限 |
 | [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、五工具动态目录、统一 `CocTool` preflight 生命周期、`PublicMechanic` 投影、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝；ongoing 续玩复用同一上下文 seam | 完整短篇开放收束验收与模型质量矩阵未运行 | 在同一 Harness lifecycle seam 完成剩余生命周期能力，不拆出第二套 orchestrator |
 | [`agentic_model.py`](../../src/monmusu_agent/agentic_model.py) | `GameMasterModel` 同时有可编程假 adapter 与 OpenAI SDK DeepSeek adapter；non-thinking/thinking、JSON Object、function tools、请求 timeout、稳定错误映射和 thinking `reasoning_content` 恢复传输已接通 | 没有多 provider、自动路由或 fallback；真实质量矩阵尚未运行 | 保持薄 provider seam，不把恢复决策、工具幂等或 provider 路由移入 adapter |
-| [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、选择 ongoing/complete/incomplete session、显示安全回顾、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
+| [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | 默认 CLI 可新建不可变会话、选择 ongoing/complete/incomplete session、显示安全回顾、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
 | [`agentic_contract.py`](../../src/monmusu_agent/agentic_contract.py) | 显式真实契约 runner 已证明 direct final、一次匹配 `tool_call_id` 的 `make_check` 往返、non-thinking/thinking 工具中断、重建和恢复，以及 Ticket 18 场景二和场景三的五工具 profile 自动门；完整脱敏记录见 [Ticket 11 evidence](evidence/ticket-11-live-recovery-2026-08-07.md) 与 [Ticket 18 evidence](evidence/ticket-18-increment-3-acceptance-batch-v2-2026-08-16.md) | 真实合同只证明 SDK/provider 传输与场景自动门，不评价完整六场景质量、其余场景或 72 次模型矩阵 | 保持 live 证据与确定性恢复矩阵、人工质量评估分开 |
-| [`agent.py`](../../src/monmusu_agent/agent.py) | 有限 `GameMasterAgent` 循环、`GameMasterModel` 注入 seam、可测试的模型步骤 | 最终输出仍是 `GameMasterDraft(strategy, narration, suggested_actions)`；没有 DeepSeek adapter、新最终 schema、结构修正或可恢复 provider 轨迹 | 保留薄模型 seam 与有限循环思想，替换模型消息和最终答复契约 |
-| [`engine.py`](../../src/monmusu_agent/engine.py) | 已有 `run_turn`、输入预检和失败分支 | 上下文来自 JSON 模组场景投影与 `public_memory`；失败后会生成 Harness 兜底叙事；没有未完成回合恢复；初始化仍创建关系状态、六格时钟和 `ending_id` | 用 Agent Harness 目标流程替换上下文、提交和失败语义；删除虚构兜底 |
-| [`rules.py`](../../src/monmusu_agent/rules.py) | 可注入随机源、d100 结算与检定记录 | 使用数值修正和旧四档结果，不是角色卡驱动的 COC 常规/困难/极难及奖励/惩罚骰；`request_check` 依赖模组 `check_rules` 和 outcome effects | 保留受信随机与不可篡改记录思想，按 COC 语义重做规则接口 |
-| [`state.py`](../../src/monmusu_agent/state.py) | 受信提交、版本检查和单效果原子写入 | `StateCommitter` 只允许模组预定义 `effect_id`，依赖 `allowed_effect_ids`、`event_rules` 和受限路径 DSL 决定故事后果 | 机械状态提交留在 Harness；虚构后果改为最终答复中的自然语言事实变化 |
-| [`tools.py`](../../src/monmusu_agent/tools.py) | 动态工具目录、工具结果与内存轨迹 | 只暴露互相耦合的 `request_check`、`apply_effect`；每工具配额和总步骤是旧接口假设 | 目标目录改为通用 COC 语义工具；模型往返保险丝属于 Agent Loop，不是剧情预算 |
-| [`cli.py`](../../src/monmusu_agent/cli.py) | 能初始化并打印开场信息 | 不是连续玩家界面，只展示场景和威胁时钟；不能恢复未完成回合 | 改为新建/继续游戏、输入、公开机械、GM 叙事、恢复和收束的唯一 MVP 界面 |
-| [`config.py`](../../src/monmusu_agent/config.py) | 集中旧模组、角色和三个 runtime JSON 路径 | 没有 Markdown 参考书、完整回合记录、事实索引、调查员卡或未完成回合配置 | 只增加 MVP 实际需要的运行输入，不建设通用配置框架 |
-| [`storage.py`](../../src/monmusu_agent/storage.py) | 单个 JSON 文件原子替换 | 尚无跨机械、回合、事实和恢复数据的完整提交协议 | 复用原子写入原语，并按目标契约建立最小一致性协议 |
-| [`data/modules/escape_thalarion.json`](../../data/modules/escape_thalarion.json) | 集中旧场景、线索、检定和效果数据 | 同时充当叙事内容、规则授权、效果白名单和六格时钟 | 运行时改读 Markdown [模组参考书](module_reference.md)；不把其内容重新拆回权限表 |
-| [`data/characters/characters.json`](../../data/characters/characters.json) | 旧 AI 队友技能与关系初态 | 不是完整预生成 COC 调查员卡，且绑定关系阶段 | 按[角色与预生成调查员](characters.md)建立机械卡与 GM 角色资料；关系只作为自然语言事实 |
-| [`tests/`](../../tests) | 同时保留旧规则基线，并通过真实临时会话与可编程假 model 覆盖 Increment 1/2/3 的 Agentic lifecycle、可见性、原子提交、五工具边界与幂等、恢复、结构修正、执行限制、thinking 回放和真实 adapter seam | 完整短篇六场景和模型质量矩阵仍未覆盖 | 继续在公开 lifecycle seam 增加后续内容测试；只有替代证据成立后才删除旧测试 |
+| [`config.py`](../../src/monmusu_agent/config.py) | 只提供项目根路径，具体 Agentic 输入由拥有者模块声明 | 没有通用配置注册表 | 保持最小共享路径接口 |
+| [`storage.py`](../../src/monmusu_agent/storage.py) | 提供 JSON 读取和同目录原子替换原语 | 完整一致性仍由 SessionStore/Harness 协议负责 | 保持无领域语义的存储原语 |
+| [`tests/`](../../tests) | 通过真实临时会话与可编程假 model 覆盖 Agentic lifecycle、可见性、原子提交、五工具边界与幂等、恢复、结构修正、执行限制、thinking 回放和真实 adapter seam | 完整短篇六场景和模型质量矩阵仍未覆盖 | 继续在公开 lifecycle seam 增加后续内容测试；旧规则驱动测试已经删除 |
 
 “已有有限循环”不等于新版 Agent Loop 已经完成；“已有原子 JSON 写入”也不等于多份目标记录已经具备原子性和恢复协议。迁移验收必须观察目标公开 seam 和真实持久化结果，不能由类名相似推断能力存在。
 
@@ -37,7 +29,7 @@ Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了
 重写改变的是权威和契约，不是把所有已有工程能力删除。迁移应优先复用或延续：
 
 - `GameMasterModel` 注入 seam，以及用可编程假 adapter 精确测试模型步骤的方式。
-- 单一、有限、串行的 `GameMasterAgent` 循环和只读输入快照思想。
+- 单一、有限、串行的 GM 循环和只读输入快照思想。
 - 可注入随机源、机械产生后不可重掷和结果不可由 GM 篡改的记录思想。
 - 工具结果轨迹；新版需要把恢复所需部分持久化，而不是只保留内存 trace。
 - `write_json_atomic` 的同目录临时文件与原子替换原语。
@@ -49,13 +41,13 @@ Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了
 ## 迁移纪律
 
 1. **先纵向证明，再横向补全**：先让真实 DeepSeek GM 处理一个未预写行动、调用一个 `make_check` 并跨两回合保持事实，再增加完整 COC 机械和内容。
-2. **临时双路径只存在于组合入口**：迁移期允许旧基线和新版实验入口并存，但不在每个领域模块里加入永久兼容分支，也不建设通用版本路由器。
-3. **旧测试不是新版证据**：旧路径继续通过只能说明基线没被意外破坏。新版必须有独立的契约、不变量和真实模型验收。
+2. **不恢复双路径**：默认入口已经切换，后续不重新引入旧兼容分支或通用版本路由器。
+3. **删除旧测试不是新版证据**：新版仍必须用独立的契约、不变量和真实模型验收证明自身行为。
 4. **机械记录先于叙事成功**：已提交机械不能因模型失败回滚或重掷；GM 答复和事实变化必须整体提交。
 5. **参考书不授权剧情**：迁移不得把 `effect_definitions` 换名为另一套路线、线索或事实白名单，也不得新增模组专用工具绕过目标设计。
 6. **事实索引不是唯一正典**：完整回合记录保留明确叙述；`establish` 和 `retire` 只维护需要持续提醒 GM 的当前事实。
 7. **不静默转换旧存档**：旧 runtime 数据与新版事实/回合语义不同。迁移期使用带明确 schema 版本的新游戏数据；不把旧 `memory.json`、`state.json` 或 ledger 猜测转换成新正典。
-8. **每个增量都有退出门**：在验收条件满足前不删除旧实现；满足后立即移除不再被调用的兼容代码，避免双架构长期共存。
+8. **清理不等于质量验收**：项目所有者决定提前删除旧实现；未完成的六场景、开放试玩和模型评估必须继续显式报告。
 
 ## 增量总览
 
@@ -74,10 +66,10 @@ Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了
 ### 交付
 
 - `CONTEXT.md` 定义 GM、Harness、正式事实、未完成回合和 COC 机械等统一领域语言。
-- ADR-005 至 ADR-044 记录已经接受的方向与边界。
+- ADR-005 至 ADR-045 记录已经接受的方向与边界。
 - `docs/agentic_mvp/` 分别描述产品、架构、循环、契约、Prompt、模组、角色、评估和迁移。
 - 六个聚焦场景有可执行夹具草案，目标 schema 有示例和反例。
-- `docs/README.md` 明确本目录是新设计权威，旧顶层文档只作迁移对照。
+- `docs/README.md` 明确本目录是当前设计权威，旧顶层文档退役后的追溯边界由 ADR、归档和 Git 历史承担。
 
 ### 验收门
 
@@ -119,11 +111,11 @@ Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了
 
 ### 暂不完成的边界
 
-这个增量只把新路径作为受控纵向切片。若在机械提交后发生技术中断，必须停止、保留已有机械和可诊断的原回合材料，且不得生成兜底叙事或对同一回合重掷；但“玩家可从 CLI 反复安全恢复”的正式能力在增量 2 验收。在此之前，新路径不能替代旧基线成为默认可玩入口。
+这个增量只把新路径作为受控纵向切片。若在机械提交后发生技术中断，必须停止、保留已有机械和可诊断的原回合材料，且不得生成兜底叙事或对同一回合重掷；但“玩家可从 CLI 反复安全恢复”的正式能力在增量 2 验收。当时新路径不能替代旧基线成为默认可玩入口；该历史边界已由后续清理决定结束。
 
 ### 旧路径处理
 
-不删除旧 Agent、Engine、工具、状态和测试。新增入口与旧入口只在组合层区分，禁止让新工具调用旧 `apply_effect` 授权链。
+当时不删除旧 Agent、Engine、工具、状态和测试；新增入口只在组合层与旧入口并存，且禁止让新工具调用旧 `apply_effect` 授权链。旧闭包现已退役。
 
 ## 增量 2：未完成回合与运行恢复
 
@@ -157,7 +149,7 @@ Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了
 
 ### 旧路径处理
 
-恢复路径通过后，新版 CLI 可以成为开发与试玩入口；旧路径继续保留到完整机械和短篇验收完成。删除旧 `engine.py` 中的兜底叙事分支只能在所有调用者已经切到新版失败语义后进行。
+恢复路径通过后，新版 CLI 已具备成为开发与试玩入口的条件。旧路径当时仍保留；2026-08-19 默认入口切换完成后，旧兜底叙事随整条规则驱动链一起删除。
 
 ## 增量 3：完整 MVP COC 机械与预生成调查员卡
 
@@ -211,7 +203,7 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 
 ### 旧路径处理
 
-新版机械完全不依赖 `target_id`、`check_rules`、`effects_by_outcome`、`effect_id` 或 `allowed_effect_ids`，新版角色机械也不读取旧关系初态。此时可以停止在新功能中维护旧 `RuleEngine -> CheckLedger -> StateCommitter` 授权链，但仍等到增量 6 的整体验收后统一删除不可达实现和绑定测试。
+新版机械完全不依赖 `target_id`、`check_rules`、`effects_by_outcome`、`effect_id` 或 `allowed_effect_ids`，新版角色机械也不读取旧关系初态。该增量完成后停止在新功能中维护旧 `RuleEngine -> CheckLedger -> StateCommitter` 授权链；项目所有者随后决定提前删除不可达实现和绑定测试。
 
 ## 增量 4：模组内容整合、NPC 与开放短篇
 
@@ -255,7 +247,7 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 
 ### 旧路径处理
 
-新版入口停止读取旧 `characters.json` 的关系初态、阶段和事件标签。新入口满足这一门后成为候选默认入口，但在完整模型矩阵和复试完成前仍不删除旧基线。任何为旧 JSON 模组做的临时转换器都不得进入最终运行路径。
+新版入口已经停止读取旧 `characters.json` 的关系初态、阶段和事件标签；旧 JSON 与运行链已提前删除。任何为旧 JSON 模组做的临时转换器都不得进入最终运行路径。
 
 ## 增量 5：模型评估矩阵与完整试玩
 
@@ -276,19 +268,17 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 
 ### 旧路径处理
 
-本增量选出默认配置，但不在评估过程中删除旧实现。旧路径继续作为只读比较基线，最终切换和不可达代码清理由增量 6 完成。
+本增量仍负责选出有证据支持的默认模型配置。旧实现已提前删除，不再作为评估比较基线。
 
 ## 增量 6：旧路径清理
 
-### 默认切换
+### 已完成的工程清理
 
-- 把新版 CLI 切换为唯一默认玩家入口，使用增量 5 选出的 DeepSeek 配置。
-- 在全新游戏、已有正常游戏和未完成回合恢复上分别执行发布前 smoke test。
-- `rg`、运行时追踪和依赖检查确认生产入口只经过新版 Harness、COC 工具与事实/回合存储。
+- 新版 CLI 已切换为唯一默认玩家入口；当前运行配置不冒充增量 5 尚未完成的模型选择结果。
+- 旧运行链、绑定测试、旧 JSON 数据和旧顶层设计文档已删除；共享配置与存储接口已收缩到 Agentic 调用者需要的最小能力。
+- 本次清理运行确定性测试、静态检查、入口检查和引用扫描；真实 provider、六场景、72 次矩阵和四局复试仍属未验证风险。
 
-### 最终退役清单
-
-只有新版确定性测试、真实契约、72 次矩阵和四局复试全部通过后，才删除或改写以下不可达旧实现：
+### 已退役清单
 
 - `request_check`、`apply_effect` 旧工具定义及其每工具剧情配额。
 - `target_id`、`check_rules`、`effects_by_outcome`、`effect_definitions`、`allowed_effect_ids` 和模组 `event_rules` 授权链。
@@ -297,16 +287,17 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 - 模组场景投影、关系等级、`pending_echo`、六格威胁时钟和 `ending_id` 运行逻辑。
 - 模型失败后由 Engine 生成叙事内容的降级模板。
 - 仅验证上述旧契约且已经有新版替代证据的测试和夹具。
-- 旧 JSON 模组与角色文件的运行时引用；文件本身在确认无仍需比较的资料后单独处理，不在代码清理中顺手删除用户内容。
+- 旧 JSON 模组与角色文件及其运行时引用。
+- 旧顶层设计文档；旧 ADR、归档探索和 Git 历史继续保留。
 
-旧顶层设计文档继续保留为迁移对照，并由索引清楚标为非权威；ADR 不因实现完成而删除。Git 历史是最终旧实现的恢复依据，不保留永久双运行架构。
+项目所有者确认旧基线没有继续比较的价值，因此上述清理早于原计划的真实质量门执行。ADR 不因实现删除；Git 历史是旧实现的恢复依据，不保留永久双运行架构。
 
-### 最终验收门
+### 尚未完成的最终验收门
 
 1. 默认 CLI 从新建游戏、真实 DeepSeek 工具调用、连续事实、技术恢复到开放收束全程只走新版 seam。
-2. `rg` 和运行时追踪证明生产入口不再读取旧授权字段或调用旧工具。
-3. 所有目标确定性测试及真实验收通过，旧测试的删除都有明确新版覆盖对应关系。
-4. 依赖与配置只保留真实使用项，API key 获取方式仍不进入核心代码。
+2. `rg` 和运行时追踪证明生产入口不再读取旧授权字段或调用旧工具；确定性引用扫描已完成，真实发布追踪仍待执行。
+3. 所有目标确定性测试及真实验收通过；删除旧测试本身不计作新版覆盖证据。
+4. 依赖与配置只保留真实使用项，API key 获取方式仍不进入核心代码；工程清理已完成，模型选择仍待增量 5。
 5. 发布说明列出旧开发存档与新版 schema 不兼容，不静默覆盖或误读旧文件。
 
 ## 高风险迁移冲突
@@ -317,15 +308,15 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 
 ### 旧兜底叙事违反恢复语义
 
-当前模型失败路径会由 Engine 返回确定性叙事。新版中 Harness 无权在 GM 中断后决定虚构发生了什么；它只能保留已提交机械、保存未完成回合并报告技术中断。迁移时不得把旧兜底文字包装进新 `narration` 字段。
+旧模型失败路径曾由 Engine 返回确定性叙事，该路径已经删除。新版中 Harness 无权在 GM 中断后决定虚构发生了什么；它只能保留已提交机械、保存未完成回合并报告技术中断。
 
 ### 内存工具轨迹不足以恢复
 
-当前 `ToolSession.trace` 只服务进程内诊断。真正恢复还需要保存 provider 消息顺序、assistant tool calls、`tool_call_id` 对应结果和机械记录引用；thinking 工具循环还需保存并原样回传 `reasoning_content`。这些 provider 数据是内部恢复材料，不属于玩家游戏记录或事实。
+旧 `ToolSession.trace` 只服务进程内诊断，已经随旧运行链删除。新版恢复保存 provider 消息顺序、assistant tool calls、`tool_call_id` 对应结果和机械记录引用；thinking 工具循环还保存并原样回传 `reasoning_content`。这些 provider 数据是内部恢复材料，不属于玩家游戏记录或事实。
 
 ### 初始化不能覆盖未完成回合
 
-当前初始化会重建 runtime 文件并重置旧检定账本。新版 CLI 必须先识别游戏数据版本和未完成回合，再决定新建或恢复；任何普通启动都不能清空恢复材料。新游戏也应使用明确的新标识，避免复用旧目录时误覆盖。
+旧初始化会重建 runtime 文件并重置旧检定账本，该入口已经删除。新版 CLI 先识别游戏数据版本和未完成回合，再决定新建或恢复；普通启动不能清空恢复材料。新游戏使用明确的新标识，避免复用旧目录时误覆盖。
 
 ### 单文件原子写入不自动提供整体一致性
 

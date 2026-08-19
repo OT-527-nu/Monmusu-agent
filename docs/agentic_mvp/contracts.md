@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义新版 MVP 的规范性目标契约。截至 2026-08-17，opt-in Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、五工具 COC 机械、六张生产角色卡、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放、真实恢复合同证据和 provider 有界重试。统一 `CocTool` 生命周期、各工具生成的统一 `PublicMechanic` 投影、按未完成回合冻结 profile 恢复，以及 `model_profile.retry_policy` 与 `IncompleteTurn.provider_retry` 均已交付。已有完整会话的继续入口、完整短篇、模型评估矩阵和默认入口切换仍是目标子集。旧 `docs/schemas.md` 仅作为迁移对照。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
+本文定义新版 MVP 的规范性目标契约。截至 2026-08-19，Agentic 路径已实现 `session.json` 聚合、不可变会话开场、角色卡与资料、事实账本、`GameMasterResponse`、`CommittedTurn`、`IncompleteTurn`、五工具 COC 机械、六张生产角色卡、non-thinking/thinking `GameMasterModel` seam、显式恢复、完整运行保险丝、单次结构修正、工具结果幂等重放、真实恢复合同证据、provider 有界重试、会话续玩和内容 provenance。完整短篇、六场景矩阵、开放试玩和模型评估仍是目标子集。旧 JSON 契约已退役。执行顺序见 [Agent Loop](agent_loop.md)，职责与 seam 见[系统架构](architecture.md)。
 
 ## 契约原则
 

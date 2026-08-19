@@ -4,7 +4,7 @@
 
 本文定义下一版 MVP 一次玩家输入如何经过同一个 GM、COC 工具、最终校验、提交、故障和显式恢复。模块职责以[系统架构](architecture.md)为准，字段和错误结构以[数据契约](contracts.md)为准，GM 行为依据[GM 能力章程与 Prompt](gm_prompt.md)。
 
-本文描述完整的**目标协议**。截至 2026-08-17，opt-in Agentic 路径已实现新回合外壳、non-thinking/thinking DeepSeek 消息、`make_check` / `push_check` / `spend_luck` / `deal_damage` / `make_sanity_check` 五工具统一生命周期、机械即时提交、最终事实/叙事原子提交、技术中断保存、一次结构修正、`attempt_timeout_seconds=180`、八次往返执行、provider 有界重试、显式恢复、已提交工具结果幂等重放和 thinking 消息回放；Ticket 11 已补充两种 profile 的真实 provider 恢复证据，Ticket 18 场景二和场景三已在 2026-08-16 由项目所有者采纳通过。默认旧循环仍返回 `GameMasterDraft(strategy, narration, suggested_actions)` 并使用 `request_check` / `apply_effect`；已有完整会话的继续入口、完整短篇六场景与开放试玩和默认入口切换仍是目标工作。
+本文描述完整的**目标协议**。截至 2026-08-19，Agentic 路径已实现新回合外壳、non-thinking/thinking DeepSeek 消息、`make_check` / `push_check` / `spend_luck` / `deal_damage` / `make_sanity_check` 五工具统一生命周期、机械即时提交、最终事实/叙事原子提交、技术中断保存、一次结构修正、`attempt_timeout_seconds=180`、八次往返执行、provider 有界重试、显式恢复、已提交工具结果幂等重放、thinking 消息回放和已有会话续玩。默认入口已切换到本协议，旧规则驱动循环已经删除；完整短篇六场景、开放试玩和模型选择仍是目标工作。
 
 ## 循环切片
 
