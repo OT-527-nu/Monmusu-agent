@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -241,6 +242,55 @@ class AgenticSessionStoreTest(unittest.TestCase):
             )
             self.assertEqual(actors["npc_aranis"]["skills"]["art_craft__rigging"], 75)
             self.assertEqual(actors["npc_aranis"]["hp"], {"current": 9, "max": 12})
+
+    def test_create_session_freezes_reference_revisions_and_content_hashes(self) -> None:
+        """SessionSetup 的发布标识与会话快照逐字节对应。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = self._copy_sources(root)
+            module_bytes = sources.module_reference.read_bytes()
+            character_bytes = sources.character_reference.read_bytes()
+            fixture = read_json(sources.setup_fixture)
+            store = AgenticSessionStore(
+                session_root=root / "sessions",
+                sources=sources,
+                game_id_factory=lambda: "game_reference_identity",
+            )
+
+            created = store.create_session(self._request())
+
+            setup = created.session["setup"]
+            self.assertEqual(
+                setup["module_reference_revision"],
+                fixture["module_reference_revision"],
+            )
+            self.assertEqual(
+                setup["character_reference_revision"],
+                fixture["character_reference_revision"],
+            )
+            module_hash = hashlib.sha256(module_bytes).hexdigest()
+            character_hash = hashlib.sha256(character_bytes).hexdigest()
+            self.assertEqual(setup["module_reference_sha256"], module_hash)
+            self.assertEqual(setup["character_reference_sha256"], character_hash)
+            self.assertEqual(
+                (
+                    created.session_directory
+                    / "snapshots"
+                    / "module_reference"
+                    / f"{module_hash}.md"
+                ).read_bytes(),
+                module_bytes,
+            )
+            self.assertEqual(
+                (
+                    created.session_directory
+                    / "snapshots"
+                    / "character_reference"
+                    / f"{character_hash}.md"
+                ).read_bytes(),
+                character_bytes,
+            )
 
     def test_profile_customization_does_not_change_frozen_mechanics(self) -> None:
         """同一预生成卡的身份资料变化不改 actor_id 或机械值。"""
@@ -702,6 +752,35 @@ class AgenticSessionStoreTest(unittest.TestCase):
 
             self.assertEqual(loaded.module_reference, module_reference)
             self.assertEqual(loaded.character_reference, character_reference)
+            model = ScriptedGameMasterModel(
+                [
+                    ModelResponse(
+                        assistant_message={
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "narration": "快照中的牢门仍在你眼前。",
+                                    "establish": [],
+                                    "retire": [],
+                                    "session_status": "ongoing",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            "tool_calls": [],
+                        },
+                        finish_reason="stop",
+                        usage=None,
+                        latency_ms=1,
+                    )
+                ]
+            )
+            AgenticHarness(store, model).start_turn(
+                created.game_id,
+                "我继续观察牢门。",
+            )
+            package = json.loads(model.requests[0].messages[1]["content"])
+            self.assertEqual(package["MODULE_REFERENCE"], module_reference)
+            self.assertEqual(package["CHARACTER_REFERENCE"], character_reference)
             module_hash = created.session["setup"]["module_reference_sha256"]
             character_hash = created.session["setup"]["character_reference_sha256"]
             module_snapshot = (

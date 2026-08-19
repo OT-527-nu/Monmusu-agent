@@ -25,6 +25,7 @@ from monmusu_agent.agentic_harness import (
     TurnResult,
 )
 from monmusu_agent.agentic_model import (
+    PROMPT_REVISION,
     ModelCallError,
     ModelResponse,
     ScriptedGameMasterModel,
@@ -2223,6 +2224,47 @@ class AgenticHarnessTest(unittest.TestCase):
                 second_package["CHARACTER_REFERENCE"],
                 store.load_session(game_id).character_reference,
             )
+            committed_turn = second_package["COMMITTED_TURNS"][0]
+            self.assertEqual(
+                set(committed_turn),
+                {
+                    "turn_id",
+                    "player_input",
+                    "mechanics",
+                    "narration",
+                    "established_fact_ids",
+                    "retirements",
+                    "session_status",
+                    "committed_at",
+                    "established_facts",
+                },
+            )
+            self.assertEqual(committed_turn["turn_id"], "turn_0001")
+            self.assertEqual(committed_turn["mechanics"], [])
+            self.assertEqual(
+                committed_turn["narration"],
+                "石墙后传来潮湿的回声。",
+            )
+            self.assertEqual(committed_turn["established_fact_ids"], ["fact_1001", "fact_1002"])
+            self.assertEqual(committed_turn["retirements"], [])
+            self.assertEqual(committed_turn["session_status"], "ongoing")
+            self.assertEqual(committed_turn["committed_at"], "2026-07-27T00:02:00Z")
+            self.assertEqual(
+                second_package["INVESTIGATOR_PROFILE"],
+                store.load_session(game_id).session["investigator_profile"],
+            )
+            self.assertEqual(
+                second_package["ACTOR_SHEETS"],
+                store.load_session(game_id).session["actors"],
+            )
+            self.assertEqual(
+                model.requests[1].model_profile["prompt_revision"],
+                PROMPT_REVISION,
+            )
+            session = store.load_session(game_id).session
+            self.assertNotIn("content_manifest", session)
+            self.assertNotIn("prompt_revision", session["setup"])
+            self.assertNotIn("prompt_snapshot", session["setup"])
             self.assertEqual(
                 [tool["function"]["name"] for tool in model.requests[1].tools],
                 ["make_check"],

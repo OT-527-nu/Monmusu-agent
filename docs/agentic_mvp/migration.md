@@ -6,17 +6,17 @@
 
 目标模块职责见[系统架构](architecture.md)，接口形状见[数据契约](contracts.md)，执行与恢复顺序见 [Agent Loop](agent_loop.md)。本文只规定迁移结果与依赖顺序，不预先锁定目标 Python 文件布局。
 
-## 截至 2026-08-16 的实现事实
+## 截至 2026-08-19 的实现事实
 
-Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了真实 DeepSeek 两回合开放行动验证，还完成了确定性故障/恢复矩阵、显式 CLI 恢复门、工具结果幂等重放、thinking 恢复传输、non-thinking/thinking 真实恢复合同、六张生产角色卡、五个 COC 工具的统一生命周期，以及 Ticket 18 场景二和场景三的真实验收。默认 `monmusu-agent` 与旧存档仍保留规则驱动基线。下表同时列出已经交付的新路径与仍用于迁移对照的旧路径，避免把目标文档误当成当前能力，也避免继续声称新路径不存在。
+Increment 1 至 Increment 3 已在独立的 opt-in Agentic 路径完成：除了真实 DeepSeek 两回合开放行动验证，还完成了确定性故障/恢复矩阵、显式 CLI 恢复门、工具结果幂等重放、thinking 恢复传输、non-thinking/thinking 真实恢复合同、六张生产角色卡、五个 COC 工具的统一生命周期，以及 Ticket 18 场景二和场景三的真实验收。Ticket 22 至 Ticket 24 又完成了玩家安全的 session 目录投影、已有 ongoing session 的选择续玩，以及增量四内容发布边界的确定性审计。默认 `monmusu-agent` 与旧存档仍保留规则驱动基线。下表同时列出已经交付的新路径与仍用于迁移对照的旧路径，避免把目标文档误当成当前能力，也避免继续声称新路径不存在。
 
 | 当前区域 | 已有能力 | 与目标设计的差距 | 迁移处理 |
 | --- | --- | --- | --- |
-| [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载会话聚合、不可变参考快照、生产角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn`；`agentic-mvp-1` 历史单卡与 `agentic-mvp-2` 生产四卡按各自精确形状装载；`find_incomplete_session_ids` 支持 CLI 在启动时门控未完成回合 | 没有面向 CLI 的已完成会话发现/继续选择 interface | 保持 SessionStore 为本地持久化深模块，只增加真实调用者需要的最小会话发现能力 |
+| [`agentic_session.py`](../../src/monmusu_agent/agentic_session.py) | 原子创建并严格装载会话聚合、不可变参考快照、生产角色卡、事实、已提交回合和恢复形状的 `IncompleteTurn`；`agentic-mvp-1` 历史单卡与 `agentic-mvp-2` 生产四卡按各自精确形状装载；session catalog 为 CLI 提供安全的 ongoing/complete/incomplete 选择和回顾 | 完整短篇开放收束与真实内容质量尚未验收 | 保持 SessionStore 为本地持久化深模块；继续只增加真实调用者需要的最小能力 |
 | [`agentic_coc.py`](../../src/monmusu_agent/agentic_coc.py) | `CocTool` 统一 `normalize` / `preflight` / `execute` / `validate_result` / `validate_result_arguments` / `validate_persistence` / `public_details` 生命周期；`DEFAULT_COC_TOOLS` 注册 `make_check`、`push_check`、`spend_luck`、`deal_damage`、`make_sanity_check` 五工具；每个工具拥有领域预检、RNG、即时机械与恢复幂等校验 | 与目标 seam 一致；当前仅以单一模块承载五工具，尚未按内部职责拆文件 | 保持为 Harness 内部深模块；是否拆文件不改变公开 seam 和 GM 可调用权限 |
-| [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、五工具动态目录、统一 `CocTool` preflight 生命周期、`PublicMechanic` 投影、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝 | 尚未覆盖已有完整会话继续入口与完整短篇开放收束验收；模型质量矩阵未运行 | 在同一 Harness lifecycle seam 完成剩余生命周期能力，不拆出第二套 orchestrator |
+| [`agentic_harness.py`](../../src/monmusu_agent/agentic_harness.py) | `start_turn`/`resume_turn` 隐藏上下文组装、GM 响应分类、五工具动态目录、统一 `CocTool` preflight 生命周期、`PublicMechanic` 投影、即时机械提交、最终答复原子提交、工具结果幂等重放、一次结构修正、180 秒尝试时限和八次往返保险丝；ongoing 续玩复用同一上下文 seam | 完整短篇开放收束验收与模型质量矩阵未运行 | 在同一 Harness lifecycle seam 完成剩余生命周期能力，不拆出第二套 orchestrator |
 | [`agentic_model.py`](../../src/monmusu_agent/agentic_model.py) | `GameMasterModel` 同时有可编程假 adapter 与 OpenAI SDK DeepSeek adapter；non-thinking/thinking、JSON Object、function tools、请求 timeout、稳定错误映射和 thinking `reasoning_content` 恢复传输已接通 | 没有多 provider、自动路由或 fallback；真实质量矩阵尚未运行 | 保持薄 provider seam，不把恢复决策、工具幂等或 provider 路由移入 adapter |
-| [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 没有已完成会话的发现/继续选择；完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
+| [`agentic_cli.py`](../../src/monmusu_agent/agentic_cli.py) | opt-in CLI 可新建不可变会话、选择 ongoing/complete/incomplete session、显示安全回顾、连续提交行动、展示已提交公开机械/事实/叙事、在技术中断时停止并提供明确恢复/退出门；终端输入固定为 UTF-8 | 完整开放收束仍未验收 | CLI 只负责显式运行选择与公开投影；恢复状态和执行仍委托 Harness |
 | [`agentic_contract.py`](../../src/monmusu_agent/agentic_contract.py) | 显式真实契约 runner 已证明 direct final、一次匹配 `tool_call_id` 的 `make_check` 往返、non-thinking/thinking 工具中断、重建和恢复，以及 Ticket 18 场景二和场景三的五工具 profile 自动门；完整脱敏记录见 [Ticket 11 evidence](evidence/ticket-11-live-recovery-2026-08-07.md) 与 [Ticket 18 evidence](evidence/ticket-18-increment-3-acceptance-batch-v2-2026-08-16.md) | 真实合同只证明 SDK/provider 传输与场景自动门，不评价完整六场景质量、其余场景或 72 次模型矩阵 | 保持 live 证据与确定性恢复矩阵、人工质量评估分开 |
 | [`agent.py`](../../src/monmusu_agent/agent.py) | 有限 `GameMasterAgent` 循环、`GameMasterModel` 注入 seam、可测试的模型步骤 | 最终输出仍是 `GameMasterDraft(strategy, narration, suggested_actions)`；没有 DeepSeek adapter、新最终 schema、结构修正或可恢复 provider 轨迹 | 保留薄模型 seam 与有限循环思想，替换模型消息和最终答复契约 |
 | [`engine.py`](../../src/monmusu_agent/engine.py) | 已有 `run_turn`、输入预检和失败分支 | 上下文来自 JSON 模组场景投影与 `public_memory`；失败后会生成 Harness 兜底叙事；没有未完成回合恢复；初始化仍创建关系状态、六格时钟和 `ending_id` | 用 Agent Harness 目标流程替换上下文、提交和失败语义；删除虚构兜底 |
@@ -215,6 +215,19 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 
 ## 增量 4：模组内容整合、NPC 与开放短篇
 
+### Ticket 22–24 工程审计结论（截至 2026-08-19）
+
+- SessionSetup 保存人工可读的 `module_reference_revision` / `character_reference_revision`，同时保存对应参考文件实际字节的 SHA-256；模组与人物全文以内容哈希命名的只读文件写入 session-local `snapshots/`。后续装载和 ongoing 新回合只读取这些快照，工作树参考资料的修改或删除会被隔离而不影响已有 session；只有快照缺失、不可读或哈希不匹配才会稳定停止，且不会 fallback 到工作树。
+- ongoing 新回合的同一 GM 请求包含 SessionSetup、开场事实历史、调查员与同行者角色卡、当前 active facts、完整 `COMMITTED_TURNS`、模组快照、人物快照和当前工具目录。Prompt 使用运行级 `PROMPT_REVISION`（当前为 `gm-capability-charter-agentic-mvp-2`）；不新增 per-session Prompt 快照、内容 manifest 或 provider 自动路由。
+- revision 是维护者用于发布沟通的人工可读标识，hash 是精确内容身份。模组、角色资料或 GM Prompt 有实质修改时，维护者必须主动递增相应 revision，并重新进行后续验收；不能只依赖 hash 或把旧证据冒充新内容版本。
+- Ticket 22 的安全目录投影与 Ticket 23 的 ongoing 选择续玩只证明本地 session 生命周期和公开投影边界；Ticket 24 的新增测试只证明 provenance、快照隔离、上下文完整性和运行级 Prompt 边界。Ticket 22–24 通过不等于真实 GM 质量通过。
+
+### 增量四工程完成条件与项目验收边界
+
+增量四在工程侧只冻结并审计内容接入和生命周期 seam：参考 provenance、session-local 快照、完整 ongoing 上下文、Prompt revision 纪律、NPC/事实/开放收束所需的目标数据契约，以及新建/选择/续玩/恢复/完成状态的确定性行为。本文不把内容文件当前的创意质量写成自动证明，也不把 CLI 能运行写成真实主持质量通过。
+
+六个聚焦场景、真实场景 runner、从石牢开始的开放人工试玩和任何模型质量判断统一延期到增量五。项目所有者后续应按 [ADR-041](../adr/0041-live-gm-evaluation-uses-six-focused-scenarios.md) 的六类场景与开放试玩要求进行人工验收；Ticket 24 不运行真实 provider、六场景、场景 runner、开放试玩、72 次模型矩阵或模型选择。ADR-041 与 [ADR-042](../adr/0042-model-selection-repeats-focused-and-full-playtests.md) 的 72 次候选配置矩阵、硬门槛、重复场景和前两名复试要求保持不变。
+
 ### 实现范围
 
 - 在增量 1 已建立全文快照加载的基础上，补齐并定稿 [《逃离塔纳里昂》模组参考书](module_reference.md)、[角色资料](characters.md)和[能力章程](gm_prompt.md)的内容质量，而不是再建设第二套接入机制。
@@ -226,15 +239,19 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 - 开场只载入参考书标明的最小正典；其他秘密、人物解释、路线和收束等待 GM 采用、改编或舍弃。
 - 动态威胁、NPC 关系和结局全部由叙事与事实变化表达，不恢复数值时钟、关系阶段或 `ending_id`。
 
-### 验收门
+### 工程验收门（Ticket 24 已审计）
 
-1. 六个聚焦场景都可以通过真实 CLI 执行并生成完整、可追溯记录。
-2. 聚焦场景四证明 NPC 能主动行动、彼此反应并保持角色差异，同时不替玩家控制调查员。
-3. 聚焦场景五证明 `establish` / `retire` 跨回合连续性，场景六证明交易、留下等未预设收束可以把会话置为 `complete`。
-4. 隐藏角色秘密只有在 GM 确立后才成为隐藏正典，不能因为写在参考资料中就自动进入事实账本。
-5. 至少一次内部开放试玩从石牢开场走到由玩家行动形成的叙事收束，不依赖阿卡利尔固定路线。
-6. 输入、角色资料、事实、回合和未完成状态的损坏或 schema 不匹配在模型调用前给出稳定错误。
-7. 真实运行中没有引用旧效果白名单、六格威胁时钟、关系阶段或预定义结局。
+1. SessionSetup 的 revision 与实际 SHA-256、session-local 快照内容和只读属性相互对应；工作树后续变化不影响已有 session。
+2. ongoing 新回合把完整已提交回合、当前事实索引、模组快照和角色资料送入同一 GM 请求，并继续使用运行级 Prompt revision。
+3. 存档不增加 per-session Prompt 快照、内容 manifest 或 provider 自动路由；Prompt 修订仍由运行 profile 冻结。
+4. 输入、角色资料、事实、回合和未完成状态的损坏或 schema 不匹配在模型调用前给出稳定错误；Ticket 22–23 的安全目录和选择续玩不改变持久化语义。
+5. 真实运行中没有引用旧效果白名单、六格威胁时钟、关系阶段或预定义结局。
+
+以下项目验收条件不是 Ticket 24 的工程证据，统一留给增量五：
+
+- 六个聚焦场景的真实 CLI 运行、NPC 主动性、跨回合事实连续性和开放收束。
+- 至少一次开放式《逃离塔纳里昂》人工试玩。
+- 真实 provider、场景 runner、模型质量、72 次矩阵、默认模型选择和前两名复试。
 
 ### 旧路径处理
 
