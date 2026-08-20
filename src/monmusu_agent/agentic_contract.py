@@ -2011,7 +2011,7 @@ def _recovery_provider_configured(
             and request["function_tools"] == ["make_check"]
             and request["response_format"] == {"type": "json_object"}
             and request["stream"] is False
-            and request["max_tokens"] == 4096
+            and request["max_tokens"] == profile["max_tokens"]
             and isinstance(request["timeout"], (int, float))
             and request["timeout"] > 0
             and request["thinking"]

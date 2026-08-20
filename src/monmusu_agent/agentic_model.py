@@ -189,8 +189,14 @@ def deepseek_model_profile(
     provider: str = "deepseek",
     base_url: str | None = None,
     retry_policy: Mapping[str, Any] | None = None,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """生成当前纵向切片唯一的非秘密模型运行配置。"""
+    """生成当前纵向切片唯一的非秘密模型运行配置。
+
+    thinking 模式的 reasoning_content 与最终 JSON 共享 completion 预算；
+    pilot 实测 thinking=true + 4096 时约 5/12 局被截断（provider_response_error），
+    因此缺省预算按 thinking 分流：false 时 4096，true 时 16384。显式传入优先。
+    """
 
     if provider not in SUPPORTED_PROVIDERS:
         raise ModelProfileValidationError(
@@ -212,7 +218,9 @@ def deepseek_model_profile(
             "response_format": "json_object",
             "temperature": None,
             "top_p": None,
-            "max_tokens": 4096,
+            "max_tokens": (
+                16384 if thinking else 4096
+            ) if max_tokens is None else max_tokens,
             "prompt_revision": PROMPT_REVISION,
             "tool_schema_version": TOOL_SCHEMA_VERSION,
             "enabled_tools": list(enabled_tools),

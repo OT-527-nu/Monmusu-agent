@@ -23,6 +23,7 @@ from monmusu_agent.agentic_model import (
     ModelCallError,
     ModelRequest,
     ModelResponse,
+    deepseek_model_profile,
 )
 from monmusu_agent.agentic_session import (
     AgenticSessionStore,
@@ -89,6 +90,28 @@ class ForbiddenClient:
 
 
 class DeepSeekGameMasterModelTest(unittest.TestCase):
+    def test_profile_max_tokens_split_by_thinking(self) -> None:
+        """thinking 模式的输出预算缺省分流，显式传参优先。
+
+        pilot 实测 thinking=true + 4096 时约 5/12 局被截断为
+        provider_response_error；reasoning 与最终 JSON 共享 completion 预算。
+        """
+
+        self.assertEqual(
+            deepseek_model_profile(thinking=False)["max_tokens"], 4096
+        )
+        self.assertEqual(
+            deepseek_model_profile(thinking=True)["max_tokens"], 16384
+        )
+        self.assertEqual(
+            deepseek_model_profile(thinking=True, max_tokens=4096)["max_tokens"],
+            4096,
+        )
+        self.assertEqual(
+            deepseek_model_profile(thinking=False, max_tokens=8192)["max_tokens"],
+            8192,
+        )
+
     def test_constructor_uses_official_deepseek_base_url(self) -> None:
         client = SimpleNamespace()
         with patch("openai.OpenAI", return_value=client) as constructor:

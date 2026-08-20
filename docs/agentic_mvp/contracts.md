@@ -717,7 +717,7 @@ indefinite_insanity_threshold_crossed = (
 
 - Harness 接受玩家输入并分配 `turn_id` 后立即保存未完成回合。
 - 上例展示第一次 provider 请求前的构造状态，因此往返、结构修正和交互数组均为零或空；初始 system/user 消息在发起请求前写入 `deepseek_messages`。
-- `model_profile` 保存恢复该 provider 对话所需的全部非秘密、行为相关配置。新回合默认冻结五个 COC 工具；恢复必须使用该未完成回合自己的模型、thinking 模式、Prompt 修订、工具 schema 版本和 `enabled_tools`，不要求等于当前新回合默认 profile。Harness 以完整注册表逐项验证冻结工具子集仍受 `coc-tools-agentic-mvp-1` 支持；若版本、工具实现不可用或 profile 损坏，明确拒绝恢复，不能静默换配置。API key 永不保存。
+- `model_profile` 保存恢复该 provider 对话所需的全部非秘密、行为相关配置。新回合默认冻结五个 COC 工具；恢复必须使用该未完成回合自己的模型、thinking 模式、Prompt 修订、工具 schema 版本和 `enabled_tools`，不要求等于当前新回合默认 profile。Harness 以完整注册表逐项验证冻结工具子集仍受 `coc-tools-agentic-mvp-1` 支持；若版本、工具实现不可用或 profile 损坏，明确拒绝恢复，不能静默换配置。API key 永不保存。`max_tokens` 是输出预算：thinking 模式的 reasoning 与最终 JSON 共享该预算，缺省按 thinking 分流为 false 时 4096、true 时 16384。
 - `attempt_limits` 描述当前执行尝试。玩家恢复会增加 `attempt_number` 并重置计数与 deadline，但默认继续使用相同的冻结限额；显式开发配置变更必须记录为新的尝试配置。
 - `round_trips_used` 与 `structure_repairs_used` 在新执行尝试中重置；`total_round_trips` 与 `total_structure_repairs` 只增不减，用于恢复与费用诊断。
 - 失败的 provider 请求不增加 `round_trips_used`；重试次数由冻结的 `model_profile.retry_policy.max_retries` 单独限制，且每次重试 sleep 与下一次请求都必须落在 `attempt_timeout_seconds` 剩余预算内。
