@@ -353,6 +353,66 @@ class MainProviderFlowTest(unittest.TestCase):
         self.assertNotIn("sk-cli-secret", rendered)
         self.assertNotIn("https://", rendered)
 
+    def test_deepseek_defaults_to_thinking_mode(self) -> None:
+        output = io.StringIO()
+        store = object()
+        harness = object()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MONMUSU_PROVIDER": "deepseek",
+                    "DEEPSEEK_API_KEY": "sk-cli-secret",
+                    "MONMUSU_DEEPSEEK_MODEL_ID": "deepseek-v4-flash",
+                },
+                clear=True,
+            ),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
+            patch(
+                "monmusu_agent.agentic_cli.AgenticSessionStore",
+                return_value=store,
+            ),
+            patch(
+                "monmusu_agent.agentic_cli.compose_deepseek_harness",
+                return_value=harness,
+            ) as compose,
+            patch("monmusu_agent.agentic_cli.run_agentic_cli"),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main([]), 0)
+
+        self.assertEqual(compose.call_args.kwargs["thinking"], True)
+
+    def test_opencode_go_keeps_non_thinking_default(self) -> None:
+        output = io.StringIO()
+        store = object()
+        harness = object()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MONMUSU_PROVIDER": "opencode-go",
+                    "OPENCODE_GO_API_KEY": "sk-cli-secret",
+                    "MONMUSU_DEEPSEEK_MODEL_ID": "deepseek-v4-flash",
+                },
+                clear=True,
+            ),
+            patch("monmusu_agent.agentic_cli.load_dotenv"),
+            patch(
+                "monmusu_agent.agentic_cli.AgenticSessionStore",
+                return_value=store,
+            ),
+            patch(
+                "monmusu_agent.agentic_cli.compose_deepseek_harness",
+                return_value=harness,
+            ) as compose,
+            patch("monmusu_agent.agentic_cli.run_agentic_cli"),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main([]), 0)
+
+        self.assertEqual(compose.call_args.kwargs["thinking"], False)
+
     def test_configure_flag_writes_config_without_creating_session_or_model(
         self,
     ) -> None:

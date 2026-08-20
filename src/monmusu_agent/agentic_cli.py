@@ -1016,9 +1016,11 @@ def _run_main(argv: Sequence[str] | None = None) -> int:
         "MONMUSU_DEEPSEEK_MODEL_ID",
         "deepseek-v4-flash",
     ).strip()
+    # OpenCode Go 首版不支持 thinking；其他当前 provider 默认开启思考模式。
+    default_thinking = "false" if config.provider == "opencode-go" else "true"
     thinking_text = os.environ.get(
         "MONMUSU_DEEPSEEK_THINKING",
-        "false",
+        default_thinking,
     ).strip().lower()
     if thinking_text not in {"false", "true"}:
         print("MONMUSU_DEEPSEEK_THINKING 必须为 false 或 true。")

@@ -25,7 +25,7 @@ python3 -m monmusu_agent
 PYTHONPATH=src python3 -m monmusu_agent.agentic_cli
 ```
 
-安装项目后也可运行 `monmusu-agent` 或兼容名称 `monmusu-agent-agentic`。入口从外部环境读取 `DEEPSEEK_API_KEY`，可用 `MONMUSU_DEEPSEEK_MODEL_ID` 和 `MONMUSU_DEEPSEEK_THINKING` 显式覆盖默认的 `deepseek-v4-flash`、non-thinking 配置；它把会话写入 `var/agentic_sessions/`，展示开场并在同一 GM 会话中持续接收玩家行动，直到本局收束或发生技术中断。显式 thinking 模式仍使用非流式 Chat Completions；工具后的 `reasoning_content` 只作为受限未完成回合恢复材料保存和回传，不进入玩家记录。旧存档与新版 schema 不兼容，不会被静默迁移。
+安装项目后也可运行 `monmusu-agent` 或兼容名称 `monmusu-agent-agentic`。入口从外部环境读取 `DEEPSEEK_API_KEY`，默认开启 thinking，可用 `MONMUSU_DEEPSEEK_MODEL_ID` 和 `MONMUSU_DEEPSEEK_THINKING` 显式覆盖默认的 `deepseek-v4-flash`、thinking 配置；它把会话写入 `var/agentic_sessions/`，展示开场并在同一 GM 会话中持续接收玩家行动，直到本局收束或发生技术中断。OpenCode Go 首版保持 non-thinking，因为该 provider 当前不支持 thinking。工具后的 `reasoning_content` 只作为受限未完成回合恢复材料保存和回传，不进入玩家记录。旧存档与新版 schema 不兼容，不会被静默迁移。
 
 ## 测试
 
