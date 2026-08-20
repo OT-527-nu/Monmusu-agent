@@ -210,7 +210,7 @@ normalize -> domain preflight/freeze -> assign mechanic_id/committed_at
 ### Ticket 22–24 工程审计结论（截至 2026-08-19）
 
 - SessionSetup 保存人工可读的 `module_reference_revision` / `character_reference_revision`，同时保存对应参考文件实际字节的 SHA-256；模组与人物全文以内容哈希命名的只读文件写入 session-local `snapshots/`。后续装载和 ongoing 新回合只读取这些快照，工作树参考资料的修改或删除会被隔离而不影响已有 session；只有快照缺失、不可读或哈希不匹配才会稳定停止，且不会 fallback 到工作树。
-- ongoing 新回合的同一 GM 请求包含 SessionSetup、开场事实历史、调查员与同行者角色卡、当前 active facts、完整 `COMMITTED_TURNS`、模组快照、人物快照和当前工具目录。Prompt 使用运行级 `PROMPT_REVISION`（当前为 `gm-capability-charter-agentic-mvp-2`）；不新增 per-session Prompt 快照、内容 manifest 或 provider 自动路由。
+- ongoing 新回合的同一 GM 请求包含 SessionSetup、开场事实历史、调查员与同行者角色卡、当前 active facts、完整 `COMMITTED_TURNS`、模组快照、人物快照和当前工具目录。Prompt 使用运行级 `PROMPT_REVISION`（当前为 `gm-capability-charter-agentic-mvp-3`）；不新增 per-session Prompt 快照、内容 manifest 或 provider 自动路由。
 - revision 是维护者用于发布沟通的人工可读标识，hash 是精确内容身份。模组、角色资料或 GM Prompt 有实质修改时，维护者必须主动递增相应 revision，并重新进行后续验收；不能只依赖 hash 或把旧证据冒充新内容版本。
 - Ticket 22 的安全目录投影与 Ticket 23 的 ongoing 选择续玩只证明本地 session 生命周期和公开投影边界；Ticket 24 的新增测试只证明 provenance、快照隔离、上下文完整性和运行级 Prompt 边界。Ticket 22–24 通过不等于真实 GM 质量通过。
 

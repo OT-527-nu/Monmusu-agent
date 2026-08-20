@@ -17,7 +17,7 @@ from monmusu_agent.agentic_retry import (
     resolve_retry_policy,
 )
 
-PROMPT_REVISION = "gm-capability-charter-agentic-mvp-2"
+PROMPT_REVISION = "gm-capability-charter-agentic-mvp-3"
 TOOL_SCHEMA_VERSION = "coc-tools-agentic-mvp-1"
 DEFAULT_COC_TOOL_NAMES = (
     "make_check",

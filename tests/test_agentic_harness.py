@@ -2055,7 +2055,7 @@ class AgenticHarnessTest(unittest.TestCase):
                         "temperature": None,
                         "top_p": None,
                         "max_tokens": 4096,
-                        "prompt_revision": "gm-capability-charter-agentic-mvp-2",
+                        "prompt_revision": "gm-capability-charter-agentic-mvp-3",
                         "tool_schema_version": "coc-tools-agentic-mvp-1",
                         "enabled_tools": [],
                         "api_key": "must-not-persist",

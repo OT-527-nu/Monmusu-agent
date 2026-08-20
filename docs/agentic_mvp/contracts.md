@@ -630,7 +630,7 @@ indefinite_insanity_threshold_crossed = (
     "temperature": null,
     "top_p": null,
     "max_tokens": 4096,
-    "prompt_revision": "gm-capability-charter-agentic-mvp-2",
+    "prompt_revision": "gm-capability-charter-agentic-mvp-3",
     "tool_schema_version": "coc-tools-agentic-mvp-1",
     "enabled_tools": [
       "make_check",
