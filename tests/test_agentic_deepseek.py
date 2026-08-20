@@ -255,6 +255,139 @@ class DeepSeekGameMasterModelTest(unittest.TestCase):
             ).hexdigest(),
         )
 
+    def test_complete_omits_tools_key_when_tools_are_empty(self) -> None:
+        """结构修正相位不携带工具；空工具必须整体省略 tools 键。
+
+        DeepSeek 对 "tools": [] 返回 HTTP 400，之前结构修正请求因此
+        全部中断为 provider_bad_request（见 zen-ab-pilot 实测记录）。
+        """
+
+        assistant_message = {
+            "role": "assistant",
+            "content": '{"narration":"门纹丝不动。","establish":[],'
+            '"retire":[],"session_status":"ongoing"}',
+            "reasoning_content": None,
+            "tool_calls": [],
+        }
+        completions = RecordingCompletions(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=Dumpable(assistant_message),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        model = DeepSeekGameMasterModel(
+            "not-a-real-key",
+            client=client,
+        )
+        request = ModelRequest(
+            messages=(
+                {"role": "system", "content": "Return JSON."},
+                {"role": "user", "content": "Retry the final JSON only."},
+            ),
+            tools=(),
+            request_timeout_seconds=60,
+            model_profile={
+                "provider": "deepseek",
+                "model_id": "deepseek-v4-flash",
+                "thinking": False,
+                "stream": False,
+                "response_format": "json_object",
+                "temperature": None,
+                "top_p": None,
+                "max_tokens": 4096,
+                "prompt_revision": "gm-capability-charter-agentic-mvp-3",
+                "tool_schema_version": "coc-tools-agentic-mvp-1",
+                "enabled_tools": ["make_check"],
+            },
+        )
+
+        model.complete(request)
+
+        self.assertEqual(len(completions.requests), 1)
+        self.assertNotIn("tools", completions.requests[0])
+        self.assertEqual(
+            completions.requests[0]["response_format"],
+            {"type": "json_object"},
+        )
+
+    def test_complete_strips_empty_tool_calls_from_assistant_messages(
+        self,
+    ) -> None:
+        """回放时 assistant 消息的空 tool_calls 数组必须被去掉。
+
+        DeepSeek 对 messages[i].tool_calls=[] 返回 HTTP 400，而 Harness
+        持久化格式用 [] 表示无工具调用（见 zen-ab-pilot 实测记录）。
+        """
+
+        assistant_message = {
+            "role": "assistant",
+            "content": '{"narration":"门纹丝不动。","establish":[],'
+            '"retire":[],"session_status":"ongoing"}',
+            "reasoning_content": None,
+            "tool_calls": [],
+        }
+        completions = RecordingCompletions(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=Dumpable(assistant_message),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        model = DeepSeekGameMasterModel(
+            "not-a-real-key",
+            client=client,
+        )
+        request = ModelRequest(
+            messages=(
+                {"role": "system", "content": "Return JSON."},
+                {
+                    "role": "assistant",
+                    "content": '{"narration":"坏掉的答复","establish":[],'
+                    '"retire":[],"session_status":"ongoing"}',
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                },
+                {"role": "user", "content": "Retry the final JSON only."},
+            ),
+            tools=(),
+            request_timeout_seconds=60,
+            model_profile={
+                "provider": "deepseek",
+                "model_id": "deepseek-v4-flash",
+                "thinking": False,
+                "stream": False,
+                "response_format": "json_object",
+                "temperature": None,
+                "top_p": None,
+                "max_tokens": 4096,
+                "prompt_revision": "gm-capability-charter-agentic-mvp-3",
+                "tool_schema_version": "coc-tools-agentic-mvp-1",
+                "enabled_tools": ["make_check"],
+            },
+        )
+
+        model.complete(request)
+
+        self.assertEqual(len(completions.requests), 1)
+        sent_assistant = completions.requests[0]["messages"][1]
+        self.assertEqual(sent_assistant["role"], "assistant")
+        self.assertNotIn("tool_calls", sent_assistant)
+
     def test_complete_enables_thinking_and_preserves_reasoning_envelope(
         self,
     ) -> None:

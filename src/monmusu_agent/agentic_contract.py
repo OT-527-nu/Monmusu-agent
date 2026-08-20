@@ -28,6 +28,7 @@ from monmusu_agent.agentic_model import (
     ModelRequest,
     ModelResponse,
     deepseek_model_profile,
+    normalized_sdk_messages,
 )
 from monmusu_agent.agentic_session import (
     AgenticSessionStore,
@@ -146,7 +147,7 @@ class _EvaluationRecordingModel:
             "structure_repairs": _structure_repair_count(request.messages),
             "structure_repair_request": not request.tools,
             "model_request_messages_sha256": _canonical_json_sha256(
-                request.messages
+                normalized_sdk_messages(request.messages)
             ),
             "tool_calls": [],
         }

@@ -342,12 +342,13 @@ class DeepSeekGameMasterModel:
                 retryable=False,
             )
 
+        # 回放兼容：DeepSeek 拒绝 assistant 消息里的空 tool_calls 数组
+        # （"empty array. Expected an array with minimum length 1"），
+        # 而 Harness 持久化格式用 [] 表示无工具调用；发送前去掉该键。
+        sdk_messages = normalized_sdk_messages(request.messages)
         sdk_request: dict[str, Any] = {
             "model": validated_profile["model_id"],
-            "messages": [
-                copy.deepcopy(dict(message)) for message in request.messages
-            ],
-            "tools": [copy.deepcopy(dict(tool)) for tool in request.tools],
+            "messages": sdk_messages,
             "stream": False,
             "max_tokens": validated_profile["max_tokens"],
             "timeout": request.request_timeout_seconds,
@@ -359,6 +360,12 @@ class DeepSeekGameMasterModel:
                 }
             },
         }
+        # 结构修正相位不携带工具：DeepSeek 拒绝空 tools 数组（HTTP 400），
+        # 因此工具为空时必须整体省略该字段，而不是发送 "tools": []。
+        if request.tools:
+            sdk_request["tools"] = [
+                copy.deepcopy(dict(tool)) for tool in request.tools
+            ]
         # opencode-go 在 response_format=json_object 下不会返回原生
         # tool_calls，而是把工具调用写进 JSON content；省略该字段才能走
         # Chat Completions function tools。最终答复仍由 Harness 本地校验 JSON。
@@ -676,6 +683,30 @@ def _response_request_id(source: object) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def normalized_sdk_messages(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """把持久化消息规范化成可安全回放给 DeepSeek 的 SDK 消息。
+
+    DeepSeek 拒绝 assistant 消息里的空 tool_calls 数组（HTTP 400：
+    "empty array. Expected an array with minimum length 1"），而 Harness
+    持久化格式用 [] 表示无工具调用；回放前必须整体去掉该键。契约 runner
+    的回放保真指纹也必须对模型侧消息应用同一变换（见 agentic_contract）。
+    """
+
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        copied = copy.deepcopy(dict(message))
+        if (
+            copied.get("role") == "assistant"
+            and isinstance(copied.get("tool_calls"), list)
+            and not copied["tool_calls"]
+        ):
+            copied.pop("tool_calls")
+        normalized.append(copied)
+    return normalized
 
 
 def _sdk_request_evidence(request: Mapping[str, Any]) -> dict[str, Any]:
