@@ -157,7 +157,7 @@ class AgenticSessionStoreTest(unittest.TestCase):
             )
             self.assertEqual(
                 {fact["origin"]["source_ref"] for fact in session["facts"]},
-                {"escape_thalarion-agentic-mvp-1#opening_minimum_canon"},
+                {"escape_thalarion-agentic-mvp-2#opening_minimum_canon"},
             )
             self.assertTrue(
                 all(fact["established_turn_id"] is None for fact in session["facts"])

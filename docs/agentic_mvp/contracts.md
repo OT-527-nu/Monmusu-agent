@@ -40,8 +40,8 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
   "skill_catalog_version": "coc7e-agentic-mvp-1",
   "setup": {
     "setup_id": "setup_0001",
-    "module_reference_revision": "escape_thalarion-agentic-mvp-1",
-    "module_reference_sha256": "16119ec99d6536f8033130fd13b6e5d276a04ba1eff6739160eccd67e75cf2c9",
+    "module_reference_revision": "escape_thalarion-agentic-mvp-2",
+    "module_reference_sha256": "5e0ba6ea3d6b83648cc20e5611f672582a4f840606be6aa65f6aad3b39f9aba7",
     "character_reference_revision": "characters-agentic-mvp-1",
     "character_reference_sha256": "c951a6a8ea66ca8f5da1af3b9e54ac4bb2fe5256298d1a93227afb61d7688a5f",
     "opening_narration": "海难后的盐水仍从石缝间渗出。牢外忽然传来商人凄厉而短促的惨叫，唯一的灯光随船工的脚步远去。铁锁还扣在门上，但现在没有人守着你们。你打算怎么做？",
@@ -98,8 +98,8 @@ MVP 使用一个本地会话聚合保存需要原子协调的短篇状态。Mark
 ```json
 {
   "setup_id": "setup_0001",
-  "module_reference_revision": "escape_thalarion-agentic-mvp-1",
-  "module_reference_sha256": "16119ec99d6536f8033130fd13b6e5d276a04ba1eff6739160eccd67e75cf2c9",
+  "module_reference_revision": "escape_thalarion-agentic-mvp-2",
+  "module_reference_sha256": "5e0ba6ea3d6b83648cc20e5611f672582a4f840606be6aa65f6aad3b39f9aba7",
   "character_reference_revision": "characters-agentic-mvp-1",
   "character_reference_sha256": "c951a6a8ea66ca8f5da1af3b9e54ac4bb2fe5256298d1a93227afb61d7688a5f",
   "opening_narration": "海难后的盐水仍从石缝间渗出。牢外忽然传来商人凄厉而短促的惨叫，唯一的灯光随船工的脚步远去。铁锁还扣在门上，但现在没有人守着你们。你打算怎么做？",

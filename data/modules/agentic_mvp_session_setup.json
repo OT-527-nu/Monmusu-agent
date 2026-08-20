@@ -1,7 +1,7 @@
 {
   "schema_version": "agentic-mvp-setup-1",
   "module_id": "escape_thalarion",
-  "module_reference_revision": "escape_thalarion-agentic-mvp-1",
+  "module_reference_revision": "escape_thalarion-agentic-mvp-2",
   "character_reference_revision": "characters-agentic-mvp-1",
   "opening_narration": "海难后的盐水仍从石缝间渗出。牢外忽然传来商人凄厉而短促的惨叫，唯一的灯光随船工的脚步远去。铁锁还扣在门上，但现在没有人守着你们。你打算怎么做？",
   "opening_facts": [
