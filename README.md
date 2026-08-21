@@ -6,6 +6,25 @@ Monmusu Agent 是一个由单一 AI 游戏主持人驱动、NPC 同行者陪伴�
 
 当前设计权威与迁移入口见 [Monmusu Agent 文档索引](docs/README.md)。Agentic MVP 已完成 Increment 1 至 Increment 4 的工程切片（五工具 COC 机械、生产角色卡、会话续玩和内容发布边界），真实六场景、完整短篇、模型矩阵和默认模型选择仍未完成；运行行为以当前源码和测试为准。
 
+## For joye：
+
+老大，我估算了一下工作量，我觉得我大概是做不完了(T_T)。前几天总算整出来了一个勉强能玩的样子，但是简单让gpt复盘了一下发现其实有很多地方做的不好，得花大力气整改才行。得到的教训是我再也不急头白脸地就是干了
+
+| 地方                                   | gpt的判断      | 严重程度 |
+| ------------------------------------ | --------- | ---: |
+| Context 全量 JSON 塞 User               | 确实需要改     |   🔴 |
+| Transcript 与 world state 混在一起        | 核心概念问题    |   🔴 |
+| Harness 1856 行                       | 职责过载      |   🔴 |
+| Agent loop 没有独立抽象                    | 应该拆       |   🟠 |
+| Provider abstraction                 | 做得不错      |   🟢 |
+| Tool call/result 持久化                 | 思路不错      |   🟢 |
+| Session persistence                  | 很认真       |   🟢 |
+| Tool authority / mechanic validation | 对你的产品合理   |   🟢 |
+| retry/recovery                       | 偏重，但有理由   |   🟡 |
+| final JSON validation                | 合理        |   🟢 |
+| COC/game state 放进 agent 层            | 可以，但应该再隔离 |   🟡 |
+
+
 ## 快速开始
 
 ```bash
